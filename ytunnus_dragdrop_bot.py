@@ -1,11 +1,11 @@
 import re
-import os
 import tkinter as tk
 from tkinter import messagebox
 from PyPDF2 import PdfReader
 from docx import Document
 import openpyxl
 
+# --- PDF -> teksti ---
 def extract_text_from_pdf(pdf_path):
     try:
         reader = PdfReader(pdf_path)
@@ -19,19 +19,22 @@ def extract_text_from_pdf(pdf_path):
         print(f"Virhe PDF:n lukemisessa ({pdf_path}): {e}")
         return ""
 
+# --- Etsi Y-tunnukset ---
 def find_ytunnukset(text):
-    yt1 = re.findall(r"\b\d{7}-\d\b", text)
-    yt2 = re.findall(r"\b\d{8}\b", text)
+    yt1 = re.findall(r"\b\d{7}-\d\b", text)  # jo viivalliset
+    yt2 = re.findall(r"\b\d{8}\b", text)     # ilman viivaa
     yt2_fixed = [y[:7] + "-" + y[7:] for y in yt2]
     all_yt = yt1 + yt2_fixed
-    return sorted(list(dict.fromkeys(all_yt)))
+    return sorted(list(dict.fromkeys(all_yt)))  # poista duplikaatit
 
+# --- Lisää yksi viiva tarvittaessa ---
 def add_extra_dash(ytunnus):
     if "-" in ytunnus:
-        parts = ytunnus.split("-")
-        return parts[0] + "--" + parts[1]
-    return ytunnus
+        return ytunnus  # kopioidaan sellaisenaan
+    else:
+        return ytunnus[:7] + "-" + ytunnus[7:]
 
+# --- Tallenna Word ---
 def save_to_word(ytunnukset, output_file):
     doc = Document()
     doc.add_heading("Y-tunnukset", level=1)
@@ -39,6 +42,7 @@ def save_to_word(ytunnukset, output_file):
         doc.add_paragraph(y)
     doc.save(output_file)
 
+# --- Tallenna Excel ---
 def save_to_excel(ytunnukset, output_file):
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -48,6 +52,7 @@ def save_to_excel(ytunnukset, output_file):
         ws.append([y])
     wb.save(output_file)
 
+# --- Käsittele PDF:t ---
 def process_pdfs(pdf_files):
     all_ytunnukset = []
     for pdf_file in pdf_files:
@@ -73,6 +78,7 @@ def process_pdfs(pdf_files):
         f"Tallennettu:\n - {word_file}\n - {excel_file}"
     )
 
+# --- GUI ---
 def on_drop(event):
     files = root.tk.splitlist(event.data)
     pdf_files = [f.strip("{}") for f in files if f.lower().endswith(".pdf")]
@@ -91,6 +97,7 @@ label = tk.Label(
 )
 label.pack(expand=True)
 
+# Drag & drop tuki
 try:
     import tkinterdnd2
     root = tkinterdnd2.TkinterDnD.Tk()
