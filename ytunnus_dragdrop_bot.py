@@ -1,3 +1,4 @@
+import os
 import re
 import threading
 import tkinter as tk
@@ -15,6 +16,17 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+
+
+# -----------------------------
+# LOG TIEDOSTO
+# -----------------------------
+def write_log_to_file(msg):
+    try:
+        with open("log.txt", "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except:
+        pass
 
 
 # -----------------------------
@@ -84,18 +96,13 @@ def save_excel_table(rows, filename, headers):
 # VIRRE HAKU
 # -----------------------------
 def virre_get_email(driver, ytunnus, log_func):
-    """
-    Avaa virre etusivu, hakee Y-tunnuksen ja palauttaa sähköpostin.
-    """
-
     wait = WebDriverWait(driver, 25)
 
     driver.get("https://virre.prh.fi/novus/home")
 
     try:
-        log_func("Etsitään Virre hakukenttä...")
+        log_func("Etsitään hakukenttä...")
 
-        # Hakukenttä on tuolla etusivulla iso input
         search_input = wait.until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='text']"))
         )
@@ -105,33 +112,33 @@ def virre_get_email(driver, ytunnus, log_func):
 
         log_func("Klikataan HAE...")
 
-        # Virren HAE-nappi on yleensä button jossa teksti HAE
         hae_btn = wait.until(
             EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'HAE')]"))
         )
         hae_btn.click()
 
-        # Odotetaan että tulossivu latautuu
-        log_func("Odotetaan tuloksia...")
+        log_func("Odotetaan tulossivua...")
 
         wait.until(
             EC.presence_of_element_located((By.TAG_NAME, "body"))
         )
 
-        # Nyt yritetään löytää teksti "Sähköposti" ja siitä email
-        page_text = driver.page_source
+        page_source = driver.page_source
 
         email_match = re.search(
             r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+",
-            page_text
+            page_source
         )
 
         if email_match:
+            log_func(f"Sähköposti löytyi: {email_match.group(0)}")
             return email_match.group(0)
 
+        log_func("Ei sähköpostia löytynyt.")
         return "EI SÄHKÖPOSTIA"
 
     except Exception as e:
+        log_func(f"Virre virhe: {str(e)}")
         return f"VIRHE: {str(e)}"
 
 
@@ -145,7 +152,7 @@ def fetch_all_emails_from_virre(ytunnukset, log_func):
         options.add_argument("--disable-dev-shm-usage")
 
         driver_path = ChromeDriverManager().install()
-        log_func(f"ChromeDriver: {driver_path}")
+        log_func(f"ChromeDriver polku: {driver_path}")
 
         driver = webdriver.Chrome(service=Service(driver_path), options=options)
 
@@ -192,17 +199,28 @@ class App(TkinterDnD.Tk):
         self.log_box = tk.Text(self, height=18, width=85)
         self.log_box.pack(pady=10)
 
-        # TÄRKEÄ: Drop toimii koko ikkunassa ja labelissa
         self.drop_target_register(DND_FILES)
         self.dnd_bind("<<Drop>>", self.drop_file)
 
         self.drop_label.drop_target_register(DND_FILES)
         self.drop_label.dnd_bind("<<Drop>>", self.drop_file)
 
+        # Tyhjennetään vanha logi aina kun botti avataan
+        try:
+            with open("log.txt", "w", encoding="utf-8") as f:
+                f.write("=== BOTTI KÄYNNISTETTY ===\n")
+        except:
+            pass
+
     def log(self, msg):
-        self.log_box.insert(tk.END, msg + "\n")
-        self.log_box.see(tk.END)
-        self.update_idletasks()
+        try:
+            self.log_box.insert(tk.END, msg + "\n")
+            self.log_box.see(tk.END)
+            self.update_idletasks()
+        except:
+            pass
+
+        write_log_to_file(msg)
 
     def drop_file(self, event):
         file_path = event.data.strip()
@@ -213,6 +231,7 @@ class App(TkinterDnD.Tk):
         self.log(f"PDF vastaanotettu: {file_path}")
 
         if not file_path.lower().endswith(".pdf"):
+            self.log("VIRHE: Ei PDF tiedosto.")
             messagebox.showerror("Virhe", "Vain PDF-tiedostot sallittu!")
             return
 
@@ -231,18 +250,15 @@ class App(TkinterDnD.Tk):
 
             self.log(f"Löytyi {len(ytunnukset)} Y-tunnusta.")
 
-            # Tallennetaan ytunnukset
             save_word_list(ytunnukset, "ytunnukset.docx", "Y-tunnukset")
             save_excel_table([(yt,) for yt in ytunnukset], "ytunnukset.xlsx", ["Y-tunnus"])
 
             self.log("Tallennettu: ytunnukset.docx")
             self.log("Tallennettu: ytunnukset.xlsx")
 
-            # Virre sähköpostit
             self.log("Aloitetaan Virre haku... Chrome avautuu nyt.")
             results = fetch_all_emails_from_virre(ytunnukset, self.log)
 
-            # Tallennetaan sähköpostit
             word_lines = [f"{yt} -> {email}" for yt, email in results]
 
             save_word_list(word_lines, "virre_sahkopostit.docx", "Virre sähköpostit")
@@ -255,8 +271,7 @@ class App(TkinterDnD.Tk):
             messagebox.showinfo("Valmis", "Valmis!\nTiedostot löytyvät exe:n kansiosta.")
 
         except Exception as e:
-            self.log("VIRHE!")
-            self.log(str(e))
+            self.log(f"VIRHE: {str(e)}")
             messagebox.showerror("Virhe", str(e))
 
 
