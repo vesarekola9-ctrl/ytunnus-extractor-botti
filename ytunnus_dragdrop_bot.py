@@ -6,10 +6,9 @@ from PyPDF2 import PdfReader
 from docx import Document
 import openpyxl
 
-# Selenium
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.keys import Keys
 
 
 # --- PDF -> teksti ---
@@ -36,7 +35,7 @@ def find_ytunnukset(text):
     return sorted(list(dict.fromkeys(all_yt)))
 
 
-# --- Tallenna Word ---
+# --- Word tallennus ---
 def save_to_word(lines, output_file, title="Tulokset"):
     doc = Document()
     doc.add_heading(title, level=1)
@@ -45,7 +44,7 @@ def save_to_word(lines, output_file, title="Tulokset"):
     doc.save(output_file)
 
 
-# --- Tallenna Excel ---
+# --- Excel tallennus ---
 def save_to_excel(rows, output_file, headers):
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -56,55 +55,61 @@ def save_to_excel(rows, output_file, headers):
     wb.save(output_file)
 
 
-# --- Muunna virren sähköposti (a) -> @ ---
+# --- sähköpostin muoto (a) -> @ ---
 def normalize_email(email):
-    email = email.strip()
-    email = email.replace("(a)", "@")
-    email = email.replace("[at]", "@")
-    return email
+    return email.replace("(a)", "@").replace(" ", "").strip()
 
 
-# --- Hae sähköposti virrestä ---
-def fetch_email_from_virre(driver, ytunnus):
-    # tämä execution muuttuu aina, mutta virre ohjaa yleensä automaattisesti
-    url = "https://virre.prh.fi/novus/home"
-    driver.get(url)
+# --- Etsi sähköposti HTML:stä ---
+def find_email_from_html(html):
+    # Virre näyttää usein info(a)domain.fi
+    match = re.search(r"[a-zA-Z0-9_.+-]+\s*\(a\)\s*[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", html)
+    if match:
+        return normalize_email(match.group(0))
 
-    time.sleep(2)
-
-    # Yritetään etsiä hakukenttä
-    # (tämä voi muuttua, mutta toimii usein)
-    try:
-        search_input = driver.find_element(By.TAG_NAME, "input")
-        search_input.clear()
-        search_input.send_keys(ytunnus)
-    except:
-        return ""
-
-    # Yritetään painaa Enter tai klikata hakunappia
-    try:
-        search_input.submit()
-    except:
-        pass
-
-    time.sleep(3)
-
-    page_text = driver.page_source
-
-    # etsitään sähköposti sivulta
-    emails = re.findall(r"[a-zA-Z0-9_.+-]+\s*\(a\)\s*[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", page_text)
-    if emails:
-        return normalize_email(emails[0])
-
-    # varalla suora @-muotoinen
-    emails2 = re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", page_text)
-    if emails2:
-        return emails2[0]
+    match2 = re.search(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", html)
+    if match2:
+        return match2.group(0)
 
     return ""
 
 
-# --- Käsittele PDF:t ---
+# --- Virre haku ---
+def fetch_email_from_virre(driver, ytunnus):
+    driver.get("https://virre.prh.fi/novus/home")
+
+    time.sleep(3)
+
+    # etsitään hakukenttä (usein ensimmäinen text input)
+    inputs = driver.find_elements(By.TAG_NAME, "input")
+
+    search_box = None
+    for inp in inputs:
+        try:
+            t = inp.get_attribute("type")
+            if t and t.lower() in ["text", "search"]:
+                search_box = inp
+                break
+        except:
+            continue
+
+    if not search_box:
+        return ""
+
+    search_box.clear()
+    search_box.send_keys(ytunnus)
+    search_box.send_keys(Keys.ENTER)
+
+    time.sleep(4)
+
+    # nyt pitäisi olla yrityssivu tai hakutulos
+    html = driver.page_source
+
+    email = find_email_from_html(html)
+    return email
+
+
+# --- pääprosessi ---
 def process_pdfs(pdf_files):
     all_ytunnukset = []
     for pdf_file in pdf_files:
@@ -118,59 +123,55 @@ def process_pdfs(pdf_files):
 
     all_ytunnukset = sorted(list(dict.fromkeys(all_ytunnukset)))
 
-    # tallenna ytunnukset wordiin/exceliin
     save_to_word(all_ytunnukset, "ytunnukset.docx", title="Y-tunnukset")
     save_to_excel([[y] for y in all_ytunnukset], "ytunnukset.xlsx", ["Y-tunnus"])
 
-    # --- Selenium käyntiin ---
-    chrome_options = Options()
-    chrome_options.add_argument("--headless=new")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--window-size=1920,1080")
+    # --- Selenium käynnistys näkyvänä ---
+    try:
+        driver = webdriver.Chrome()
+    except Exception as e:
+        messagebox.showerror("Virhe", f"Selenium ei käynnistynyt.\n\nVirhe:\n{e}")
+        return
 
-    driver = webdriver.Chrome(options=chrome_options)
-
-    results = []
-    word_lines = []
+    results_excel = []
+    results_word = []
 
     try:
         for i, yt in enumerate(all_ytunnukset, start=1):
             print(f"[{i}/{len(all_ytunnukset)}] Haetaan sähköposti: {yt}")
 
-            email = ""
             try:
                 email = fetch_email_from_virre(driver, yt)
             except Exception as e:
+                email = ""
                 print("Virhe:", e)
 
-            results.append([yt, email])
+            results_excel.append([yt, email])
 
             if email:
-                word_lines.append(f"{yt}  ->  {email}")
+                results_word.append(f"{yt} -> {email}")
             else:
-                word_lines.append(f"{yt}  ->  EI SÄHKÖPOSTIA")
+                results_word.append(f"{yt} -> EI SÄHKÖPOSTIA")
 
-            time.sleep(2)  # viive ettei hakata virreä
+            time.sleep(2)
 
     finally:
         driver.quit()
 
-    # tallenna sähköpostitulokset
-    save_to_word(word_lines, "virre_sahkopostit.docx", title="Virre sähköpostit")
-    save_to_excel(results, "virre_sahkopostit.xlsx", ["Y-tunnus", "Sähköposti"])
+    save_to_word(results_word, "virre_sahkopostit.docx", title="Virre sähköpostit")
+    save_to_excel(results_excel, "virre_sahkopostit.xlsx", ["Y-tunnus", "Sähköposti"])
 
     messagebox.showinfo(
         "Valmis",
-        f"Löytyi {len(all_ytunnukset)} Y-tunnusta.\n\n"
-        "Tallennettu tiedostot:\n"
-        "- ytunnukset.docx\n"
-        "- ytunnukset.xlsx\n"
-        "- virre_sahkopostit.docx\n"
-        "- virre_sahkopostit.xlsx"
+        f"Valmis!\n\nTallennettu:\n"
+        f"- ytunnukset.docx\n"
+        f"- ytunnukset.xlsx\n"
+        f"- virre_sahkopostit.docx\n"
+        f"- virre_sahkopostit.xlsx"
     )
 
 
-# --- GUI ---
+# --- GUI Drop ---
 def on_drop(event):
     files = root.tk.splitlist(event.data)
     pdf_files = [f.strip("{}") for f in files if f.lower().endswith(".pdf")]
@@ -180,12 +181,12 @@ def on_drop(event):
 
 root = tk.Tk()
 root.title("Y-tunnus + Virre sähköposti botti")
-root.geometry("450x200")
+root.geometry("500x220")
 
 label = tk.Label(
     root,
-    text="Vedä ja pudota PDF-tiedostot tähän ikkunaan\nBotti kerää Y-tunnukset ja hakee sähköpostit Virrestä",
-    wraplength=420,
+    text="Vedä ja pudota PDF tähän.\n\nBotti kerää Y-tunnukset ja hakee sähköpostit Virre-palvelusta.",
+    wraplength=480,
     justify="center"
 )
 label.pack(expand=True)
@@ -194,11 +195,12 @@ try:
     import tkinterdnd2
     root = tkinterdnd2.TkinterDnD.Tk()
     root.title("Y-tunnus + Virre sähköposti botti")
-    root.geometry("450x200")
+    root.geometry("500x220")
+
     label = tk.Label(
         root,
-        text="Vedä ja pudota PDF-tiedostot tähän ikkunaan\nBotti kerää Y-tunnukset ja hakee sähköpostit Virrestä",
-        wraplength=420,
+        text="Vedä ja pudota PDF tähän.\n\nBotti kerää Y-tunnukset ja hakee sähköpostit Virre-palvelusta.",
+        wraplength=480,
         justify="center"
     )
     label.pack(expand=True)
@@ -208,5 +210,7 @@ try:
 
 except ImportError:
     pass
+
+root.mainloop()
 
 root.mainloop()
