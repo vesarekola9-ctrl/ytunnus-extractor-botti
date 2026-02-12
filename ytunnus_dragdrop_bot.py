@@ -1,4 +1,3 @@
-import os
 import re
 import threading
 import tkinter as tk
@@ -10,7 +9,6 @@ import PyPDF2
 from docx import Document
 import openpyxl
 
-# Selenium + driver manager
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
@@ -39,6 +37,7 @@ def extract_ytunnukset_from_pdf(pdf_path):
 
     with open(pdf_path, "rb") as f:
         reader = PyPDF2.PdfReader(f)
+
         for page in reader.pages:
             text = page.extract_text()
             if not text:
@@ -57,66 +56,46 @@ def extract_ytunnukset_from_pdf(pdf_path):
 # -----------------------------
 # Tallennus Word + Excel
 # -----------------------------
-def save_ytunnukset_word(ytunnukset, filename="ytunnukset.docx"):
+def save_word_list(lines, filename, title):
     doc = Document()
-    doc.add_heading("Y-tunnukset", level=1)
+    doc.add_heading(title, level=1)
 
-    for yt in ytunnukset:
-        doc.add_paragraph(yt)
+    for line in lines:
+        doc.add_paragraph(line)
 
     doc.save(filename)
 
 
-def save_ytunnukset_excel(ytunnukset, filename="ytunnukset.xlsx"):
+def save_excel_table(rows, filename, headers):
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "Y-tunnukset"
 
-    ws["A1"] = "Y-tunnus"
+    for col, h in enumerate(headers, start=1):
+        ws.cell(row=1, column=col).value = h
 
-    for i, yt in enumerate(ytunnukset, start=2):
-        ws[f"A{i}"] = yt
-
-    wb.save(filename)
-
-
-def save_emails_word(results, filename="virre_sahkopostit.docx"):
-    doc = Document()
-    doc.add_heading("Virre - Sähköpostit", level=1)
-
-    for yt, email in results:
-        doc.add_paragraph(f"{yt}  ->  {email}")
-
-    doc.save(filename)
-
-
-def save_emails_excel(results, filename="virre_sahkopostit.xlsx"):
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Sähköpostit"
-
-    ws["A1"] = "Y-tunnus"
-    ws["B1"] = "Sähköposti"
-
-    for i, (yt, email) in enumerate(results, start=2):
-        ws[f"A{i}"] = yt
-        ws[f"B{i}"] = email
+    for r, row_data in enumerate(rows, start=2):
+        for c, value in enumerate(row_data, start=1):
+            ws.cell(row=r, column=c).value = value
 
     wb.save(filename)
 
 
 # -----------------------------
-# Virre sähköpostien haku
+# VIRRE HAKU
 # -----------------------------
-def fetch_email_from_virre(driver, ytunnus, log_func):
+def virre_get_email(driver, ytunnus, log_func):
+    """
+    Avaa virre etusivu, hakee Y-tunnuksen ja palauttaa sähköpostin.
+    """
+
+    wait = WebDriverWait(driver, 25)
+
     driver.get("https://virre.prh.fi/novus/home")
 
-    wait = WebDriverWait(driver, 20)
-
     try:
-        log_func("Etsitään hakukenttä...")
+        log_func("Etsitään Virre hakukenttä...")
 
-        # Tämä hakee ekana tekstikentän (Virre käyttää tätä yleensä)
+        # Hakukenttä on tuolla etusivulla iso input
         search_input = wait.until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='text']"))
         )
@@ -124,27 +103,29 @@ def fetch_email_from_virre(driver, ytunnus, log_func):
         search_input.clear()
         search_input.send_keys(ytunnus)
 
-        log_func("Painetaan Hae...")
+        log_func("Klikataan HAE...")
 
-        # Etsitään nappi joka sisältää "Hae"
-        buttons = driver.find_elements(By.TAG_NAME, "button")
-        clicked = False
+        # Virren HAE-nappi on yleensä button jossa teksti HAE
+        hae_btn = wait.until(
+            EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'HAE')]"))
+        )
+        hae_btn.click()
 
-        for b in buttons:
-            if "hae" in b.text.strip().lower():
-                b.click()
-                clicked = True
-                break
+        # Odotetaan että tulossivu latautuu
+        log_func("Odotetaan tuloksia...")
 
-        if not clicked:
-            return "EI HAKUNAPPIA"
+        wait.until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
 
-        # Odotetaan että sivu muuttuu / tulos latautuu
-        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        # Nyt yritetään löytää teksti "Sähköposti" ja siitä email
+        page_text = driver.page_source
 
-        page_source = driver.page_source
+        email_match = re.search(
+            r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+",
+            page_text
+        )
 
-        email_match = re.search(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", page_source)
         if email_match:
             return email_match.group(0)
 
@@ -154,19 +135,131 @@ def fetch_email_from_virre(driver, ytunnus, log_func):
         return f"VIRHE: {str(e)}"
 
 
-def fetch_all_emails(ytunnukset, log_func):
-    log_func("Käynnistetään Chrome (Selenium)...")
+def fetch_all_emails_from_virre(ytunnukset, log_func):
+    log_func("Käynnistetään Chrome...")
 
     try:
         options = webdriver.ChromeOptions()
-
-        # Näkyvä Chrome (debug)
         options.add_argument("--start-maximized")
-
-        # tärkeä exe:ssä
         options.add_argument("--disable-gpu")
-
-        # tämä auttaa jos ongelmia profiilin kanssa
         options.add_argument("--disable-dev-shm-usage")
 
-        driver_pat_
+        driver_path = ChromeDriverManager().install()
+        log_func(f"ChromeDriver: {driver_path}")
+
+        driver = webdriver.Chrome(service=Service(driver_path), options=options)
+
+    except Exception as e:
+        log_func("CHROME EI KÄYNNISTY!")
+        log_func(str(e))
+        return [(yt, "CHROME EI KÄYNNISTY") for yt in ytunnukset]
+
+    results = []
+
+    try:
+        for yt in ytunnukset:
+            log_func(f"Haku Virrestä: {yt}")
+            email = virre_get_email(driver, yt, log_func)
+            results.append((yt, email))
+
+    finally:
+        driver.quit()
+
+    return results
+
+
+# -----------------------------
+# GUI
+# -----------------------------
+class App(TkinterDnD.Tk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("Protestilista botti (Y-tunnukset + Virre sähköpostit)")
+        self.geometry("720x520")
+
+        self.drop_label = tk.Label(
+            self,
+            text="VEDÄ JA PUDOTA PDF TÄHÄN",
+            font=("Arial", 16, "bold"),
+            bg="lightgray",
+            relief="ridge",
+            width=60,
+            height=5
+        )
+        self.drop_label.pack(pady=20)
+
+        self.log_box = tk.Text(self, height=18, width=85)
+        self.log_box.pack(pady=10)
+
+        # TÄRKEÄ: Drop toimii koko ikkunassa ja labelissa
+        self.drop_target_register(DND_FILES)
+        self.dnd_bind("<<Drop>>", self.drop_file)
+
+        self.drop_label.drop_target_register(DND_FILES)
+        self.drop_label.dnd_bind("<<Drop>>", self.drop_file)
+
+    def log(self, msg):
+        self.log_box.insert(tk.END, msg + "\n")
+        self.log_box.see(tk.END)
+        self.update_idletasks()
+
+    def drop_file(self, event):
+        file_path = event.data.strip()
+
+        if file_path.startswith("{") and file_path.endswith("}"):
+            file_path = file_path[1:-1]
+
+        self.log(f"PDF vastaanotettu: {file_path}")
+
+        if not file_path.lower().endswith(".pdf"):
+            messagebox.showerror("Virhe", "Vain PDF-tiedostot sallittu!")
+            return
+
+        threading.Thread(target=self.process_pdf, args=(file_path,), daemon=True).start()
+
+    def process_pdf(self, pdf_path):
+        try:
+            self.log("Luetaan PDF ja etsitään Y-tunnukset...")
+
+            ytunnukset = extract_ytunnukset_from_pdf(pdf_path)
+
+            if not ytunnukset:
+                self.log("Ei löytynyt yhtään Y-tunnusta.")
+                messagebox.showwarning("Ei löytynyt", "PDF:stä ei löytynyt yhtään Y-tunnusta.")
+                return
+
+            self.log(f"Löytyi {len(ytunnukset)} Y-tunnusta.")
+
+            # Tallennetaan ytunnukset
+            save_word_list(ytunnukset, "ytunnukset.docx", "Y-tunnukset")
+            save_excel_table([(yt,) for yt in ytunnukset], "ytunnukset.xlsx", ["Y-tunnus"])
+
+            self.log("Tallennettu: ytunnukset.docx")
+            self.log("Tallennettu: ytunnukset.xlsx")
+
+            # Virre sähköpostit
+            self.log("Aloitetaan Virre haku... Chrome avautuu nyt.")
+            results = fetch_all_emails_from_virre(ytunnukset, self.log)
+
+            # Tallennetaan sähköpostit
+            word_lines = [f"{yt} -> {email}" for yt, email in results]
+
+            save_word_list(word_lines, "virre_sahkopostit.docx", "Virre sähköpostit")
+            save_excel_table(results, "virre_sahkopostit.xlsx", ["Y-tunnus", "Sähköposti"])
+
+            self.log("Tallennettu: virre_sahkopostit.docx")
+            self.log("Tallennettu: virre_sahkopostit.xlsx")
+
+            self.log("VALMIS!")
+            messagebox.showinfo("Valmis", "Valmis!\nTiedostot löytyvät exe:n kansiosta.")
+
+        except Exception as e:
+            self.log("VIRHE!")
+            self.log(str(e))
+            messagebox.showerror("Virhe", str(e))
+
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
