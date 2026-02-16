@@ -6,19 +6,14 @@ import threading
 import tkinter as tk
 from tkinter import messagebox, filedialog
 
-# PDF + Word + Excel
 import PyPDF2
 from docx import Document
-import openpyxl
 
-# Selenium
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-
-# Driver manager
 from webdriver_manager.chrome import ChromeDriverManager
 
 
@@ -99,55 +94,39 @@ def extract_ytunnukset_from_pdf(pdf_path: str):
 
 
 # -----------------------------
-# Tallennus Word/Excel
+# Word-tallennus
 # -----------------------------
-def save_word_list(lines, filename, title):
+def save_word_list(lines, filename, title=None):
     path = os.path.join(OUT_DIR, filename)
     doc = Document()
-    doc.add_heading(title, level=1)
+    if title:
+        doc.add_heading(title, level=1)
     for line in lines:
         doc.add_paragraph(line)
     doc.save(path)
     log(f"Tallennettu Word: {path}")
 
 
-def save_excel_table(rows, filename, headers):
-    path = os.path.join(OUT_DIR, filename)
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Tulokset"
-    ws.append(headers)
-    for r in rows:
-        ws.append(list(r))
-    wb.save(path)
-    log(f"Tallennettu Excel: {path}")
-
-
 # -----------------------------
-# VIRRE: sähköposti nimenomaan "Sähköposti"-kentästä
+# VIRRE: hae sähköposti nimenomaan "Sähköposti"-kentästä
 # -----------------------------
 def normalize_email(text: str):
-    # Virre näyttää usein info(a)firma.fi
     return (text or "").strip().replace(" ", "").replace("(a)", "@").replace("[at]", "@")
 
 
 def extract_company_email_from_dom(driver):
     """
-    Poimii yrityksen sähköpostin DOMista kohdasta 'Sähköposti' (ei footterin virre-mailia).
-    Palauttaa "" jos ei löydy.
+    Poimii yrityksen sähköpostin DOMista kohdasta 'Sähköposti'
+    (ei Virren omaa footterisähköpostia).
     """
-    # Etsi label-elementti jonka tekstinä tarkalleen Sähköposti
     labels = driver.find_elements(By.XPATH, "//*[normalize-space(.)='Sähköposti']")
     for lab in labels:
         try:
-            # Kokeillaan yleiset: sisarus / seuraava elementti / parentin seuraava
             candidates = []
             candidates += lab.find_elements(By.XPATH, "following-sibling::*[1]")
             candidates += lab.find_elements(By.XPATH, "following::*[1]")
             parent = lab.find_element(By.XPATH, "..")
             candidates += parent.find_elements(By.XPATH, "following-sibling::*[1]")
-
-            # Lisäksi: joskus arvo on linkissä <a>
             candidates += parent.find_elements(By.XPATH, ".//a")
 
             for c in candidates:
@@ -155,10 +134,10 @@ def extract_company_email_from_dom(driver):
                 if "@" in txt and "." in txt and len(txt) >= 6:
                     return txt
 
-                # varalla: jos mukana muuta tekstiä, poimi email-regexillä
                 m = re.search(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", txt)
                 if m:
                     return m.group(0)
+
         except Exception:
             continue
 
@@ -166,9 +145,6 @@ def extract_company_email_from_dom(driver):
 
 
 def find_search_input(driver):
-    """
-    Etsitään Virre etusivun hakukenttä luotettavasti.
-    """
     inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='text'], input[type='search']")
     candidates = []
     for inp in inputs:
@@ -187,7 +163,6 @@ def find_search_input(driver):
 
 
 def click_hae_button(driver):
-    # Ensisijaisesti <button> jossa teksti "HAE"
     buttons = driver.find_elements(By.TAG_NAME, "button")
     for b in buttons:
         try:
@@ -197,7 +172,6 @@ def click_hae_button(driver):
         except Exception:
             continue
 
-    # Fallback: mikä tahansa klikattava elementti, jossa HAE
     elems = driver.find_elements(By.XPATH, "//*[contains(translate(normalize-space(.),'hae','HAE'),'HAE')]")
     for e in elems:
         try:
@@ -210,9 +184,6 @@ def click_hae_button(driver):
 
 
 def try_open_first_result_if_list(driver):
-    """
-    Jos tulee tuloslista, klikataan ensimmäinen linkki jossa näkyy Y-tunnus.
-    """
     links = driver.find_elements(By.TAG_NAME, "a")
     for a in links:
         try:
@@ -227,7 +198,6 @@ def try_open_first_result_if_list(driver):
 
 def start_chrome_driver():
     options = webdriver.ChromeOptions()
-    # näkyvä Chrome (luotettavin)
     options.add_argument("--start-maximized")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-dev-shm-usage")
@@ -239,7 +209,7 @@ def start_chrome_driver():
 
 def virre_fetch_email_for_yt(driver, yt):
     """
-    Palauttaa (email tai "", status-teksti)
+    Palauttaa (email, status). email tyhjä jos ei löydy.
     """
     wait = WebDriverWait(driver, 25)
 
@@ -259,7 +229,6 @@ def virre_fetch_email_for_yt(driver, yt):
     if not click_hae_button(driver):
         return "", "EI HAE-NAPPIA"
 
-    # Odota että tulos/yrityssivu latautuu (body löytyy aina)
     wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
     # Jos listaus, avaa eka osuma
@@ -269,25 +238,22 @@ def virre_fetch_email_for_yt(driver, yt):
     except Exception:
         pass
 
-    # TÄRKEIN: poimi sähköposti vain "Sähköposti"-kentästä
     email = extract_company_email_from_dom(driver)
     if email:
         return email, "OK"
-
-    # Jos sähköposti-label ei löydy tai ei ole arvoa
     return "", "EI SÄHKÖPOSTIA"
 
 
 # -----------------------------
-# GUI (valitse PDF)
+# GUI
 # -----------------------------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         reset_log()
 
-        self.title("Y-tunnus extractor + Virre sähköpostit")
-        self.geometry("560x320")
+        self.title("ProtestiBotti (vain Word)")
+        self.geometry("580x330")
 
         title = tk.Label(self, text="ProtestiBotti", font=("Arial", 18, "bold"))
         title.pack(pady=12)
@@ -295,7 +261,7 @@ class App(tk.Tk):
         info = tk.Label(
             self,
             text="Valitse PDF → botti kerää Y-tunnukset → hakee Virrestä sähköpostit\n"
-                 "Tallennus: EXE-kansio (tai fallback Documents\\ProtestiBotti)",
+                 "Tuloksena vain Word-tiedostot (ei Exceliä).",
             justify="center"
         )
         info.pack(pady=8)
@@ -306,7 +272,7 @@ class App(tk.Tk):
         self.status = tk.Label(self, text="Valmiina.", font=("Arial", 11))
         self.status.pack(pady=8)
 
-        out = tk.Label(self, text=f"Output: {OUT_DIR}", wraplength=520, justify="center")
+        out = tk.Label(self, text=f"Output: {OUT_DIR}", wraplength=540, justify="center")
         out.pack(pady=6)
 
     def pick_pdf(self):
@@ -328,11 +294,12 @@ class App(tk.Tk):
                 messagebox.showwarning("Ei löytynyt", "PDF:stä ei löytynyt yhtään Y-tunnusta.")
                 return
 
-            self.set_status(f"Löytyi {len(yt)} Y-tunnusta. Tallennetaan…")
-            save_word_list(yt, "ytunnukset.docx", "Y-tunnukset")
-            save_excel_table([(x,) for x in yt], "ytunnukset.xlsx", ["Y-tunnus"])
+            # 1) ytunnukset.docx
+            self.set_status(f"Löytyi {len(yt)} Y-tunnusta. Tallennetaan Word…")
+            save_word_list(yt, "ytunnukset.docx", title="Y-tunnukset")
 
-            self.set_status("Käynnistetään Chrome ja haetaan Virrestä sähköpostit…")
+            # 2) Virre sähköpostit -> vain emailit allekkain Wordiin
+            self.set_status("Käynnistetään Chrome ja haetaan sähköpostit…")
             try:
                 driver = start_chrome_driver()
             except Exception as e:
@@ -341,27 +308,35 @@ class App(tk.Tk):
                 self.set_status("Chrome ei käynnistynyt.")
                 return
 
-            results = []
+            emails_only = []
+            seen = set()
+
             try:
                 for i, y in enumerate(yt, start=1):
                     self.set_status(f"Virre {i}/{len(yt)}: {y}")
-                    email, status = virre_fetch_email_for_yt(driver, y)
-                    results.append((y, email if email else status))
-                    # pieni viive ettei hakata palvelua
-                    time.sleep(1)
+                    email, _status = virre_fetch_email_for_yt(driver, y)
+                    if email:
+                        key = email.lower()
+                        if key not in seen:
+                            seen.add(key)
+                            emails_only.append(email)
+                    time.sleep(1)  # kevyt viive ettei hakata palvelua
             finally:
                 try:
                     driver.quit()
                 except Exception:
                     pass
 
-            self.set_status("Tallennetaan sähköpostit…")
-            word_lines = [f"{y} -> {e}" for y, e in results]
-            save_word_list(word_lines, "virre_sahkopostit.docx", "Virre sähköpostit")
-            save_excel_table(results, "virre_sahkopostit.xlsx", ["Y-tunnus", "Sähköposti / status"])
+            self.set_status("Tallennetaan sähköpostit Wordiin…")
+            # HUOM: vain sähköpostit allekkain
+            save_word_list(emails_only, "sahkopostit.docx", title="Sähköpostit")
 
             self.set_status("Valmis!")
-            messagebox.showinfo("Valmis", f"Valmis!\n\nTiedostot:\n{OUT_DIR}\n\nLogi:\n{LOG_PATH}")
+            messagebox.showinfo(
+                "Valmis",
+                f"Valmis!\n\nTiedostot:\n{OUT_DIR}\n"
+                f"- ytunnukset.docx\n- sahkopostit.docx\n\nLogi:\n{LOG_PATH}"
+            )
 
         except Exception as e:
             log(f"VIRHE: {e}")
