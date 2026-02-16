@@ -2,7 +2,6 @@ import os
 import re
 import sys
 import time
-import random
 import threading
 import tkinter as tk
 from tkinter import messagebox, filedialog
@@ -19,17 +18,9 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9-.]+")
-EMAIL_A_RE = re.compile(r"[A-Za-z0-9_.+-]+\s*\(a\)\s*[A-Za-z0-9-]+\.[A-Za-z0-9-.]+")
-
-BLOCK_HINTS = [
-    "captcha", "robot", "access denied", "liian monta", "too many requests",
-    "rate limit", "kielletty", "forbidden", "blocked", "estetty", "varmistus"
-]
+EMAIL_A_RE = re.compile(r"[A-Za-z0-9_.+-]+\s*\(a\)\s*[A-Za-z0-9-]+\.[A-Za-z0-9-.]+", re.I)
 
 
-# -----------------------------
-# Output + päivämääräkansio
-# -----------------------------
 def get_exe_dir():
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
@@ -79,9 +70,6 @@ def reset_log():
     log(f"Logi: {LOG_PATH}")
 
 
-# -----------------------------
-# PDF -> Y-tunnukset
-# -----------------------------
 def normalize_yt(yt: str):
     yt = yt.strip().replace(" ", "")
     if re.fullmatch(r"\d{7}-\d", yt):
@@ -105,9 +93,6 @@ def extract_ytunnukset_from_pdf(pdf_path: str):
     return sorted(yt_set)
 
 
-# -----------------------------
-# Word: pelkkä lista riveinä (ei otsikkoa)
-# -----------------------------
 def save_word_plain_lines(lines, filename):
     path = os.path.join(OUT_DIR, filename)
     doc = Document()
@@ -117,9 +102,6 @@ def save_word_plain_lines(lines, filename):
     log(f"Tallennettu: {path}")
 
 
-# -----------------------------
-# Email poiminta (vain email)
-# -----------------------------
 def normalize_email_candidate(raw: str) -> str:
     raw = (raw or "").strip().replace(" ", "")
     raw = raw.replace("(a)", "@").replace("[at]", "@")
@@ -147,8 +129,8 @@ def extract_company_email_from_dom(driver):
             if email:
                 return email
 
-            sib = lab.find_elements(By.XPATH, "following-sibling::*[1]")
-            for s in sib:
+            sibs = lab.find_elements(By.XPATH, "following-sibling::*[1]")
+            for s in sibs:
                 email = pick_email_from_text(s.text)
                 if email:
                     return email
@@ -161,7 +143,6 @@ def extract_company_email_from_dom(driver):
         except Exception:
             continue
 
-    # fallback: etsi mail main-alueelta (ei koko sivulta -> vähentää footteri-osumia)
     try:
         main = driver.find_element(By.TAG_NAME, "main")
         email = pick_email_from_text(main.text)
@@ -173,9 +154,6 @@ def extract_company_email_from_dom(driver):
     return ""
 
 
-# -----------------------------
-# Virre: 1 selain, NOPEA, blokin tunnistus
-# -----------------------------
 def start_driver():
     options = webdriver.ChromeOptions()
     options.add_argument("--start-maximized")
@@ -199,79 +177,44 @@ def click_hae_button(driver):
     return False
 
 
-def looks_blocked(page_source_lower: str) -> bool:
-    return any(h in page_source_lower for h in BLOCK_HINTS)
-
-
 def virre_fetch_email(driver, yt):
-    """
-    Returns: (email, blocked_flag)
-    blocked_flag=True jos havaitaan blokki/captcha/robot.
-    """
     wait = WebDriverWait(driver, 20)
 
     driver.get("https://virre.prh.fi/novus/home")
     wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-
-    src = (driver.page_source or "").lower()
-    if looks_blocked(src):
-        return "", True
 
     search = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='text'], input[type='search']")))
     search.clear()
     search.send_keys(yt)
 
     if not click_hae_button(driver):
-        # ei välttämättä blokki, voi olla UI muutos
-        return "", False
+        return ""
 
-    # pieni odotus että tulos ehtii päivittyä (ei pitkä sleep)
     try:
         wait.until(EC.presence_of_element_located((By.XPATH, "//*[normalize-space(.)='Sähköposti']")))
     except Exception:
         pass
 
-    src2 = (driver.page_source or "").lower()
-    if looks_blocked(src2):
-        return "", True
-
-    email = extract_company_email_from_dom(driver)
-    return email, False
+    return extract_company_email_from_dom(driver)
 
 
-# -----------------------------
-# GUI
-# -----------------------------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         reset_log()
 
-        self.title("ProtestiBotti (nopea + blokki-hälytys)")
-        self.geometry("720x420")
+        self.title("ProtestiBotti")
+        self.geometry("600x340")
 
         tk.Label(self, text="ProtestiBotti", font=("Arial", 18, "bold")).pack(pady=12)
-        tk.Label(self, text="Nopea yksinajo + pysäyttää jos Virre blokkaa/captcha", justify="center").pack(pady=6)
-
-        row = tk.Frame(self)
-        row.pack(pady=6)
-
-        tk.Label(row, text="Perusviive (s):", font=("Arial", 11)).pack(side="left", padx=6)
-        self.base_delay_var = tk.DoubleVar(value=0.12)  # NOPEA
-        tk.Entry(row, textvariable=self.base_delay_var, width=6).pack(side="left")
-
-        row2 = tk.Frame(self)
-        row2.pack(pady=6)
-        tk.Label(row2, text="Max viive (s):", font=("Arial", 11)).pack(side="left", padx=6)
-        self.max_delay_var = tk.DoubleVar(value=1.5)  # ei pitkiä viiveitä
-        tk.Entry(row2, textvariable=self.max_delay_var, width=6).pack(side="left")
+        tk.Label(self, text="Valitse PDF → kerää Y-tunnukset → hae sähköpostit Virrestä", justify="center").pack(pady=6)
 
         tk.Button(self, text="Valitse PDF", font=("Arial", 12), command=self.pick_pdf).pack(pady=12)
 
         self.status = tk.Label(self, text="Valmiina.", font=("Arial", 11))
         self.status.pack(pady=10)
 
-        tk.Label(self, text=f"Tallennus: {OUT_DIR}", wraplength=680, justify="center").pack(pady=6)
+        tk.Label(self, text=f"Tallennus: {OUT_DIR}", wraplength=560, justify="center").pack(pady=6)
 
     def set_status(self, s):
         self.status.config(text=s)
@@ -295,35 +238,16 @@ class App(tk.Tk):
 
             save_word_plain_lines(yt_list, "ytunnukset.docx")
 
-            self.set_status("Käynnistetään Chrome…")
+            self.set_status("Käynnistetään Chrome ja haetaan sähköpostit…")
             driver = start_driver()
 
             emails = []
             seen = set()
 
-            base_delay = max(0.05, float(self.base_delay_var.get()))
-            max_delay = max(base_delay, float(self.max_delay_var.get()))
-            cur_delay = base_delay
-
             try:
                 for i, yt in enumerate(yt_list, start=1):
-                    self.set_status(f"Haku {i}/{len(yt_list)} (viive {cur_delay:.2f}s)")
-
-                    email, blocked = virre_fetch_email(driver, yt)
-
-                    if blocked:
-                        # Tallenna tähän asti saadut ja pysäytä
-                        save_word_plain_lines(emails, "sahkopostit_PARTIAL.docx")
-                        log("BLOKKI HAVAITTU -> pysäytetään.")
-                        messagebox.showerror(
-                            "Blokki havaittu",
-                            "Virre näyttää blokanneen / CAPTCHA / robot-tarkistus.\n\n"
-                            "Tallensin tähän asti saadut sähköpostit:\n"
-                            f"{os.path.join(OUT_DIR, 'sahkopostit_PARTIAL.docx')}\n\n"
-                            "Pidä tauko ja kokeile myöhemmin."
-                        )
-                        self.set_status("Pysäytetty: blokki havaittu.")
-                        return
+                    self.set_status(f"Haku {i}/{len(yt_list)}: {yt}")
+                    email = virre_fetch_email(driver, yt)
 
                     if email:
                         k = email.lower()
@@ -331,20 +255,7 @@ class App(tk.Tk):
                             seen.add(k)
                             emails.append(email)
 
-                    # NOPEA, mutta pieni jitter ettei ole täysin tasainen
-                    jitter = random.uniform(0.0, 0.08)
-
-                    # kevyt “mikro-backoff” jos ei löydy mitään usein (mutta ei pitkiä viiveitä)
-                    if not email:
-                        cur_delay = min(max_delay, max(cur_delay * 1.08, base_delay))
-                    else:
-                        cur_delay = max(base_delay, cur_delay * 0.95)
-
-                    time.sleep(cur_delay + jitter)
-
-                    # kevyt mini-tauko joka 100 haku (EI pitkä)
-                    if i % 100 == 0:
-                        time.sleep(1.0)
+                    time.sleep(0.1)  # 🔥 nopeampi
 
             finally:
                 try:
@@ -353,6 +264,7 @@ class App(tk.Tk):
                     pass
 
             save_word_plain_lines(emails, "sahkopostit.docx")
+
             self.set_status("Valmis!")
             messagebox.showinfo("Valmis", f"Valmis!\n\nKansio:\n{OUT_DIR}")
 
