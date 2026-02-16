@@ -20,11 +20,11 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller tkinterdnd2 PyPDF2 python-docx openpyxl selenium webdriver-manager
+          pip install pyinstaller PyPDF2 python-docx openpyxl selenium webdriver-manager tkinterdnd2
 
       - name: Build .exe
         run: |
-          pyinstaller --onefile --windowed ytunnus_dragdrop_bot.py
+          pyinstaller --onefile --windowed --hidden-import=tkinterdnd2 --hidden-import=tkinterdnd2.TkinterDnD ytunnus_dragdrop_bot.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
