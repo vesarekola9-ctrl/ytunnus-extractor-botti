@@ -1,3 +1,4 @@
+PyPDF2
 python-docx
 selenium
 webdriver-manager
