@@ -1,5 +1,4 @@
 PyPDF2
 python-docx
-openpyxl
 selenium
 webdriver-manager
