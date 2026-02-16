@@ -20,6 +20,9 @@ from webdriver_manager.chrome import ChromeDriverManager
 EMAIL_RE = re.compile(r"[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9-.]+")
 EMAIL_A_RE = re.compile(r"[A-Za-z0-9_.+-]+\s*\(a\)\s*[A-Za-z0-9-]+\.[A-Za-z0-9-.]+", re.I)
 
+# Debug: jos ei löydy emailia, tallenna sivun HTML ensimmäisistä N tapauksesta
+DEBUG_DUMP_NO_EMAIL_FIRST_N = 5
+
 
 # -----------------------------
 # Output + päivämääräkansio
@@ -140,7 +143,6 @@ def start_driver():
     options.add_argument("--start-maximized")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-dev-shm-usage")
-
     driver_path = ChromeDriverManager().install()
     log("ChromeDriver OK")
     return webdriver.Chrome(service=Service(driver_path), options=options)
@@ -153,7 +155,6 @@ def click_all_nayta(driver):
     for _ in range(3):
         clicked = False
 
-        # button
         for b in driver.find_elements(By.TAG_NAME, "button"):
             try:
                 if (b.text or "").strip().lower() == "näytä" and b.is_displayed() and b.is_enabled():
@@ -164,7 +165,6 @@ def click_all_nayta(driver):
             except Exception:
                 continue
 
-        # linkki
         for a in driver.find_elements(By.TAG_NAME, "a"):
             try:
                 if (a.text or "").strip().lower() == "näytä" and a.is_displayed():
@@ -179,23 +179,86 @@ def click_all_nayta(driver):
             break
 
 
-def extract_email_from_ytj(driver):
+def wait_company_page_loaded(driver):
     """
-    Poimi sähköposti taulukkoriviltä:
-    - löydä elementti "Sähköposti"
-    - ota lähin <tr> ja poimi email sen tekstistä
+    Odota että yrityssivun sisältö on oikeasti ladattu.
+    Odotetaan tekstiä 'Y-tunnus' tai 'Sähköposti' (kumpi tulee ensin).
     """
-    nodes = driver.find_elements(By.XPATH, "//*[normalize-space(.)='Sähköposti']")
-    for n in nodes:
+    wait = WebDriverWait(driver, 25)
+    wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+
+    # YTJ on JS-heavy: odotetaan vielä että yritystiedot-tekstit löytyy DOM:sta
+    try:
+        wait.until(EC.presence_of_element_located(
+            (By.XPATH, "//*[contains(normalize-space(.), 'Y-tunnus') or contains(normalize-space(.), 'Sähköposti')]")
+        ))
+    except Exception:
+        # jos ei löydy, jatketaan silti (fallback regex)
+        pass
+
+
+def extract_email_from_row_cells(driver):
+    """
+    Etsi 'Sähköposti' sisältävä solu ja ota seuraava solu samalta riviltä.
+    Toimii kun sivu on taulukko/tr/td (kuten screenshot).
+    """
+    # Solu voi olla td tai th
+    label_cells = driver.find_elements(
+        By.XPATH,
+        "//tr//*[self::td or self::th][contains(normalize-space(.), 'Sähköposti')]"
+    )
+
+    for cell in label_cells:
         try:
-            tr = n.find_element(By.XPATH, "ancestor::tr[1]")
-            email = pick_email_from_text(tr.text or "")
-            if email:
-                return email
+            tr = cell.find_element(By.XPATH, "ancestor::tr[1]")
+
+            # 1) kokeile mailto-linkki ensin
+            for a in tr.find_elements(By.TAG_NAME, "a"):
+                href = (a.get_attribute("href") or "")
+                if href.lower().startswith("mailto:"):
+                    return normalize_email_candidate(href.split(":", 1)[1])
+                e = pick_email_from_text(a.text or "")
+                if e:
+                    return e
+
+            # 2) ota seuraava solu samalla rivillä
+            # jos label cell on 1. solu, seuraava on 2.
+            next_cell = None
+            try:
+                next_cell = cell.find_element(By.XPATH, "following-sibling::*[1]")
+            except Exception:
+                # vaihtoehto: ota rivin kaikki solut ja etsi labelin jälkeen
+                tds = tr.find_elements(By.XPATH, ".//*[self::td or self::th]")
+                for idx, c in enumerate(tds):
+                    if c == cell and idx + 1 < len(tds):
+                        next_cell = tds[idx + 1]
+                        break
+
+            if next_cell:
+                e = pick_email_from_text(next_cell.text or "")
+                if e:
+                    return e
+                # myös mailto mahdollinen tässä solussa
+                for a in next_cell.find_elements(By.TAG_NAME, "a"):
+                    href = (a.get_attribute("href") or "")
+                    if href.lower().startswith("mailto:"):
+                        return normalize_email_candidate(href.split(":", 1)[1])
+                    e = pick_email_from_text(a.text or "")
+                    if e:
+                        return e
+
+            # 3) fallback: koko riviteksti
+            e = pick_email_from_text(tr.text or "")
+            if e:
+                return e
+
         except Exception:
             continue
 
-    # fallback: main-alueesta
+    return ""
+
+
+def extract_email_fallback_main(driver):
     try:
         main = driver.find_element(By.TAG_NAME, "main")
         return pick_email_from_text(main.text or "")
@@ -203,28 +266,38 @@ def extract_email_from_ytj(driver):
         return ""
 
 
-def ytj_fetch_email_direct(driver, yt):
+def dump_debug_html(driver, yt):
+    try:
+        path = os.path.join(OUT_DIR, f"debug_no_email_{yt}.html")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(driver.page_source or "")
+        log(f"DEBUG: tallennettu HTML: {path}")
+    except Exception:
+        pass
+
+
+def ytj_fetch_email_direct(driver, yt, debug_counter):
     """
-    UUSI LOGIIKKA: avaa suoraan yrityssivu:
-    https://tietopalvelu.ytj.fi/yritys/<Y-TUNNUS>
+    Avaa suoraan yrityssivu /yritys/<yt>, klikkaa 'Näytä', poimi email.
     """
-    wait = WebDriverWait(driver, 20)
     url = f"https://tietopalvelu.ytj.fi/yritys/{yt}"
     driver.get(url)
 
-    # odota että sivu latautuu
-    wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    wait_company_page_loaded(driver)
 
-    # varmistus: jos tuli jokin virhesivu, palauta tyhjä
-    src = (driver.page_source or "").lower()
-    if "404" in src or "not found" in src:
-        return ""
-
-    # klikkaa "Näytä" jos tarvitaan
+    # Avaa piilotetut tiedot
     click_all_nayta(driver)
 
-    # poimi email
-    return extract_email_from_ytj(driver)
+    # Poimi sähköposti
+    email = extract_email_from_row_cells(driver)
+    if not email:
+        email = extract_email_fallback_main(driver)
+
+    # Debug dump jos ei löydy
+    if not email and debug_counter < DEBUG_DUMP_NO_EMAIL_FIRST_N:
+        dump_debug_html(driver, yt)
+
+    return email
 
 
 # -----------------------------
@@ -239,8 +312,11 @@ class App(tk.Tk):
         self.geometry("620x360")
 
         tk.Label(self, text="ProtestiBotti", font=("Arial", 18, "bold")).pack(pady=12)
-        tk.Label(self, text="Valitse PDF → kerää Y-tunnukset → avaa YTJ yrityssivu suoraan (/yritys/..)\n→ klikkaa Näytä → poimi sähköposti",
-                 justify="center").pack(pady=6)
+        tk.Label(
+            self,
+            text="Valitse PDF → kerää Y-tunnukset → avaa YTJ yrityssivu suoraan (/yritys/..)\n→ klikkaa Näytä → poimi sähköposti",
+            justify="center"
+        ).pack(pady=6)
 
         tk.Button(self, text="Valitse PDF", font=("Arial", 12), command=self.pick_pdf).pack(pady=12)
 
@@ -276,19 +352,23 @@ class App(tk.Tk):
 
             emails = []
             seen = set()
+            debug_no_email = 0
 
             try:
                 for i, yt in enumerate(yt_list, start=1):
                     self.set_status(f"Haku {i}/{len(yt_list)}: {yt}")
-                    email = ytj_fetch_email_direct(driver, yt)
+                    email = ytj_fetch_email_direct(driver, yt, debug_no_email)
 
                     if email:
-                        k = email.lower()
-                        if k not in seen:
-                            seen.add(k)
+                        key = email.lower()
+                        if key not in seen:
+                            seen.add(key)
                             emails.append(email)
+                    else:
+                        debug_no_email += 1
 
-                    time.sleep(0.1)  # nopea
+                    time.sleep(0.1)  # nopea, kuten halusit
+
             finally:
                 try:
                     driver.quit()
@@ -298,7 +378,11 @@ class App(tk.Tk):
             save_word_plain_lines(emails, "sahkopostit.docx")
 
             self.set_status("Valmis!")
-            messagebox.showinfo("Valmis", f"Valmis!\n\nKansio:\n{OUT_DIR}\n\nLöydetyt emailit: {len(emails)}")
+            messagebox.showinfo(
+                "Valmis",
+                f"Valmis!\n\nKansio:\n{OUT_DIR}\n\nLöydetyt emailit: {len(emails)}\n\n"
+                f"Jos nolla, katso debug_no_email_*.html tiedostot kansiosta."
+            )
 
         except Exception as e:
             log(f"VIRHE: {e}")
