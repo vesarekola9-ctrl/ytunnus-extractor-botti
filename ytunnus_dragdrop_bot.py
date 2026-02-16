@@ -19,6 +19,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 # -----------------------------
 # Output-kansio: EXE-kansio ensisijaisesti, fallback Documentsiin
+# + Päivämääräkansio YYYY-MM-DD
 # -----------------------------
 def get_exe_dir():
     if getattr(sys, "frozen", False):
@@ -27,19 +28,23 @@ def get_exe_dir():
 
 
 def get_output_dir():
-    exe_dir = get_exe_dir()
+    base = get_exe_dir()
+
+    # testaa kirjoitusoikeus exe-kansioon
     try:
-        test_path = os.path.join(exe_dir, "_write_test.tmp")
+        test_path = os.path.join(base, "_write_test.tmp")
         with open(test_path, "w", encoding="utf-8") as f:
             f.write("ok")
         os.remove(test_path)
-        return exe_dir
     except Exception:
         home = os.path.expanduser("~")
         docs = os.path.join(home, "Documents")
-        out = os.path.join(docs, "ProtestiBotti")
-        os.makedirs(out, exist_ok=True)
-        return out
+        base = os.path.join(docs, "ProtestiBotti")
+
+    date_folder = time.strftime("%Y-%m-%d")
+    out = os.path.join(base, date_folder)
+    os.makedirs(out, exist_ok=True)
+    return out
 
 
 OUT_DIR = get_output_dir()
@@ -108,17 +113,13 @@ def save_word_list(lines, filename, title=None):
 
 
 # -----------------------------
-# VIRRE: hae sähköposti nimenomaan "Sähköposti"-kentästä
+# VIRRE: hae sähköposti "Sähköposti"-kentästä
 # -----------------------------
 def normalize_email(text: str):
     return (text or "").strip().replace(" ", "").replace("(a)", "@").replace("[at]", "@")
 
 
 def extract_company_email_from_dom(driver):
-    """
-    Poimii yrityksen sähköpostin DOMista kohdasta 'Sähköposti'
-    (ei Virren omaa footterisähköpostia).
-    """
     labels = driver.find_elements(By.XPATH, "//*[normalize-space(.)='Sähköposti']")
     for lab in labels:
         try:
@@ -133,14 +134,11 @@ def extract_company_email_from_dom(driver):
                 txt = normalize_email(getattr(c, "text", "") or "")
                 if "@" in txt and "." in txt and len(txt) >= 6:
                     return txt
-
                 m = re.search(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", txt)
                 if m:
                     return m.group(0)
-
         except Exception:
             continue
-
     return ""
 
 
@@ -208,11 +206,9 @@ def start_chrome_driver():
 
 
 def virre_fetch_email_for_yt(driver, yt):
-    """
-    Palauttaa (email, status). email tyhjä jos ei löydy.
-    """
-    wait = WebDriverWait(driver, 25)
+    wait = WebDriverWait(driver, 20)
 
+    # Ladataan etusivu joka haulla (varmin, vaikka vähän hitaampi)
     driver.get("https://virre.prh.fi/novus/home")
     wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
@@ -229,11 +225,17 @@ def virre_fetch_email_for_yt(driver, yt):
     if not click_hae_button(driver):
         return "", "EI HAE-NAPPIA"
 
-    wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    # Odota että yritystiedot latautuvat – nopea yritys: "Sähköposti"-label
+    try:
+        wait.until(EC.presence_of_element_located((By.XPATH, "//*[normalize-space(.)='Sähköposti']")))
+    except Exception:
+        # joskus ei ole sähköposti-kenttää, mutta sivu voi silti olla yrityssivu
+        pass
 
     # Jos listaus, avaa eka osuma
     try:
         if try_open_first_result_if_list(driver):
+            # odota että sivu latautuu
             wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
     except Exception:
         pass
@@ -252,19 +254,19 @@ class App(tk.Tk):
         super().__init__()
         reset_log()
 
-        self.title("ProtestiBotti (vain Word)")
-        self.geometry("580x330")
+        self.title("ProtestiBotti (valmis)")
+        self.geometry("600x340")
 
         title = tk.Label(self, text="ProtestiBotti", font=("Arial", 18, "bold"))
         title.pack(pady=12)
 
         info = tk.Label(
             self,
-            text="Valitse PDF → botti kerää Y-tunnukset → hakee Virrestä sähköpostit\n"
-                 "Tuloksena vain Word-tiedostot (ei Exceliä).",
+            text="Valitse PDF → kerää Y-tunnukset → hakee Virrestä sähköpostit\n"
+                 "Tuloksena vain Wordit + päivämääräkansio",
             justify="center"
         )
-        info.pack(pady=8)
+        info.pack(pady=6)
 
         btn = tk.Button(self, text="Valitse PDF", font=("Arial", 12), command=self.pick_pdf)
         btn.pack(pady=10)
@@ -272,7 +274,7 @@ class App(tk.Tk):
         self.status = tk.Label(self, text="Valmiina.", font=("Arial", 11))
         self.status.pack(pady=8)
 
-        out = tk.Label(self, text=f"Output: {OUT_DIR}", wraplength=540, justify="center")
+        out = tk.Label(self, text=f"Tallennus: {OUT_DIR}", wraplength=560, justify="center")
         out.pack(pady=6)
 
     def pick_pdf(self):
@@ -289,16 +291,15 @@ class App(tk.Tk):
         try:
             self.set_status("Luetaan PDF ja kerätään Y-tunnukset…")
             yt = extract_ytunnukset_from_pdf(pdf_path)
+
             if not yt:
                 self.set_status("Ei löytynyt Y-tunnuksia.")
                 messagebox.showwarning("Ei löytynyt", "PDF:stä ei löytynyt yhtään Y-tunnusta.")
                 return
 
-            # 1) ytunnukset.docx
-            self.set_status(f"Löytyi {len(yt)} Y-tunnusta. Tallennetaan Word…")
+            self.set_status(f"Löytyi {len(yt)} Y-tunnusta. Tallennetaan ytunnukset.docx…")
             save_word_list(yt, "ytunnukset.docx", title="Y-tunnukset")
 
-            # 2) Virre sähköpostit -> vain emailit allekkain Wordiin
             self.set_status("Käynnistetään Chrome ja haetaan sähköpostit…")
             try:
                 driver = start_chrome_driver()
@@ -320,22 +321,23 @@ class App(tk.Tk):
                         if key not in seen:
                             seen.add(key)
                             emails_only.append(email)
-                    time.sleep(1)  # kevyt viive ettei hakata palvelua
+
+                    # NOPEUTUS: pienempi viive
+                    time.sleep(0.3)
+
             finally:
                 try:
                     driver.quit()
                 except Exception:
                     pass
 
-            self.set_status("Tallennetaan sähköpostit Wordiin…")
-            # HUOM: vain sähköpostit allekkain
+            self.set_status("Tallennetaan sahkopostit.docx…")
             save_word_list(emails_only, "sahkopostit.docx", title="Sähköpostit")
 
             self.set_status("Valmis!")
             messagebox.showinfo(
                 "Valmis",
-                f"Valmis!\n\nTiedostot:\n{OUT_DIR}\n"
-                f"- ytunnukset.docx\n- sahkopostit.docx\n\nLogi:\n{LOG_PATH}"
+                f"Valmis!\n\nKansio:\n{OUT_DIR}\n\nTiedostot:\n- ytunnukset.docx\n- sahkopostit.docx\n\nLogi:\n{LOG_PATH}"
             )
 
         except Exception as e:
