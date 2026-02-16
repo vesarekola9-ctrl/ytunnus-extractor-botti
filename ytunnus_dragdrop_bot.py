@@ -6,40 +6,36 @@ import threading
 import tkinter as tk
 from tkinter import messagebox, filedialog
 
-# Drag & drop
+# Drag&Drop (valinnainen)
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
     HAS_DND = True
 except Exception:
     HAS_DND = False
 
-# PDF + Word + Excel
 import PyPDF2
 from docx import Document
 import openpyxl
 
-# Selenium
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-
-# Driver manager
 from webdriver_manager.chrome import ChromeDriverManager
 
 
 # -----------------------------
-# Polut (exe-kansioon)
+# OUTPUT-KANSIO: Dokumentit\ProtestiBotti
 # -----------------------------
-def base_dir():
-    # exe: sys.executable -> .../ytunnus_dragdrop_bot.exe
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+def get_output_dir():
+    home = os.path.expanduser("~")
+    docs = os.path.join(home, "Documents")
+    out = os.path.join(docs, "ProtestiBotti")
+    os.makedirs(out, exist_ok=True)
+    return out
 
-
-OUT_DIR = base_dir()
+OUT_DIR = get_output_dir()
 LOG_PATH = os.path.join(OUT_DIR, "log.txt")
 
 
@@ -51,12 +47,20 @@ def log(msg: str):
             f.write(line + "\n")
     except Exception:
         pass
-    # myös konsoliin (GitHub Actions / debug)
     print(line)
 
 
+def reset_log():
+    try:
+        with open(LOG_PATH, "w", encoding="utf-8") as f:
+            f.write("=== BOTTI KÄYNNISTETTY ===\n")
+        log(f"Output-kansio: {OUT_DIR}")
+    except Exception:
+        pass
+
+
 # -----------------------------
-# Y-tunnukset PDF:stä
+# Y-tunnus: normalisointi ja haku PDF:stä
 # -----------------------------
 def normalize_yt(yt: str):
     yt = yt.strip().replace(" ", "")
@@ -73,7 +77,6 @@ def extract_ytunnukset_from_pdf(pdf_path: str):
         reader = PyPDF2.PdfReader(f)
         for page in reader.pages:
             text = page.extract_text() or ""
-            # hae 1234567-8 tai 12345678
             matches = re.findall(r"\b\d{7}-\d\b|\b\d{8}\b", text)
             for m in matches:
                 n = normalize_yt(m)
@@ -108,17 +111,14 @@ def save_excel_table(rows, filename, headers):
 
 
 # -----------------------------
-# VIRRE: sähköpostin poiminta
+# VIRRE: sähköpostin etsiminen
 # -----------------------------
 EMAIL_AT = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
-EMAIL_A = re.compile(r"[a-zA-Z0-9_.+-]+\s*\(a\)\s*[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
-
+EMAIL_A  = re.compile(r"[a-zA-Z0-9_.+-]+\s*\(a\)\s*[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
 
 def normalize_email(raw: str):
     raw = raw.strip().replace(" ", "")
-    raw = raw.replace("(a)", "@").replace("[at]", "@")
-    return raw
-
+    return raw.replace("(a)", "@").replace("[at]", "@")
 
 def find_email_anywhere(page_source: str):
     m = EMAIL_AT.search(page_source)
@@ -131,11 +131,6 @@ def find_email_anywhere(page_source: str):
 
 
 def find_search_input(driver):
-    """
-    Etsitään Virren etusivun hakukenttä robustisti:
-    - input[type=text] jossa placeholder/aria sisältää 'Y-tunnus'
-    - fallback: ensimmäinen näkyvä input[type=text]
-    """
     inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='text'], input[type='search']")
     candidates = []
     for inp in inputs:
@@ -154,17 +149,11 @@ def find_search_input(driver):
 
 
 def click_hae_button(driver):
-    """
-    Klikkaa HAE-nappi robustisti:
-    - button jossa teksti sisältää HAE
-    - fallback: elementti jossa teksti HAE
-    """
+    # button missä teksti "HAE"
     buttons = driver.find_elements(By.TAG_NAME, "button")
     for b in buttons:
         try:
-            if not b.is_displayed():
-                continue
-            if "hae" in (b.text or "").strip().lower():
+            if b.is_displayed() and "hae" in (b.text or "").strip().lower():
                 b.click()
                 return True
         except Exception:
@@ -183,15 +172,6 @@ def click_hae_button(driver):
 
 
 def try_open_first_result_if_list(driver):
-    """
-    Jos Virre näyttää listan (useampi osuma), klikataan ensimmäinen osuma.
-    Tämä on heuristiikka: klikataan ensimmäinen näkyvä linkki/row, jossa on Y-tunnus-muotoinen teksti.
-    """
-    page = driver.page_source
-    if "Y-tunnus" not in page and "y-tunnus" not in page.lower():
-        return False
-
-    # etsitään linkkejä, joissa näkyy y-tunnus
     links = driver.find_elements(By.TAG_NAME, "a")
     for a in links:
         try:
@@ -205,9 +185,6 @@ def try_open_first_result_if_list(driver):
 
 
 def virre_fetch_email_for_yt(driver, yt):
-    """
-    Avaa Virre, hakee ytunnuksella, ja palauttaa email tai tyhjä/teksti.
-    """
     wait = WebDriverWait(driver, 25)
 
     driver.get("https://virre.prh.fi/novus/home")
@@ -216,7 +193,7 @@ def virre_fetch_email_for_yt(driver, yt):
 
     inp = find_search_input(driver)
     if not inp:
-        return "", "EI LÖYTYNYT HAKUKENTTÄÄ"
+        return "", "EI HAKUKENTTÄÄ"
 
     try:
         inp.clear()
@@ -224,18 +201,15 @@ def virre_fetch_email_for_yt(driver, yt):
     except Exception as e:
         return "", f"HAKUKENTTÄ VIRHE: {e}"
 
-    ok = click_hae_button(driver)
-    if not ok:
-        return "", "EI LÖYTYNYT HAE-NAPPIA"
+    if not click_hae_button(driver):
+        return "", "EI HAE-NAPPIA"
 
-    # odotetaan, että sivu muuttuu / sisältö päivittyy
     time.sleep(3)
     wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
-    # jos listanäkymä, yritä avata eka osuma
+    # jos tuloslista, avaa eka osuma
     try:
-        opened = try_open_first_result_if_list(driver)
-        if opened:
+        if try_open_first_result_if_list(driver):
             time.sleep(3)
     except Exception:
         pass
@@ -244,17 +218,11 @@ def virre_fetch_email_for_yt(driver, yt):
     email = find_email_anywhere(src)
     if email:
         return email, "OK"
-
-    # jos ei löydy mitään, merkitään "EI SÄHKÖPOSTIA"
     return "", "EI SÄHKÖPOSTIA"
 
 
 def start_chrome_driver():
-    """
-    Käynnistää Chromen. Jos tämä epäonnistuu, log.txt kertoo miksi.
-    """
     options = webdriver.ChromeOptions()
-    # näkyvä Chrome helpottaa (ja ei jää “salaisesti” piiloon)
     options.add_argument("--start-maximized")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-dev-shm-usage")
@@ -262,36 +230,30 @@ def start_chrome_driver():
     driver_path = ChromeDriverManager().install()
     log(f"ChromeDriver: {driver_path}")
 
-    driver = webdriver.Chrome(service=Service(driver_path), options=options)
-    return driver
+    return webdriver.Chrome(service=Service(driver_path), options=options)
 
 
 # -----------------------------
-# GUI
+# GUI APP
 # -----------------------------
 class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Protestilista botti (PDF → Y-tunnukset → Virre sähköpostit)")
-        self.geometry("760x520")
+        self.title("ProtestiBotti (PDF -> Y-tunnukset -> Virre sähköpostit)")
+        self.geometry("760x480")
 
-        # reset log
-        try:
-            with open(LOG_PATH, "w", encoding="utf-8") as f:
-                f.write("=== BOTTI KÄYNNISTETTY ===\n")
-        except Exception:
-            pass
+        reset_log()
 
-        self.info = tk.Label(
+        self.box = tk.Label(
             self,
-            text="VEDÄ JA PUDOTA PDF TÄHÄN\n(Tai paina 'Valitse PDF')\n\nTulokset ja log.txt tallentuu samaan kansioon kuin exe",
-            font=("Arial", 14, "bold"),
+            text="VEDÄ JA PUDOTA PDF TÄHÄN\n(Tai klikkaa 'Valitse PDF')\n\nKaikki tiedostot tallentuu:\nDocuments\\ProtestiBotti\\",
+            font=("Arial", 13, "bold"),
             bg="lightgray",
             relief="ridge",
             width=70,
-            height=6
+            height=7
         )
-        self.info.pack(pady=18)
+        self.box.pack(pady=18)
 
         self.btn = tk.Button(self, text="Valitse PDF", font=("Arial", 12), command=self.pick_pdf)
         self.btn.pack(pady=6)
@@ -299,18 +261,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self.status = tk.Label(self, text="Valmiina.", font=("Arial", 11))
         self.status.pack(pady=6)
 
-        # Drag&Drop: rekisteröi koko ikkuna + label (ettei tipu “väärään paikkaan”)
         if HAS_DND:
             self.drop_target_register(DND_FILES)
             self.dnd_bind("<<Drop>>", self.on_drop)
-            self.info.drop_target_register(DND_FILES)
-            self.info.dnd_bind("<<Drop>>", self.on_drop)
+            self.box.drop_target_register(DND_FILES)
+            self.box.dnd_bind("<<Drop>>", self.on_drop)
 
-        log(f"OUT_DIR = {OUT_DIR}")
+        log("GUI käynnissä.")
 
     def set_status(self, s):
         self.status.config(text=s)
         self.update_idletasks()
+        log(s)
 
     def pick_pdf(self):
         path = filedialog.askopenfilename(filetypes=[("PDF files", "*.pdf")])
@@ -327,80 +289,58 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         if not pdf_path.lower().endswith(".pdf"):
             messagebox.showerror("Virhe", "Valitse PDF.")
             return
-
         self.set_status(f"PDF vastaanotettu: {pdf_path}")
-        log(f"PDF vastaanotettu: {pdf_path}")
-
-        t = threading.Thread(target=self.job, args=(pdf_path,), daemon=True)
-        t.start()
+        threading.Thread(target=self.job, args=(pdf_path,), daemon=True).start()
 
     def job(self, pdf_path):
         try:
             self.set_status("Luetaan PDF ja kerätään Y-tunnukset…")
-            ytunnukset = extract_ytunnukset_from_pdf(pdf_path)
-            log(f"Löytyi Y-tunnuksia: {len(ytunnukset)}")
-
-            if not ytunnukset:
+            yt = extract_ytunnukset_from_pdf(pdf_path)
+            if not yt:
                 self.set_status("Ei löytynyt Y-tunnuksia.")
                 messagebox.showwarning("Ei löytynyt", "PDF:stä ei löytynyt yhtään Y-tunnusta.")
                 return
 
-            # tallenna ytunnukset
-            save_word_list(ytunnukset, "ytunnukset.docx", "Y-tunnukset")
-            save_excel_table([(y,) for y in ytunnukset], "ytunnukset.xlsx", ["Y-tunnus"])
+            self.set_status(f"Löytyi {len(yt)} Y-tunnusta. Tallennetaan…")
+            save_word_list(yt, "ytunnukset.docx", "Y-tunnukset")
+            save_excel_table([(x,) for x in yt], "ytunnukset.xlsx", ["Y-tunnus"])
 
-            # virre
             self.set_status("Käynnistetään Chrome ja haetaan Virrestä sähköpostit…")
             try:
                 driver = start_chrome_driver()
             except Exception as e:
                 log(f"CHROME EI KÄYNNISTY: {e}")
+                self.set_status("Chrome ei käynnistynyt. Avaa log.txt")
                 messagebox.showerror("Chrome ei käynnisty",
-                                     f"Chrome/Selenium ei käynnistynyt.\nAvaa log.txt ja lähetä se minulle.\n\nVirhe:\n{e}")
-                self.set_status("Chrome ei käynnistynyt. Katso log.txt")
+                                     f"Chrome/Selenium ei käynnistynyt.\n\nKatso log.txt:\n{LOG_PATH}\n\nVirhe:\n{e}")
                 return
 
             results = []
             try:
-                for idx, yt in enumerate(ytunnukset, start=1):
-                    self.set_status(f"Virre-haku {idx}/{len(ytunnukset)}: {yt}")
-                    log(f"Virre-haku {idx}/{len(ytunnukset)}: {yt}")
-
-                    email, status = virre_fetch_email_for_yt(driver, yt)
-                    if not email:
-                        email_out = status
-                    else:
-                        email_out = email
-
-                    results.append((yt, email_out))
-
-                    # pieni viive ettei hakata palvelua
+                for i, y in enumerate(yt, start=1):
+                    self.set_status(f"Virre-haku {i}/{len(yt)}: {y}")
+                    email, status = virre_fetch_email_for_yt(driver, y)
+                    results.append((y, email if email else status))
                     time.sleep(2)
-
             finally:
                 try:
                     driver.quit()
                 except Exception:
                     pass
 
-            # tallenna sähköpostit
-            word_lines = [f"{yt} -> {email}" for yt, email in results]
+            self.set_status("Tallennetaan sähköpostit…")
+            word_lines = [f"{y} -> {e}" for y, e in results]
             save_word_list(word_lines, "virre_sahkopostit.docx", "Virre sähköpostit")
             save_excel_table(results, "virre_sahkopostit.xlsx", ["Y-tunnus", "Sähköposti / status"])
 
-            self.set_status("Valmis! Katso exe-kansiosta tulokset + log.txt")
-            messagebox.showinfo(
-                "Valmis",
-                "Valmis!\n\nTiedostot luotu exe:n kansioon:\n"
-                "- ytunnukset.docx / ytunnukset.xlsx\n"
-                "- virre_sahkopostit.docx / virre_sahkopostit.xlsx\n"
-                "- log.txt"
-            )
+            self.set_status("Valmis! Avaa Documents\\ProtestiBotti\\")
+            messagebox.showinfo("Valmis",
+                                f"Valmis!\n\nTiedostot löytyvät:\n{OUT_DIR}\n\nLogi:\n{LOG_PATH}")
 
         except Exception as e:
             log(f"VIRHE: {e}")
-            self.set_status("Virhe. Katso log.txt")
-            messagebox.showerror("Virhe", f"Tuli virhe. Katso log.txt.\n\n{e}")
+            self.set_status("Virhe. Avaa log.txt")
+            messagebox.showerror("Virhe", f"Tuli virhe.\nAvaa log.txt:\n{LOG_PATH}\n\n{e}")
 
 
 if __name__ == "__main__":
