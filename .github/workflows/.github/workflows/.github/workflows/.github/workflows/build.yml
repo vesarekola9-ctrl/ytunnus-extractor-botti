@@ -31,3 +31,4 @@ jobs:
         with:
           name: ytunnus-exe
           path: dist/ytunnus_dragdrop_bot.exe
+
