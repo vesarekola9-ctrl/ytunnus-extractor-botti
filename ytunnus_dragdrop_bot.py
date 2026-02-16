@@ -21,6 +21,9 @@ EMAIL_RE = re.compile(r"[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9-.]+")
 EMAIL_A_RE = re.compile(r"[A-Za-z0-9_.+-]+\s*\(a\)\s*[A-Za-z0-9-]+\.[A-Za-z0-9-.]+", re.I)
 
 
+# -----------------------------
+# Output + päivämääräkansio
+# -----------------------------
 def get_exe_dir():
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
@@ -70,6 +73,9 @@ def reset_log():
     log(f"Logi: {LOG_PATH}")
 
 
+# -----------------------------
+# PDF -> Y-tunnukset
+# -----------------------------
 def normalize_yt(yt: str):
     yt = yt.strip().replace(" ", "")
     if re.fullmatch(r"\d{7}-\d", yt):
@@ -93,6 +99,9 @@ def extract_ytunnukset_from_pdf(pdf_path: str):
     return sorted(yt_set)
 
 
+# -----------------------------
+# Word: pelkkä lista riveinä (ei otsikkoa)
+# -----------------------------
 def save_word_plain_lines(lines, filename):
     path = os.path.join(OUT_DIR, filename)
     doc = Document()
@@ -102,6 +111,9 @@ def save_word_plain_lines(lines, filename):
     log(f"Tallennettu: {path}")
 
 
+# -----------------------------
+# Email poiminta (vain email)
+# -----------------------------
 def normalize_email_candidate(raw: str) -> str:
     raw = (raw or "").strip().replace(" ", "")
     raw = raw.replace("(a)", "@").replace("[at]", "@")
@@ -154,6 +166,9 @@ def extract_company_email_from_dom(driver):
     return ""
 
 
+# -----------------------------
+# Virre haku (näkyvä Chrome, normaali)
+# -----------------------------
 def start_driver():
     options = webdriver.ChromeOptions()
     options.add_argument("--start-maximized")
@@ -190,6 +205,7 @@ def virre_fetch_email(driver, yt):
     if not click_hae_button(driver):
         return ""
 
+    # odota nopeasti jos sähköposti-elementti ilmestyy
     try:
         wait.until(EC.presence_of_element_located((By.XPATH, "//*[normalize-space(.)='Sähköposti']")))
     except Exception:
@@ -198,6 +214,9 @@ def virre_fetch_email(driver, yt):
     return extract_company_email_from_dom(driver)
 
 
+# -----------------------------
+# GUI
+# -----------------------------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -255,7 +274,7 @@ class App(tk.Tk):
                             seen.add(k)
                             emails.append(email)
 
-                    time.sleep(0.1)  # 🔥 nopeampi
+                    time.sleep(0.3)  # sama “normaali” viive kuin aiemmin
 
             finally:
                 try:
