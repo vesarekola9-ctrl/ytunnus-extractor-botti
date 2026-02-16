@@ -112,7 +112,7 @@ def save_word_plain_lines(lines, filename):
 
 
 # -----------------------------
-# Email poiminta
+# Email helpers
 # -----------------------------
 def normalize_email_candidate(raw: str) -> str:
     raw = (raw or "").strip().replace(" ", "")
@@ -129,45 +129,6 @@ def pick_email_from_text(text: str) -> str:
     m2 = EMAIL_A_RE.search(text)
     if m2:
         return normalize_email_candidate(m2.group(0))
-    return ""
-
-
-def extract_email_from_page(driver):
-    """
-    YTJ-yrityssivulla sähköposti löytyy riviltä 'Sähköposti'.
-    Poimitaan vain email.
-    """
-    labels = driver.find_elements(By.XPATH, "//*[normalize-space(.)='Sähköposti']")
-    for lab in labels:
-        try:
-            parent = lab.find_element(By.XPATH, "..")
-            e = pick_email_from_text(parent.text)
-            if e:
-                return e
-
-            sib = lab.find_elements(By.XPATH, "following-sibling::*[1]")
-            for s in sib:
-                e = pick_email_from_text(s.text)
-                if e:
-                    return e
-
-            links = parent.find_elements(By.XPATH, ".//a")
-            for a in links:
-                e = pick_email_from_text(a.text)
-                if e:
-                    return e
-        except Exception:
-            continue
-
-    # fallback: etsi mail main-alueesta
-    try:
-        main = driver.find_element(By.TAG_NAME, "main")
-        e = pick_email_from_text(main.text)
-        if e:
-            return e
-    except Exception:
-        pass
-
     return ""
 
 
@@ -217,6 +178,7 @@ def click_ytj_hae(driver):
         except Exception:
             continue
 
+    # fallback: elementti jossa teksti HAE
     elems = driver.find_elements(By.XPATH, "//*[normalize-space(.)='HAE']")
     for e in elems:
         try:
@@ -229,7 +191,9 @@ def click_ytj_hae(driver):
 
 
 def open_first_result_if_list(driver, yt):
-    # Jos tuloslistassa on linkki jossa Y-tunnus, avaa se
+    """
+    Jos hakutulos on listana, avaa linkki jossa näkyy Y-tunnus.
+    """
     links = driver.find_elements(By.TAG_NAME, "a")
     for a in links:
         try:
@@ -244,26 +208,35 @@ def open_first_result_if_list(driver, yt):
 
 def click_all_nayta_buttons(driver):
     """
-    Klikkaa kaikki näkyvät 'Näytä' -napit yrityssivulla (esim. puhelin/sähköposti).
-    Tehdään pari kierrosta, koska napin klikkaus voi paljastaa uuden 'Näytä' napin.
+    Klikkaa kaikki näkyvät 'Näytä' -napit yrityssivulla.
+    Joissain tapauksissa ne voivat olla buttonit, joskus myös linkkejä.
     """
     clicked_any = False
+
     for _round in range(3):
-        buttons = driver.find_elements(By.TAG_NAME, "button")
         clicked_this_round = False
 
-        for b in buttons:
+        # 1) button "Näytä"
+        for b in driver.find_elements(By.TAG_NAME, "button"):
             try:
-                txt = (b.text or "").strip().lower()
-                if txt == "näytä" and b.is_displayed() and b.is_enabled():
-                    try:
-                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", b)
-                    except Exception:
-                        pass
+                if (b.text or "").strip().lower() == "näytä" and b.is_displayed() and b.is_enabled():
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", b)
                     b.click()
                     clicked_this_round = True
                     clicked_any = True
-                    time.sleep(0.15)  # pieni hetki että sisältö ehtii avautua
+                    time.sleep(0.12)
+            except Exception:
+                continue
+
+        # 2) linkki <a> jossa "Näytä"
+        for a in driver.find_elements(By.TAG_NAME, "a"):
+            try:
+                if (a.text or "").strip().lower() == "näytä" and a.is_displayed():
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", a)
+                    a.click()
+                    clicked_this_round = True
+                    clicked_any = True
+                    time.sleep(0.12)
             except Exception:
                 continue
 
@@ -271,6 +244,49 @@ def click_all_nayta_buttons(driver):
             break
 
     return clicked_any
+
+
+def extract_email_from_ytj_table(driver):
+    """
+    Oikea tapa YTJ:ssä:
+    - etsi rivi jossa ensimmäisessä solussa lukee 'Sähköposti'
+    - lue saman rivin muut solut ja poimi email
+    """
+    # Etsi elementti jonka tekstinä 'Sähköposti'
+    nodes = driver.find_elements(By.XPATH, "//*[normalize-space(.)='Sähköposti']")
+    for node in nodes:
+        try:
+            # mene ylös rivitasolle (tr) jos taulukko, tai lähimpään "row" konttiin
+            row = None
+            try:
+                row = node.find_element(By.XPATH, "ancestor::tr[1]")
+            except Exception:
+                row = node.find_element(By.XPATH, "ancestor::*[self::div or self::section][1]")
+
+            txt = row.text or ""
+            email = pick_email_from_text(txt)
+            if email:
+                return email
+
+            # jos ei löytynyt row.textistä, etsi linkeistä/soluista
+            for a in row.find_elements(By.TAG_NAME, "a"):
+                email = pick_email_from_text(a.text or "")
+                if email:
+                    return email
+
+        except Exception:
+            continue
+
+    return ""
+
+
+def extract_email_fallback_main(driver):
+    # fallback: main-alueesta
+    try:
+        main = driver.find_element(By.TAG_NAME, "main")
+        return pick_email_from_text(main.text or "")
+    except Exception:
+        return ""
 
 
 def ytj_fetch_email(driver, yt):
@@ -281,34 +297,41 @@ def ytj_fetch_email(driver, yt):
 
     inp = find_ytj_search_input(driver)
     if not inp:
+        log("Ei löydy hakukenttää.")
         return ""
 
-    try:
-        inp.clear()
-        inp.send_keys(yt)
-    except Exception:
-        return ""
+    inp.clear()
+    inp.send_keys(yt)
 
     if not click_ytj_hae(driver):
+        log("Ei löydy HAE-nappia.")
         return ""
 
     wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
-    # Jos listaus, avaa eka osuma
+    # jos tuli listaus -> avaa
     try:
         if open_first_result_if_list(driver, yt):
             wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
     except Exception:
         pass
 
-    # Klikkaa "Näytä" -napit (jos on)
+    # Nyt pitäisi olla yrityssivu (URL usein /yritys/xxxxxxx-x)
+    # Klikkaa "Näytä" napit, jotta piilotetut tiedot paljastuu
     try:
         click_all_nayta_buttons(driver)
+        # anna DOM:n päivittyä
+        time.sleep(0.15)
     except Exception:
         pass
 
-    # Poimi email
-    return extract_email_from_page(driver)
+    # 1) poimi sähköposti oikealta riviltä
+    email = extract_email_from_ytj_table(driver)
+    if email:
+        return email
+
+    # 2) fallback: main-alueesta
+    return extract_email_fallback_main(driver)
 
 
 # -----------------------------
@@ -371,7 +394,7 @@ class App(tk.Tk):
                             seen.add(k)
                             emails.append(email)
 
-                    time.sleep(0.1)  # nopea
+                    time.sleep(0.1)  # nopea kuten pyysit
             finally:
                 try:
                     driver.quit()
@@ -381,7 +404,7 @@ class App(tk.Tk):
             save_word_plain_lines(emails, "sahkopostit.docx")
 
             self.set_status("Valmis!")
-            messagebox.showinfo("Valmis", f"Valmis!\n\nKansio:\n{OUT_DIR}")
+            messagebox.showinfo("Valmis", f"Valmis!\n\nKansio:\n{OUT_DIR}\n\nLöydetyt emailit: {len(emails)}")
 
         except Exception as e:
             log(f"VIRHE: {e}")
