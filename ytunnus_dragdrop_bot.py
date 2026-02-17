@@ -23,9 +23,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 YT_RE = re.compile(r"\b\d{7}-\d\b|\b\d{8}\b")
 EMAIL_RE = re.compile(r"[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9-.]+")
 EMAIL_A_RE = re.compile(r"[A-Za-z0-9_.+-]+\s*\(a\)\s*[A-Za-z0-9-]+\.[A-Za-z0-9-.]+", re.I)
-DATE_RE = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
 
-KAUPPALEHTI_URL = "https://www.kauppalehti.fi/yritykset/protestilista"
 YTJ_COMPANY_URL = "https://tietopalvelu.ytj.fi/yritys/{}"
 
 
@@ -182,74 +180,8 @@ def focus_kauppalehti_tab(driver):
 
 
 # -----------------------------
-# Kauppalehti robust: row-by-row click Häiriöpäivä -> read Y-TUNNUS
+# Kauppalehti: click only company row cell (not header)
 # -----------------------------
-def get_company_rows(driver):
-    """
-    Palauttaa yritysrivit siten, että rivissä on yrityksen linkki (/yritykset/)
-    ja EI sisällä 'Y-TUNNUS' (eli ei lisärivi).
-    """
-    rows = []
-    candidates = driver.find_elements(By.XPATH, "//*[self::tr or self::div]")
-    for r in candidates:
-        try:
-            if not r.is_displayed():
-                continue
-            txt = (r.text or "")
-            if "Y-TUNNUS" in txt:
-                continue
-            # yrityslinkki
-            links = r.find_elements(By.XPATH, ".//a[contains(@href,'/yritykset/') and normalize-space(.)!='']")
-            if not links:
-                continue
-            # rivissä pitää näkyä dd.mm.yyyy jossain (häiriöpäivä)
-            has_date = False
-            for s in r.find_elements(By.XPATH, ".//*[self::td or self::span or self::div]"):
-                t = (s.text or "").strip()
-                if DATE_RE.match(t):
-                    has_date = True
-                    break
-            if not has_date:
-                continue
-            rows.append(r)
-        except Exception:
-            continue
-    return rows
-
-
-def find_hairiopaiva_cell_in_row(row):
-    """
-    Palauta se elementti rivistä, joka on päivämäärä (dd.mm.yyyy) = Häiriöpäivä
-    """
-    elems = row.find_elements(By.XPATH, ".//*[self::td or self::span or self::div]")
-    for e in elems:
-        try:
-            t = (e.text or "").strip()
-            if DATE_RE.match(t):
-                return e
-        except Exception:
-            continue
-    return None
-
-
-def extract_yt_from_opened_area(anchor_elem):
-    """
-    Klikkauksen jälkeen aukeaa lisärivi jossa 'Y-TUNNUS' ja numero.
-    Poimitaan ensimmäinen Y-tunnus siitä.
-    """
-    try:
-        y_label = anchor_elem.find_element(By.XPATH, "following:://*[contains(normalize-space(.), 'Y-TUNNUS')][1]")
-        block = y_label.find_element(By.XPATH, "ancestor::*[self::div or self::tr][1]")
-        found = YT_RE.findall(block.text or "")
-        for m in found:
-            n = normalize_yt(m)
-            if n:
-                return n
-    except Exception:
-        pass
-    return ""
-
-
 def click_nayta_lisaa(driver):
     for b in driver.find_elements(By.XPATH, "//button|//*[@role='button']"):
         try:
@@ -264,54 +196,133 @@ def click_nayta_lisaa(driver):
     return False
 
 
-def collect_yts_from_kauppalehti_rowwise(driver, status_cb, log_cb):
+def get_company_rows_tbody(driver):
+    """
+    Palauttaa taulukon TBODY-rivit, joissa on yrityslinkki.
+    Tämä EI ikinä ota headeria.
+    """
+    rows = []
+    # Usein taulukko on thead + tbody
+    candidates = driver.find_elements(By.XPATH, "//table//tbody//tr")
+    for r in candidates:
+        try:
+            if not r.is_displayed():
+                continue
+            # skip expanded detail rows that contain Y-TUNNUS text
+            if "Y-TUNNUS" in (r.text or ""):
+                continue
+            # must contain a company link
+            links = r.find_elements(By.XPATH, ".//a[contains(@href,'/yritykset/') and normalize-space(.)!='']")
+            if not links:
+                continue
+            rows.append(r)
+        except Exception:
+            continue
+    return rows
+
+
+def open_row_by_hairiopaiva_cell(row):
+    """
+    Klikkaa Häiriöpäivä-sarakkeen solua (4. sarake).
+    Sarakkeet: Yritys(1) Sijainti(2) Summa(3) Häiriöpäivä(4) Tyyppi(5) Lähde(6) Nuoli(7)
+    """
+    try:
+        cell = row.find_element(By.XPATH, ".//td[4]")
+        return cell
+    except Exception:
+        return None
+
+
+def open_row_by_toggle_button(row):
+    """
+    Fallback: oikean laidan nuoli/button (aria-expanded)
+    """
+    try:
+        btn = row.find_element(By.XPATH, ".//button[@aria-expanded='true' or @aria-expanded='false']")
+        return btn
+    except Exception:
+        return None
+
+
+def extract_yt_after_open(anchor_elem):
+    """
+    Avauksen jälkeen rivin alle tulee detail-alue jossa 'Y-TUNNUS' + numero.
+    Haetaan anchorin jälkeen lähin Y-TUNNUS ja otetaan siitä löytyvä y-tunnus.
+    """
+    try:
+        y_label = anchor_elem.find_element(By.XPATH, "following:://*[contains(normalize-space(.), 'Y-TUNNUS')][1]")
+        block = y_label.find_element(By.XPATH, "ancestor::*[self::div or self::tr][1]")
+        found = YT_RE.findall(block.text or "")
+        for m in found:
+            n = normalize_yt(m)
+            if n:
+                return n
+    except Exception:
+        pass
+    return ""
+
+
+def collect_yts_from_kauppalehti(driver, status_cb, log_cb):
     wait = WebDriverWait(driver, 25)
     wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
     try_accept_cookies(driver)
 
     collected = set()
-    seen_row_signatures = set()
+    seen_rows = set()
 
     def row_signature(row):
-        # vakaa “sormenjälki”: yritysnimi + summa + paikkakunta + päivämäärä (teksti)
-        t = " ".join((row.text or "").split())
-        return t[:220]
+        # sormenjälki: yritysnimi-linkin teksti + häiriöpäivä + summa
+        try:
+            name = row.find_element(By.XPATH, ".//a[contains(@href,'/yritykset/') and normalize-space(.)!='']").text.strip()
+        except Exception:
+            name = ""
+        try:
+            date = row.find_element(By.XPATH, ".//td[4]").text.strip()
+        except Exception:
+            date = ""
+        try:
+            amount = row.find_element(By.XPATH, ".//td[3]").text.strip()
+        except Exception:
+            amount = ""
+        return f"{name}|{date}|{amount}"
 
     while True:
-        rows = get_company_rows(driver)
+        rows = get_company_rows_tbody(driver)
         if not rows:
-            status_cb("Kauppalehti: en löydä yritysrivejä. Onko lista näkyvissä + kirjautuneena?")
+            status_cb("Kauppalehti: en löydä yritysrivejä (tbody). Onko lista näkyvissä + kirjautuneena?")
             break
 
-        status_cb(f"Kauppalehti: rivejä näkyvissä {len(rows)} | kerätty {len(collected)}")
+        status_cb(f"Kauppalehti: näkyviä yritysrivejä {len(rows)} | kerätty {len(collected)}")
 
         new_in_pass = 0
 
-        for r in rows:
+        for row in rows:
             try:
-                sig = row_signature(r)
-                if sig in seen_row_signatures:
+                sig = row_signature(row)
+                if sig in seen_rows:
+                    continue
+                seen_rows.add(sig)
+
+                # 1) yritä klikata häiriöpäivä-solu
+                anchor = open_row_by_hairiopaiva_cell(row)
+
+                # jos ei onnistu, käytä nuolta
+                if anchor is None:
+                    anchor = open_row_by_toggle_button(row)
+                if anchor is None:
                     continue
 
-                # merkkaa käsitellyksi heti (ettei loopkaa samaa)
-                seen_row_signatures.add(sig)
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", anchor)
+                time.sleep(0.03)
 
-                cell = find_hairiopaiva_cell_in_row(r)
-                if not cell:
-                    continue
-
-                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", cell)
-                time.sleep(0.05)
-
-                # avaa lisärivi klikkaamalla päivämäärää
                 try:
-                    driver.execute_script("arguments[0].click();", cell)
+                    driver.execute_script("arguments[0].click();", anchor)
                 except StaleElementReferenceException:
                     continue
 
                 yt = ""
                 for _ in range(25):  # max ~2.5s
-                    yt = extract_yt_from_opened_area(cell)
+                    yt = extract_yt_after_open(anchor)
                     if yt:
                         break
                     time.sleep(0.1)
@@ -321,43 +332,31 @@ def collect_yts_from_kauppalehti_rowwise(driver, status_cb, log_cb):
                     new_in_pass += 1
                     log_cb(f"+ {yt} (yht {len(collected)})")
 
-                # sulje (ei pakollinen, mutta vähentää sekoilua)
+                # yritä sulkea: klikkaa samaa anchor-elementtiä uudestaan
                 try:
-                    driver.execute_script("arguments[0].click();", cell)
+                    driver.execute_script("arguments[0].click();", anchor)
                 except Exception:
                     pass
 
-                time.sleep(0.03)
+                time.sleep(0.02)
 
             except Exception:
                 continue
 
-        # Jos ei tullut yhtään uutta ja “Näytä lisää” löytyy → paina ja odota että rivejä tulee lisää
-        before = len(seen_row_signatures)
-
+        # Näytä lisää
         if click_nayta_lisaa(driver):
             status_cb("Kauppalehti: Näytä lisää…")
-            # odota että sivulle ilmestyy uutta (uusia rivejä)
-            for _ in range(30):  # max ~15s
-                time.sleep(0.5)
-                rows2 = get_company_rows(driver)
-                # jos uusia rivejä on tullut, jatketaan
-                if rows2 and len(rows2) >= 1:
-                    # pieni scroll alas auttaa latauksessa
-                    try:
-                        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                    except Exception:
-                        pass
-                    break
+            time.sleep(1.2)
+            try:
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            except Exception:
+                pass
+            time.sleep(0.8)
             continue
 
-        # ei lisää nappia -> valmis
+        # jos ei enää uusia ja ei lisää-nappia
         if new_in_pass == 0:
             status_cb("Kauppalehti: ei uusia + ei Näytä lisää -> valmis.")
-            break
-
-        # varmistus: jos ei edes signaturet kasva, lopetetaan
-        if len(seen_row_signatures) == before and new_in_pass == 0:
             break
 
     return sorted(collected)
@@ -482,7 +481,7 @@ class App(tk.Tk):
         super().__init__()
         reset_log()
 
-        self.title("ProtestiBotti (2500+ STABLE)")
+        self.title("ProtestiBotti (tbody-row click)")
         self.geometry("920x580")
 
         tk.Label(self, text="ProtestiBotti", font=("Arial", 18, "bold")).pack(pady=10)
@@ -545,7 +544,6 @@ class App(tk.Tk):
         self.progress["value"] = value
         self.update_idletasks()
 
-    # ---- Mode 1: Kauppalehti -> YTJ ----
     def start_kauppalehti_mode(self):
         threading.Thread(target=self.run_kauppalehti_mode, daemon=True).start()
 
@@ -559,13 +557,13 @@ class App(tk.Tk):
                 messagebox.showerror(
                     "Ei löytynyt Kauppalehteä",
                     "En löytänyt välilehteä jossa on kauppalehti.fi/yritykset/protestilista.\n\n"
-                    "Varmista että avasit Chromen BAT-komennolla (portti 9222) ja protestilista on auki."
+                    "Varmista että avasit Chromen debug-tilassa (portti 9222) ja protestilista on auki."
                 )
                 self.set_status("Keskeytetty.")
                 return
 
-            self.set_status("Kauppalehti: kerätään Y-tunnukset (rivi kerrallaan Häiriöpäivä-klikkaus)…")
-            yt_list = collect_yts_from_kauppalehti_rowwise(driver, self.set_status, self.ui_log)
+            self.set_status("Kauppalehti: kerätään Y-tunnukset (tbody rivit + td[4] klikkaus)…")
+            yt_list = collect_yts_from_kauppalehti(driver, self.set_status, self.ui_log)
 
             if not yt_list:
                 self.set_status("Ei löytynyt Y-tunnuksia.")
@@ -594,7 +592,6 @@ class App(tk.Tk):
         finally:
             pass
 
-    # ---- Mode 2: PDF -> YTJ ----
     def start_pdf_mode(self):
         path = filedialog.askopenfilename(filetypes=[("PDF files", "*.pdf")])
         if path:
