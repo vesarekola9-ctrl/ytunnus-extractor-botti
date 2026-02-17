@@ -24,7 +24,7 @@ YT_RE = re.compile(r"\b\d{7}-\d\b|\b\d{8}\b")
 EMAIL_RE = re.compile(r"[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9-.]+")
 EMAIL_A_RE = re.compile(r"[A-Za-z0-9_.+-]+\s*\(a\)\s*[A-Za-z0-9-]+\.[A-Za-z0-9-.]+", re.I)
 
-KAUPPALEHTI_URL = "https://www.kauppalehti.fi/yritykset/protestilista"
+KAUPPALEHTI_MATCH = "kauppalehti.fi/yritykset/protestilista"
 YTJ_COMPANY_URL = "https://tietopalvelu.ytj.fi/yritys/{}"
 
 
@@ -39,7 +39,6 @@ def get_exe_dir():
 
 def get_output_dir():
     base = get_exe_dir()
-    # jos exe-kansioon ei voi kirjoittaa, käytä Documents/ProtestiBotti
     try:
         test_path = os.path.join(base, "_write_test.tmp")
         with open(test_path, "w", encoding="utf-8") as f:
@@ -185,53 +184,32 @@ def attach_to_existing_chrome():
     return webdriver.Chrome(service=Service(driver_path), options=options)
 
 
-def focus_kauppalehti_tab(driver):
+def focus_kauppalehti_tab(driver) -> bool:
+    """Vaihda siihen välilehteen jossa protestilista on auki."""
     for handle in driver.window_handles:
-        driver.switch_to.window(handle)
-        url = (driver.current_url or "")
-        if "kauppalehti.fi/yritykset/protestilista" in url:
-            return True
+        try:
+            driver.switch_to.window(handle)
+            url = (driver.current_url or "")
+            if KAUPPALEHTI_MATCH in url:
+                return True
+        except Exception:
+            continue
     return False
 
 
-def is_on_kauppalehti_protestilista(driver) -> bool:
-    try:
-        url = (driver.current_url or "")
-        if "kauppalehti.fi/yritykset/protestilista" not in url:
-            return False
-        body = driver.find_element(By.TAG_NAME, "body").text or ""
-        return ("Protestilista" in body) or ("Näytä lisää" in body)
-    except Exception:
-        return False
-
-
-def recover_to_kauppalehti(driver, status_cb=None, log_cb=None):
-    try:
-        if status_cb:
-            status_cb("Palautus: takaisin protestilistalle…")
-        if log_cb:
-            log_cb("RECOVER: navigating to protestilista")
-
-        driver.get(KAUPPALEHTI_URL)
-        WebDriverWait(driver, 25).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        try_accept_cookies(driver)
-
-        try:
-            driver.execute_script("window.scrollTo(0, 600);")
-        except Exception:
-            pass
-        time.sleep(0.6)
+def ensure_kauppalehti_tab(driver, status_cb, log_cb) -> bool:
+    """ÄLÄ navigoi mihinkään. Vain etsi oikea välilehti."""
+    if focus_kauppalehti_tab(driver):
         return True
-    except Exception as e:
-        if log_cb:
-            log_cb(f"RECOVER FAILED: {e}")
-        return False
+    status_cb("En löydä Chrome-välilehteä missä protestilista on auki.")
+    log_cb("ERROR: No tab with protestilista URL open.")
+    return False
 
 
 # -----------------------------
-# Kauppalehti: klikkaa SUMMA-solua (EI yritysnimeä)
+# Kauppalehti keräys (VARMA: klikkaa nuolta / aria-expanded)
 # -----------------------------
-def click_nayta_lisaa(driver):
+def click_nayta_lisaa(driver) -> bool:
     for b in driver.find_elements(By.XPATH, "//button|//*[@role='button']"):
         try:
             if not b.is_displayed() or not b.is_enabled():
@@ -260,7 +238,7 @@ def get_company_rows_tbody(driver):
             if "Y-TUNNUS" in txt:
                 continue
 
-            # yritysrivissä on yrityksen nimi linkkinä 1. sarakkeessa
+            # pitää olla yrityslinkki 1. sarakkeessa
             links = r.find_elements(By.XPATH, ".//td[1]//a[contains(@href,'/yritykset/') and normalize-space(.)!='']")
             if not links:
                 continue
@@ -271,21 +249,36 @@ def get_company_rows_tbody(driver):
     return rows
 
 
-def open_row_by_summa_cell(row):
+def row_fingerprint(row):
+    """Fingerprint ilman häiriöpäivää."""
+    try:
+        name = row.find_element(By.XPATH, ".//td[1]//a[contains(@href,'/yritykset/') and normalize-space(.)!='']").text.strip()
+    except Exception:
+        name = ""
+    try:
+        location = row.find_element(By.XPATH, ".//td[2]").text.strip()
+    except Exception:
+        location = ""
+    try:
+        amount = row.find_element(By.XPATH, ".//td[3]").text.strip()
+    except Exception:
+        amount = ""
+    return f"{name}|{location}|{amount}"
+
+
+def get_toggle_button(row):
     """
-    Klikkaa SUMMA-solua (3. sarake) -> avaa detail-rivin alle.
-    EI KOSKAAN klikkaa yritysnimeä (td[1]).
+    VARMA avaus: rivillä on yleensä nuoli/toggle button jossa aria-expanded.
     """
     try:
-        return row.find_element(By.XPATH, ".//td[3]")
+        return row.find_element(By.XPATH, ".//button[@aria-expanded='false' or @aria-expanded='true']")
     except Exception:
         return None
 
 
-def extract_yt_from_detail_row(row):
+def extract_yt_from_detail_row(row) -> str:
     """
     Detail-rivi on yleensä heti tämän rivin jälkeen: following-sibling::tr[1]
-    Siitä etsitään Y-TUNNUS ja poimitaan y-tunnus.
     """
     try:
         detail = row.find_element(By.XPATH, "following-sibling::tr[1]")
@@ -308,36 +301,18 @@ def collect_yts_from_kauppalehti(driver, status_cb, log_cb):
     try_accept_cookies(driver)
 
     collected = set()
-    processed = set()  # rivin fingerprint
-
-    def row_fingerprint(r):
-        # fingerprint: yritysnimi + sijainti + summa (EI häiriöpäivää)
-        try:
-            name = r.find_element(By.XPATH, ".//td[1]//a[contains(@href,'/yritykset/') and normalize-space(.)!='']").text.strip()
-        except Exception:
-            name = ""
-        try:
-            location = r.find_element(By.XPATH, ".//td[2]").text.strip()
-        except Exception:
-            location = ""
-        try:
-            amount = r.find_element(By.XPATH, ".//td[3]").text.strip()
-        except Exception:
-            amount = ""
-        return f"{name}|{location}|{amount}"
+    processed = set()
 
     while True:
-        # jos eksyttiin, palauta
-        if not is_on_kauppalehti_protestilista(driver):
-            recover_to_kauppalehti(driver, status_cb, log_cb)
+        if not ensure_kauppalehti_tab(driver, status_cb, log_cb):
+            break
 
         rows = get_company_rows_tbody(driver)
         if not rows:
-            status_cb("Kauppalehti: en löydä yritysrivejä (tbody). Oletko kirjautuneena ja lista näkyy?")
+            status_cb("Kauppalehti: en löydä yritysrivejä. Onko lista näkyvissä (ja kirjautuneena)?")
             break
 
         status_cb(f"Kauppalehti: näkyviä rivejä {len(rows)} | kerätty {len(collected)}")
-
         new_in_pass = 0
 
         for row in rows:
@@ -347,18 +322,19 @@ def collect_yts_from_kauppalehti(driver, status_cb, log_cb):
                     continue
                 processed.add(fp)
 
-                # 1) klikkaa SUMMA-solua (EI yritysnimeä)
-                click_cell = open_row_by_summa_cell(row)
-                if click_cell is None:
+                toggle = get_toggle_button(row)
+                if toggle is None:
+                    log_cb("SKIP: toggle (aria-expanded) ei löytynyt riviltä")
                     continue
 
-                if not safe_click(driver, click_cell):
-                    log_cb("SKIP: ei saanut klikattua summa-solua")
+                # Avaa
+                if not safe_click(driver, toggle):
+                    log_cb("SKIP: toggle click epäonnistui")
                     continue
 
-                # 2) odota detail ja poimi Y-TUNNUS
+                # Odota ja poimi y-tunnus
                 yt = ""
-                for _ in range(25):  # max ~2.5s
+                for _ in range(25):  # ~2.5s
                     yt = extract_yt_from_detail_row(row)
                     if yt:
                         break
@@ -371,9 +347,9 @@ def collect_yts_from_kauppalehti(driver, status_cb, log_cb):
                 elif not yt:
                     log_cb("SKIP: detail ei auennut / ei Y-TUNNUS")
 
-                # 3) sulje takaisin (klikataan samaa solua uudelleen)
+                # Sulje (klikkaa toggle uudestaan)
                 try:
-                    safe_click(driver, click_cell)
+                    safe_click(driver, toggle)
                 except Exception:
                     pass
 
@@ -384,7 +360,7 @@ def collect_yts_from_kauppalehti(driver, status_cb, log_cb):
             except Exception:
                 continue
 
-        # 4) Näytä lisää ja jatka
+        # Näytä lisää
         if click_nayta_lisaa(driver):
             status_cb("Kauppalehti: Näytä lisää…")
             time.sleep(1.2)
@@ -395,7 +371,6 @@ def collect_yts_from_kauppalehti(driver, status_cb, log_cb):
             time.sleep(0.8)
             continue
 
-        # 5) jos ei enää uusia eikä Näytä lisää -> loppu
         if new_in_pass == 0:
             status_cb("Kauppalehti: ei uusia + ei Näytä lisää -> valmis.")
             break
@@ -520,7 +495,7 @@ class App(tk.Tk):
         super().__init__()
         reset_log()
 
-        self.title("ProtestiBotti (Summa-klikkaus, järjestys)")
+        self.title("ProtestiBotti (toggle-klikkaus, järjestys)")
         self.geometry("940x600")
 
         tk.Label(self, text="ProtestiBotti", font=("Arial", 18, "bold")).pack(pady=10)
@@ -534,19 +509,8 @@ class App(tk.Tk):
         btn_row = tk.Frame(self)
         btn_row.pack(pady=8)
 
-        tk.Button(
-            btn_row,
-            text="Kauppalehti → YTJ",
-            font=("Arial", 12),
-            command=self.start_kauppalehti_mode
-        ).grid(row=0, column=0, padx=8)
-
-        tk.Button(
-            btn_row,
-            text="PDF → YTJ",
-            font=("Arial", 12),
-            command=self.start_pdf_mode
-        ).grid(row=0, column=1, padx=8)
+        tk.Button(btn_row, text="Kauppalehti → YTJ", font=("Arial", 12), command=self.start_kauppalehti_mode).grid(row=0, column=0, padx=8)
+        tk.Button(btn_row, text="PDF → YTJ", font=("Arial", 12), command=self.start_pdf_mode).grid(row=0, column=1, padx=8)
 
         self.status = tk.Label(self, text="Valmiina.", font=("Arial", 11))
         self.status.pack(pady=6)
@@ -596,19 +560,17 @@ class App(tk.Tk):
             if not focus_kauppalehti_tab(driver):
                 messagebox.showerror(
                     "Ei löytynyt Kauppalehteä",
-                    "En löytänyt välilehteä jossa on kauppalehti.fi/yritykset/protestilista.\n\n"
-                    "Varmista:\n"
-                    "1) Chrome auki debug-tilassa (portti 9222)\n"
-                    "2) Olet kirjautuneena\n"
-                    "3) Protestilista on auki"
+                    "En löydä välilehteä jossa protestilista on auki.\n\n"
+                    "Tee näin:\n"
+                    "1) Avaa Chrome debug-tilassa (9222)\n"
+                    "2) Kirjaudu Kauppalehteen\n"
+                    "3) Avaa protestilista välilehteen\n"
+                    "4) Aja botti"
                 )
                 self.set_status("Keskeytetty.")
                 return
 
-            if not is_on_kauppalehti_protestilista(driver):
-                recover_to_kauppalehti(driver, self.set_status, self.ui_log)
-
-            self.set_status("Kauppalehti: kerätään Y-tunnukset (klikataan SUMMA-solua rivi kerrallaan)…")
+            self.set_status("Kauppalehti: kerätään Y-tunnukset (klikataan nuolta / togglea)…")
             yt_list = collect_yts_from_kauppalehti(driver, self.set_status, self.ui_log)
 
             if not yt_list:
@@ -636,8 +598,7 @@ class App(tk.Tk):
             self.set_status("Virhe. Katso log.txt")
             messagebox.showerror("Virhe", f"Tuli virhe.\nKatso log.txt:\n{LOG_PATH}\n\n{e}")
         finally:
-            # ei suljeta driveria tässä moodissa, koska se on käyttäjän oma Chrome
-            pass
+            pass  # ei suljeta käyttäjän Chromea
 
     # ---- Mode 2: PDF -> YTJ ----
     def start_pdf_mode(self):
