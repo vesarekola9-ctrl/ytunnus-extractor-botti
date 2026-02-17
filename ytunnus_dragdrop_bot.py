@@ -166,10 +166,6 @@ def start_new_driver():
 
 
 def attach_to_existing_chrome():
-    """
-    Liity jo auki olevaan Chromeen (remote debugging):
-    chrome.exe --remote-debugging-port=9222 --user-data-dir=...
-    """
     options = webdriver.ChromeOptions()
     options.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
     driver_path = ChromeDriverManager().install()
@@ -186,21 +182,72 @@ def focus_kauppalehti_tab(driver):
 
 
 # -----------------------------
-# Kauppalehti: klikkaa Häiriöpäivä (päivämäärä) -> aukeaa lisärivi jossa Y-TUNNUS
+# Kauppalehti robust: row-by-row click Häiriöpäivä -> read Y-TUNNUS
 # -----------------------------
-def close_all_expanded(driver):
-    # Sulje kaikki auki olevat accordionit jos jokin jää auki
-    try:
-        buttons = driver.find_elements(By.XPATH, "//button[@aria-expanded='true']")
-        for b in buttons:
-            try:
-                if b.is_displayed() and b.is_enabled():
-                    driver.execute_script("arguments[0].click();", b)
-                    time.sleep(0.03)
-            except Exception:
+def get_company_rows(driver):
+    """
+    Palauttaa yritysrivit siten, että rivissä on yrityksen linkki (/yritykset/)
+    ja EI sisällä 'Y-TUNNUS' (eli ei lisärivi).
+    """
+    rows = []
+    candidates = driver.find_elements(By.XPATH, "//*[self::tr or self::div]")
+    for r in candidates:
+        try:
+            if not r.is_displayed():
                 continue
+            txt = (r.text or "")
+            if "Y-TUNNUS" in txt:
+                continue
+            # yrityslinkki
+            links = r.find_elements(By.XPATH, ".//a[contains(@href,'/yritykset/') and normalize-space(.)!='']")
+            if not links:
+                continue
+            # rivissä pitää näkyä dd.mm.yyyy jossain (häiriöpäivä)
+            has_date = False
+            for s in r.find_elements(By.XPATH, ".//*[self::td or self::span or self::div]"):
+                t = (s.text or "").strip()
+                if DATE_RE.match(t):
+                    has_date = True
+                    break
+            if not has_date:
+                continue
+            rows.append(r)
+        except Exception:
+            continue
+    return rows
+
+
+def find_hairiopaiva_cell_in_row(row):
+    """
+    Palauta se elementti rivistä, joka on päivämäärä (dd.mm.yyyy) = Häiriöpäivä
+    """
+    elems = row.find_elements(By.XPATH, ".//*[self::td or self::span or self::div]")
+    for e in elems:
+        try:
+            t = (e.text or "").strip()
+            if DATE_RE.match(t):
+                return e
+        except Exception:
+            continue
+    return None
+
+
+def extract_yt_from_opened_area(anchor_elem):
+    """
+    Klikkauksen jälkeen aukeaa lisärivi jossa 'Y-TUNNUS' ja numero.
+    Poimitaan ensimmäinen Y-tunnus siitä.
+    """
+    try:
+        y_label = anchor_elem.find_element(By.XPATH, "following:://*[contains(normalize-space(.), 'Y-TUNNUS')][1]")
+        block = y_label.find_element(By.XPATH, "ancestor::*[self::div or self::tr][1]")
+        found = YT_RE.findall(block.text or "")
+        for m in found:
+            n = normalize_yt(m)
+            if n:
+                return n
     except Exception:
         pass
+    return ""
 
 
 def click_nayta_lisaa(driver):
@@ -217,129 +264,54 @@ def click_nayta_lisaa(driver):
     return False
 
 
-def get_hairiopaiva_targets(driver):
-    """
-    Palauttaa klikattavat päivämäärä-elementit (dd.mm.yyyy), jotka kuuluvat yritysriveihin.
-    Varmistus: samassa rivissä/divissä on yrityksen nimi-linkki (/yritykset/).
-    """
-    targets = []
-    elems = driver.find_elements(By.XPATH, "//*[self::td or self::div or self::span]")
-    for e in elems:
-        try:
-            if not e.is_displayed():
-                continue
-            t = (e.text or "").strip()
-            if not DATE_RE.match(t):
-                continue
-
-            # Yritä ensin table-rivi
-            row = None
-            row_text = ""
-            try:
-                row = e.find_element(By.XPATH, "ancestor::tr[1]")
-                row_text = row.text or ""
-            except Exception:
-                # fallback div-kontti
-                try:
-                    row = e.find_element(By.XPATH, "ancestor::div[.//a[contains(@href,'/yritykset/')]][1]")
-                    row_text = row.text or ""
-                except Exception:
-                    continue
-
-            # Älä ota lisärivin päivämääriä tms jos se sisältää Y-TUNNUS jo
-            if "Y-TUNNUS" in row_text:
-                continue
-
-            # Pitää olla yrityksen nimi linkkinä samassa rivissä
-            has_company_link = False
-            try:
-                links = row.find_elements(By.XPATH, ".//a[contains(@href,'/yritykset/') and normalize-space(.)!='']")
-                if links:
-                    has_company_link = True
-            except Exception:
-                pass
-            if not has_company_link:
-                continue
-
-            targets.append(e)
-        except Exception:
-            continue
-
-    return targets
-
-
-def extract_yt_from_opened_area(anchor_elem):
-    """
-    Klikkauksen jälkeen aukeaa lisärivi jossa 'Y-TUNNUS' ja numero.
-    Poimitaan y-tunnus siitä.
-    """
-    try:
-        y_label = anchor_elem.find_element(By.XPATH, "following:://*[contains(normalize-space(.), 'Y-TUNNUS')][1]")
-        block = y_label.find_element(By.XPATH, "ancestor::*[self::div or self::tr][1]")
-        found = YT_RE.findall(block.text or "")
-        for m in found:
-            n = normalize_yt(m)
-            if n:
-                return n
-    except Exception:
-        pass
-    return ""
-
-
-def collect_yts_from_kauppalehti_by_dateclick(driver, status_cb, log_cb):
-    """
-    Päälogiikka:
-    - käy näkyvät yritysrivit läpi
-    - klikkaa Häiriöpäivä-päivämäärää
-    - poimii Y-TUNNUS lisärivistä
-    - sulkee rivin
-    - kun loppu: Näytä lisää
-    """
+def collect_yts_from_kauppalehti_rowwise(driver, status_cb, log_cb):
     wait = WebDriverWait(driver, 25)
     wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
     try_accept_cookies(driver)
 
     collected = set()
-    rounds_without_new = 0
+    seen_row_signatures = set()
+
+    def row_signature(row):
+        # vakaa “sormenjälki”: yritysnimi + summa + paikkakunta + päivämäärä (teksti)
+        t = " ".join((row.text or "").split())
+        return t[:220]
 
     while True:
-        status_cb(f"Kauppalehti: klikataan Häiriöpäivä → kerätään Y-tunnukset… kasassa {len(collected)}")
-
-        targets = get_hairiopaiva_targets(driver)
-        if not targets:
-            status_cb("Kauppalehti: en löydä Häiriöpäivä-päiviä. Onko lista näkyvissä + kirjautuneena?")
+        rows = get_company_rows(driver)
+        if not rows:
+            status_cb("Kauppalehti: en löydä yritysrivejä. Onko lista näkyvissä + kirjautuneena?")
             break
+
+        status_cb(f"Kauppalehti: rivejä näkyvissä {len(rows)} | kerätty {len(collected)}")
 
         new_in_pass = 0
 
-        for i in range(len(targets)):
-            close_all_expanded(driver)
-
-            # DOM voi muuttua, hae lista uudelleen
+        for r in rows:
             try:
-                targets = get_hairiopaiva_targets(driver)
-                if i >= len(targets):
-                    break
-                cell = targets[i]
-            except Exception:
-                continue
+                sig = row_signature(r)
+                if sig in seen_row_signatures:
+                    continue
 
-            try:
+                # merkkaa käsitellyksi heti (ettei loopkaa samaa)
+                seen_row_signatures.add(sig)
+
+                cell = find_hairiopaiva_cell_in_row(r)
+                if not cell:
+                    continue
+
                 driver.execute_script("arguments[0].scrollIntoView({block:'center'});", cell)
                 time.sleep(0.05)
 
-                # Avaa yrityksen lisärivi klikkaamalla päivämäärää
+                # avaa lisärivi klikkaamalla päivämäärää
                 try:
                     driver.execute_script("arguments[0].click();", cell)
                 except StaleElementReferenceException:
                     continue
 
                 yt = ""
-                for _ in range(20):  # max ~2s
-                    try:
-                        yt = extract_yt_from_opened_area(cell)
-                    except StaleElementReferenceException:
-                        yt = ""
+                for _ in range(25):  # max ~2.5s
+                    yt = extract_yt_from_opened_area(cell)
                     if yt:
                         break
                     time.sleep(0.1)
@@ -347,9 +319,9 @@ def collect_yts_from_kauppalehti_by_dateclick(driver, status_cb, log_cb):
                 if yt and yt not in collected:
                     collected.add(yt)
                     new_in_pass += 1
-                    log_cb(f"+ {yt} (yhteensä {len(collected)})")
+                    log_cb(f"+ {yt} (yht {len(collected)})")
 
-                # Sulje takaisin klikkaamalla samaa päivämäärää uudelleen
+                # sulje (ei pakollinen, mutta vähentää sekoilua)
                 try:
                     driver.execute_script("arguments[0].click();", cell)
                 except Exception:
@@ -360,25 +332,33 @@ def collect_yts_from_kauppalehti_by_dateclick(driver, status_cb, log_cb):
             except Exception:
                 continue
 
-        if new_in_pass == 0:
-            rounds_without_new += 1
-        else:
-            rounds_without_new = 0
+        # Jos ei tullut yhtään uutta ja “Näytä lisää” löytyy → paina ja odota että rivejä tulee lisää
+        before = len(seen_row_signatures)
 
         if click_nayta_lisaa(driver):
             status_cb("Kauppalehti: Näytä lisää…")
-            time.sleep(1.0)
-            try:
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            except Exception:
-                pass
-            time.sleep(0.8)
+            # odota että sivulle ilmestyy uutta (uusia rivejä)
+            for _ in range(30):  # max ~15s
+                time.sleep(0.5)
+                rows2 = get_company_rows(driver)
+                # jos uusia rivejä on tullut, jatketaan
+                if rows2 and len(rows2) >= 1:
+                    # pieni scroll alas auttaa latauksessa
+                    try:
+                        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    except Exception:
+                        pass
+                    break
             continue
 
-        if rounds_without_new >= 2:
+        # ei lisää nappia -> valmis
+        if new_in_pass == 0:
+            status_cb("Kauppalehti: ei uusia + ei Näytä lisää -> valmis.")
             break
 
-        time.sleep(0.6)
+        # varmistus: jos ei edes signaturet kasva, lopetetaan
+        if len(seen_row_signatures) == before and new_in_pass == 0:
+            break
 
     return sorted(collected)
 
@@ -502,8 +482,8 @@ class App(tk.Tk):
         super().__init__()
         reset_log()
 
-        self.title("ProtestiBotti (Kauppalehti Häiriöpäivä-klikkaus)")
-        self.geometry("900x560")
+        self.title("ProtestiBotti (2500+ STABLE)")
+        self.geometry("920x580")
 
         tk.Label(self, text="ProtestiBotti", font=("Arial", 18, "bold")).pack(pady=10)
 
@@ -533,21 +513,21 @@ class App(tk.Tk):
         self.status = tk.Label(self, text="Valmiina.", font=("Arial", 11))
         self.status.pack(pady=6)
 
-        self.progress = ttk.Progressbar(self, orient="horizontal", mode="determinate", length=820)
+        self.progress = ttk.Progressbar(self, orient="horizontal", mode="determinate", length=840)
         self.progress.pack(pady=6)
 
         frame = tk.Frame(self)
         frame.pack(fill="both", expand=True, padx=14, pady=10)
 
         tk.Label(frame, text="Live-logi (uusimmat alimmaisena):").pack(anchor="w")
-        self.listbox = tk.Listbox(frame, height=15)
+        self.listbox = tk.Listbox(frame, height=16)
         self.listbox.pack(side="left", fill="both", expand=True)
 
         sb = tk.Scrollbar(frame, orient="vertical", command=self.listbox.yview)
         sb.pack(side="right", fill="y")
         self.listbox.configure(yscrollcommand=sb.set)
 
-        tk.Label(self, text=f"Tallennus: {OUT_DIR}", wraplength=860, justify="center").pack(pady=6)
+        tk.Label(self, text=f"Tallennus: {OUT_DIR}", wraplength=900, justify="center").pack(pady=6)
 
     def ui_log(self, msg):
         line = log_to_file(msg)
@@ -584,8 +564,8 @@ class App(tk.Tk):
                 self.set_status("Keskeytetty.")
                 return
 
-            self.set_status("Kauppalehti: kerätään Y-tunnukset (Häiriöpäivä-klikkaus)…")
-            yt_list = collect_yts_from_kauppalehti_by_dateclick(driver, self.set_status, self.ui_log)
+            self.set_status("Kauppalehti: kerätään Y-tunnukset (rivi kerrallaan Häiriöpäivä-klikkaus)…")
+            yt_list = collect_yts_from_kauppalehti_rowwise(driver, self.set_status, self.ui_log)
 
             if not yt_list:
                 self.set_status("Ei löytynyt Y-tunnuksia.")
@@ -612,7 +592,7 @@ class App(tk.Tk):
             self.set_status("Virhe. Katso log.txt")
             messagebox.showerror("Virhe", f"Tuli virhe.\nKatso log.txt:\n{LOG_PATH}\n\n{e}")
         finally:
-            pass  # ei suljeta existing Chromea
+            pass
 
     # ---- Mode 2: PDF -> YTJ ----
     def start_pdf_mode(self):
