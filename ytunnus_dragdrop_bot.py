@@ -4,11 +4,11 @@ import sys
 import time
 import threading
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, filedialog
 from tkinter import ttk
-from dataclasses import dataclass
 from urllib.parse import urlparse
 
+import PyPDF2
 from docx import Document
 
 from selenium import webdriver
@@ -30,6 +30,8 @@ EMAIL_A_RE = re.compile(r"[A-Za-z0-9_.+-]+\s*\(a\)\s*[A-Za-z0-9-]+\.[A-Za-z0-9-.
 
 KAUPPALEHTI_URL = "https://www.kauppalehti.fi/yritykset/protestilista"
 YTJ_HOME = "https://tietopalvelu.ytj.fi/"
+YTJ_COMPANY_URL = "https://tietopalvelu.ytj.fi/yritys/{}"
+
 ALLOWED_KL_HOST = "www.kauppalehti.fi"
 
 
@@ -112,44 +114,6 @@ def normalize_yt(yt: str):
     return None
 
 
-def normalize_name(s: str) -> str:
-    s = (s or "").strip().casefold()
-    s = re.sub(r"\s+", " ", s)
-    s = s.replace("asunto oy", "as oy").replace("asunto-osakeyhtiö", "as oy")
-    return s
-
-
-def token_set(s: str):
-    s = normalize_name(s)
-    s = re.sub(r"[^0-9a-zåäö\s-]", " ", s)
-    parts = [p for p in re.split(r"\s+", s) if p]
-    return set(parts)
-
-
-def score_match(query_name: str, query_location: str, candidate_text: str) -> int:
-    qn = normalize_name(query_name)
-    qtoks = token_set(query_name)
-    cl = normalize_name(candidate_text)
-
-    score = 0
-    if qn and qn == cl:
-        score += 120
-    if qn and qn in cl:
-        score += 60
-
-    ctoks = token_set(candidate_text)
-    score += len(qtoks & ctoks) * 8
-
-    loc = normalize_name(query_location)
-    if loc and loc in cl:
-        score += 35
-
-    for suf in ["oy", "ab", "ky", "oyj", "tmi", "ry"]:
-        if suf in qn and suf in cl:
-            score += 10
-    return score
-
-
 def pick_email_from_text(text: str) -> str:
     if not text:
         return ""
@@ -162,17 +126,12 @@ def pick_email_from_text(text: str) -> str:
     return ""
 
 
-def save_word_table(rows, headers, filename):
+def save_word_plain_lines(lines, filename):
     path = os.path.join(OUT_DIR, filename)
     doc = Document()
-    table = doc.add_table(rows=1, cols=len(headers))
-    hdr = table.rows[0].cells
-    for i, h in enumerate(headers):
-        hdr[i].text = str(h)
-    for r in rows:
-        cells = table.add_row().cells
-        for i, v in enumerate(r):
-            cells[i].text = "" if v is None else str(v)
+    for line in lines:
+        if line and str(line).strip():
+            doc.add_paragraph(str(line).strip())
     doc.save(path)
     return path
 
@@ -198,7 +157,7 @@ def safe_click(driver, elem) -> bool:
 
 
 # =========================
-#   CLICK SAFETY (PREVENT EXTERNAL NAV)
+#   CLICK SAFETY (STOP EXTERNAL NAV)
 # =========================
 def current_host(driver) -> str:
     try:
@@ -222,9 +181,9 @@ def is_external_href(href: str) -> bool:
 def safe_click_kl_only(driver, elem) -> bool:
     """
     Klikkaa vain jos:
-    - elementti ei ole ulkoinen <a href="https://..."> tai
-    - klikkauksen jälkeen pysytään kauppalehti.fi domainissa
-    Jos mennään ulos, palautetaan takaisin ja palautetaan False.
+    - ei ole ulkoinen linkki
+    - ja klikkauksen jälkeen pysytään kauppalehti.fi domainissa
+    Jos lipsahtaa ulos, palautetaan takaisin ja palautetaan False.
     """
     before = driver.current_url
 
@@ -245,7 +204,6 @@ def safe_click_kl_only(driver, elem) -> bool:
 
     host = current_host(driver)
     if host and host != ALLOWED_KL_HOST:
-        # palautetaan takaisin
         try:
             driver.get(before)
         except Exception:
@@ -292,7 +250,7 @@ def try_accept_cookies(driver):
                     continue
                 t = (b.text or "").strip().lower()
                 if t in texts:
-                    # tärkeä: kl-only ettei lähde mihinkään
+                    # KL-only suojattu klikki
                     if safe_click_kl_only(driver, b):
                         time.sleep(0.2)
                         return
@@ -301,7 +259,23 @@ def try_accept_cookies(driver):
 
 
 # =========================
-#   SELENIUM START (NO 9222, persistent profile)
+#   PDF -> YTs
+# =========================
+def extract_ytunnukset_from_pdf(pdf_path: str):
+    yt_set = set()
+    with open(pdf_path, "rb") as f:
+        reader = PyPDF2.PdfReader(f)
+        for page in reader.pages:
+            text = page.extract_text() or ""
+            for m in YT_RE.findall(text):
+                n = normalize_yt(m)
+                if n:
+                    yt_set.add(n)
+    return sorted(yt_set)
+
+
+# =========================
+#   SELENIUM START (NO 9222) + MOBILE EMU
 # =========================
 def get_profile_dir():
     base = get_exe_dir()
@@ -321,9 +295,8 @@ def get_profile_dir():
         return prof
 
 
-def start_persistent_driver():
+def start_persistent_driver(mobile: bool = False):
     options = webdriver.ChromeOptions()
-    options.add_argument("--start-maximized")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--no-first-run")
@@ -334,10 +307,18 @@ def start_persistent_driver():
     profile_dir = get_profile_dir()
     options.add_argument(f"--user-data-dir={profile_dir}")
 
+    if mobile:
+        mobile_emulation = {
+            "deviceMetrics": {"width": 412, "height": 915, "pixelRatio": 2.625},
+            "userAgent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+        }
+        options.add_experimental_option("mobileEmulation", mobile_emulation)
+    else:
+        options.add_argument("--start-maximized")
+
     driver_path = ChromeDriverManager().install()
     driver = webdriver.Chrome(service=Service(driver_path), options=options)
 
-    # pieni “stealth”
     try:
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
             "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
@@ -349,30 +330,7 @@ def start_persistent_driver():
 
 
 # =========================
-#   TABS
-# =========================
-def open_new_tab(driver, url="about:blank"):
-    driver.execute_script("window.open(arguments[0], '_blank');", url)
-    driver.switch_to.window(driver.window_handles[-1])
-
-
-def ensure_two_tabs(driver):
-    # TAB1 KL
-    driver.get(KAUPPALEHTI_URL)
-    WebDriverWait(driver, 25).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    try_accept_cookies(driver)
-
-    # TAB2 YTJ
-    open_new_tab(driver, YTJ_HOME)
-    WebDriverWait(driver, 25).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    try_accept_cookies(driver)
-
-    # takaisin KL
-    driver.switch_to.window(driver.window_handles[0])
-
-
-# =========================
-#   KL READY + TIMEFRAME
+#   KL READY / GUARD
 # =========================
 def page_looks_like_login_or_paywall(driver) -> bool:
     try:
@@ -389,11 +347,9 @@ def page_looks_like_login_or_paywall(driver) -> bool:
 
 
 def ensure_kl_ready(driver, status_cb, log_cb, stop_evt: threading.Event, max_wait_seconds=900):
-    # Varmistus: pysytään domainissa
-    if current_host(driver) != ALLOWED_KL_HOST or "protestilista" not in (driver.current_url or ""):
-        driver.get(KAUPPALEHTI_URL)
-        WebDriverWait(driver, 25).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        try_accept_cookies(driver)
+    driver.get(KAUPPALEHTI_URL)
+    WebDriverWait(driver, 25).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    try_accept_cookies(driver)
 
     start = time.time()
     warned = False
@@ -404,7 +360,7 @@ def ensure_kl_ready(driver, status_cb, log_cb, stop_evt: threading.Event, max_wa
 
         try_accept_cookies(driver)
 
-        # jos karkasi ulos, palaa
+        # guard: pysy domainissa
         if current_host(driver) and current_host(driver) != ALLOWED_KL_HOST:
             driver.get(KAUPPALEHTI_URL)
             WebDriverWait(driver, 25).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
@@ -424,7 +380,7 @@ def ensure_kl_ready(driver, status_cb, log_cb, stop_evt: threading.Event, max_wa
         if not warned:
             warned = True
             status_cb("Kirjaudu Kauppalehteen tässä botti-Chromessa. Kun protestilista näkyy, botti jatkaa.")
-            log_cb("Waiting for user login on Kauppalehti…")
+            log_cb("Waiting for user login on Kauppalehti (botti-Chrome profile)…")
             try:
                 messagebox.showinfo(
                     "Kirjaudu Kauppalehteen",
@@ -442,78 +398,6 @@ def ensure_kl_ready(driver, status_cb, log_cb, stop_evt: threading.Event, max_wa
             return False
 
         time.sleep(2)
-
-
-def set_kl_timeframe(driver, timeframe_text: str, log_cb=None):
-    if not timeframe_text:
-        return False
-    tf = timeframe_text.strip()
-
-    try:
-        container = None
-        labels = driver.find_elements(By.XPATH, "//*[contains(normalize-space(.), 'Aikarajaus')]")
-        for lab in labels[:10]:
-            try:
-                if not lab.is_displayed():
-                    continue
-                container = lab.find_element(By.XPATH, "ancestor::*[self::div or self::section][1]")
-                if container:
-                    break
-            except Exception:
-                continue
-
-        if not container:
-            return False
-
-        opener = None
-        for xp in [".//button", ".//*[@role='button']", ".//*[@role='combobox']", ".//div[@role='combobox']"]:
-            elems = container.find_elements(By.XPATH, xp)
-            for e in elems:
-                try:
-                    if e.is_displayed() and e.is_enabled():
-                        opener = e
-                        break
-                except Exception:
-                    continue
-            if opener:
-                break
-
-        if not opener:
-            return False
-
-        safe_click_kl_only(driver, opener)
-        time.sleep(0.25)
-
-        candidates = driver.find_elements(By.XPATH, "//*[self::li or self::button or @role='option' or @role='menuitem' or @role='listitem']")
-        for c in candidates:
-            try:
-                if not c.is_displayed() or not c.is_enabled():
-                    continue
-                txt = (c.text or "").strip()
-                if txt.lower() == tf.lower():
-                    safe_click_kl_only(driver, c)
-                    time.sleep(0.4)
-                    return True
-            except Exception:
-                continue
-
-        for c in candidates:
-            try:
-                if not c.is_displayed() or not c.is_enabled():
-                    continue
-                txt = (c.text or "").strip().lower()
-                if tf.lower() in txt:
-                    safe_click_kl_only(driver, c)
-                    time.sleep(0.4)
-                    return True
-            except Exception:
-                continue
-
-        return False
-    except Exception as e:
-        if log_cb:
-            log_cb(f"KL Aikarajaus set error: {e}")
-        return False
 
 
 def click_nayta_lisaa(driver) -> bool:
@@ -541,62 +425,121 @@ def click_nayta_lisaa(driver) -> bool:
 
 
 # =========================
-#   HYBRID DATA
+#   KL MOBILE: click chevrons -> extract YTs
 # =========================
-@dataclass
-class KLRow:
-    company: str
-    location: str
-    amount: str
-    date: str
-    ptype: str
-    source: str
+def extract_yt_from_text_block(text: str) -> str:
+    if not text:
+        return ""
+    for m in YT_RE.findall(text):
+        n = normalize_yt(m)
+        if n:
+            return n
+    return ""
 
 
-def read_kl_visible_rows(driver):
-    rows = []
-    trs = driver.find_elements(By.XPATH, "//table//tbody//tr")
-    for tr in trs:
+def get_mobile_toggles(driver):
+    """
+    Yritetään ensin aria-expanded togglet (monesti käytössä).
+    Fallback: napit joissa on svg nuoli.
+    """
+    toggles = []
+    try:
+        elems = driver.find_elements(By.XPATH, "//*[@aria-expanded='false' or @aria-expanded='true']")
+        for e in elems:
+            try:
+                if e.is_displayed() and e.is_enabled():
+                    toggles.append(e)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if toggles:
+        return toggles
+
+    # fallback: etsi buttonit joissa sisällä svg (nuoli)
+    try:
+        buttons = driver.find_elements(By.XPATH, "//button[.//*[name()='svg']]")
+        for b in buttons:
+            try:
+                if b.is_displayed() and b.is_enabled():
+                    toggles.append(b)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return toggles
+
+
+def mobile_toggle_fingerprint(toggle):
+    for xp in [
+        "ancestor::*[self::div or self::li or self::article][1]",
+        "ancestor::tr[1]"
+    ]:
         try:
-            if not tr.is_displayed():
-                continue
-            txt = (tr.text or "").strip()
-            if not txt:
-                continue
-            if "Y-tunnus" in txt or "Y-TUNNUS" in txt:
-                continue
-
-            tds = tr.find_elements(By.XPATH, ".//td")
-            if len(tds) < 6:
-                continue
-
-            company = (tds[0].text or "").strip()
-            location = (tds[1].text or "").strip()
-            amount = (tds[2].text or "").strip()
-            date = (tds[3].text or "").strip()
-            ptype = (tds[4].text or "").strip()
-            source = (tds[5].text or "").strip()
-
-            if company:
-                rows.append(KLRow(company, location, amount, date, ptype, source))
+            c = toggle.find_element(By.XPATH, xp)
+            txt = (c.text or "").strip().replace("\n", " ")
+            if txt:
+                return txt[:180]
         except Exception:
             continue
-    return rows
+    try:
+        return (toggle.get_attribute("class") or "")[:120]
+    except Exception:
+        return "unknown"
 
 
-def collect_kl_rows_all(driver, status_cb, log_cb, stop_evt: threading.Event, max_pages=999):
-    collected = []
-    seen = set()
+def extract_yt_after_expand(toggle):
+    """
+    Kun toggle on klikattu, etsitään lähialueesta Y-TUNNUS ja siitä Y-tunnus.
+    """
+    for xp in [
+        "ancestor::*[self::div or self::li or self::article][1]",
+        "ancestor::tr[1]",
+        "ancestor::section[1]"
+    ]:
+        try:
+            c = toggle.find_element(By.XPATH, xp)
+            txt = (c.text or "")
+            if "Y-TUNNUS" in txt or "Y-tunnus" in txt:
+                yt = extract_yt_from_text_block(txt)
+                if yt:
+                    return yt
+        except Exception:
+            continue
+
+    # fallback: katso vähän ympäristöä
+    try:
+        c = toggle.find_element(By.XPATH, "ancestor::*[self::div or self::li or self::article][1]")
+        txt = (c.get_attribute("innerText") or "")
+        if "Y-TUNNUS" in txt or "Y-tunnus" in txt:
+            yt = extract_yt_from_text_block(txt)
+            if yt:
+                return yt
+    except Exception:
+        pass
+
+    return ""
+
+
+def collect_yts_from_kauppalehti_mobile(driver, status_cb, log_cb, stop_evt, max_rounds=250):
+    if not ensure_kl_ready(driver, status_cb, log_cb, stop_evt):
+        return []
+
+    collected = set()
+    processed = set()
     rounds_no_new = 0
-    page_clicks = 0
 
-    while True:
+    time.sleep(0.8)
+
+    for _round in range(max_rounds):
         if stop_evt.is_set():
             break
 
         try_accept_cookies(driver)
 
-        # jos karkasi jostain syystä, palaa protestilistaan
+        # guard: pysy protestilistassa
         if current_host(driver) != ALLOWED_KL_HOST or "protestilista" not in (driver.current_url or ""):
             log_cb(f"KL guard: palataan protestilistaan (url oli {driver.current_url})")
             driver.get(KAUPPALEHTI_URL)
@@ -604,55 +547,88 @@ def collect_kl_rows_all(driver, status_cb, log_cb, stop_evt: threading.Event, ma
             try_accept_cookies(driver)
             time.sleep(0.6)
 
-        if page_looks_like_login_or_paywall(driver):
-            status_cb("KL: näyttää blokilta/paywallilta -> debug dump.")
-            html, png = dump_debug(driver, "kl_blocked")
-            log_cb(f"DEBUG dump: {html} | {png}")
-            time.sleep(2)
-            continue
+        toggles = get_mobile_toggles(driver)
+        status_cb(f"KL(mobile): näkyviä nuolia {len(toggles)} | kerätty {len(collected)}")
 
-        visible = read_kl_visible_rows(driver)
-        new = 0
-        for r in visible:
-            key = (r.company, r.location, r.amount, r.date, r.ptype, r.source)
-            if key in seen:
+        new_this_round = 0
+
+        for t in toggles:
+            if stop_evt.is_set():
+                break
+
+            fp = mobile_toggle_fingerprint(t)
+            if fp in processed:
                 continue
-            seen.add(key)
-            collected.append(r)
-            new += 1
+            processed.add(fp)
 
-        status_cb(f"KL: kerätty {len(collected)} (uusii {new})")
+            if not safe_click_kl_only(driver, t):
+                continue
 
-        if new == 0:
+            time.sleep(0.25)
+
+            yt = ""
+            for _ in range(25):
+                yt = extract_yt_after_expand(t)
+                if yt:
+                    break
+                time.sleep(0.06)
+
+            if yt and yt not in collected:
+                collected.add(yt)
+                new_this_round += 1
+                log_cb(f"+ {yt} (yht {len(collected)})")
+
+        # scrollaa alas
+        try:
+            driver.execute_script("window.scrollBy(0, 950);")
+        except Exception:
+            pass
+        time.sleep(0.35)
+
+        if new_this_round == 0:
             rounds_no_new += 1
         else:
             rounds_no_new = 0
 
-        if page_clicks >= max_pages:
-            status_cb("KL: max_pages täynnä -> lopetan.")
-            break
-
-        if click_nayta_lisaa(driver):
-            page_clicks += 1
-            time.sleep(1.1)
-            continue
-
-        if rounds_no_new >= 2:
+        # jos ei uutta useaan kierrokseen, yritä Näytä lisää kerran ja lopeta muuten
+        if rounds_no_new >= 6:
+            if click_nayta_lisaa(driver):
+                rounds_no_new = 0
+                time.sleep(1.0)
+                continue
             break
 
     if not collected:
-        html, png = dump_debug(driver, "kl_zero_rows")
+        html, png = dump_debug(driver, "kl_mobile_zero")
         log_cb(f"DEBUG dump: {html} | {png}")
 
-    return collected
+    return sorted(collected)
 
 
 # =========================
-#   YTJ
+#   YTJ EMAILS (PDF-mode)
 # =========================
 def wait_ytj_loaded(driver):
     WebDriverWait(driver, 25).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
     time.sleep(0.2)
+
+
+def click_all_nayta_ytj(driver):
+    for _ in range(3):
+        clicked = False
+        for b in driver.find_elements(By.XPATH, "//button|//*[@role='button']|//a"):
+            try:
+                if not b.is_displayed() or not b.is_enabled():
+                    continue
+                t = (b.text or "").strip().lower()
+                if t == "näytä":
+                    safe_click(driver, b)
+                    clicked = True
+                    time.sleep(0.15)
+            except Exception:
+                continue
+        if not clicked:
+            break
 
 
 def extract_email_from_ytj(driver):
@@ -683,220 +659,40 @@ def extract_email_from_ytj(driver):
         return ""
 
 
-def extract_yt_from_ytj_page(driver) -> str:
-    try:
-        text = driver.find_element(By.TAG_NAME, "body").text or ""
-        for m in YT_RE.findall(text):
-            n = normalize_yt(m)
-            if n:
-                return n
-    except Exception:
-        pass
-    return ""
+def fetch_emails_from_ytj(driver, yt_list, status_cb, progress_cb, log_cb, stop_evt):
+    emails = []
+    seen = set()
+    progress_cb(0, max(1, len(yt_list)))
 
-
-def ytj_open_home(driver):
-    driver.get(YTJ_HOME)
-    wait_ytj_loaded(driver)
-    try_accept_cookies(driver)
-
-
-def ytj_search_and_pick_best(driver, company_name: str, location: str, log_cb=None):
-    ytj_open_home(driver)
-
-    search_input = None
-    inputs = driver.find_elements(By.XPATH, "//input")
-    for inp in inputs:
-        try:
-            if not inp.is_displayed() or not inp.is_enabled():
-                continue
-            typ = (inp.get_attribute("type") or "").lower()
-            aria = (inp.get_attribute("aria-label") or "").lower()
-            ph = (inp.get_attribute("placeholder") or "").lower()
-            if typ in ("search", "text") and ("hae" in aria or "hae" in ph or "yritys" in aria or "yritys" in ph):
-                search_input = inp
-                break
-        except Exception:
-            continue
-
-    if not search_input:
-        for inp in inputs:
-            try:
-                if inp.is_displayed() and inp.is_enabled():
-                    search_input = inp
-                    break
-            except Exception:
-                continue
-
-    if not search_input:
-        if log_cb:
-            log_cb("YTJ: hakukenttää ei löytynyt")
-        return "", 0, ""
-
-    try:
-        search_input.click()
-        time.sleep(0.05)
-        search_input.clear()
-    except Exception:
-        pass
-
-    try:
-        search_input.send_keys(company_name)
-        time.sleep(0.05)
-        search_input.send_keys(Keys.ENTER)
-    except Exception:
-        try:
-            driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ENTER)
-        except Exception:
-            pass
-
-    time.sleep(1.0)
-    try_accept_cookies(driver)
-
-    links = driver.find_elements(By.XPATH, "//a[contains(@href, '/yritys/')]")
-    best = ("", 0, "")
-    seen_urls = set()
-
-    for a in links[:60]:
-        try:
-            url = (a.get_attribute("href") or "").strip()
-            if not url or "/yritys/" not in url:
-                continue
-            if url in seen_urls:
-                continue
-            seen_urls.add(url)
-
-            cand_text = ""
-            try:
-                container = a.find_element(By.XPATH, "ancestor::*[self::li or self::div or self::article][1]")
-                cand_text = (container.text or "").strip()
-            except Exception:
-                cand_text = (a.text or "").strip()
-
-            if not cand_text:
-                continue
-
-            sc = score_match(company_name, location, cand_text)
-            if sc > best[1]:
-                best = (url, sc, cand_text)
-        except Exception:
-            continue
-
-    return best
-
-
-def ytj_get_email_by_company_name(driver, company_name: str, location: str, log_cb=None):
-    url, score, _txt = ytj_search_and_pick_best(driver, company_name, location, log_cb=log_cb)
-    if not url:
-        return {"yt": "", "email": "", "url": "", "score": 0}
-
-    driver.get(url)
-    wait_ytj_loaded(driver)
-    try_accept_cookies(driver)
-
-    # yritä avata "Näytä"
-    for _ in range(2):
-        clicked = False
-        for b in driver.find_elements(By.XPATH, "//button|//*[@role='button']|//a"):
-            try:
-                t = (b.text or "").strip().lower()
-                if t == "näytä" and b.is_displayed() and b.is_enabled():
-                    # YTJ:ssä ei tarvita KL-only -klikkiä
-                    safe_click(driver, b)
-                    clicked = True
-                    time.sleep(0.15)
-            except Exception:
-                continue
-        if not clicked:
-            break
-
-    yt = extract_yt_from_ytj_page(driver)
-    email = extract_email_from_ytj(driver)
-    return {"yt": yt, "email": email, "url": url, "score": score}
-
-
-# =========================
-#   HYBRID RUN (TWO TABS)
-# =========================
-def run_hybrid(driver, timeframe: str, status_cb, progress_cb, log_cb, stop_evt: threading.Event):
-    # Varmista 2 tabia
-    status_cb("Alustus: avataan KL ja YTJ omiin tabbeihin…")
-    ensure_two_tabs(driver)
-
-    kl_handle = driver.window_handles[0]
-    ytj_handle = driver.window_handles[1]
-
-    # KL ready
-    driver.switch_to.window(kl_handle)
-    status_cb("KL: avataan protestilista…")
-    if not ensure_kl_ready(driver, status_cb, log_cb, stop_evt):
-        return [], []
-
-    # Timeframe
-    if timeframe:
-        status_cb(f"KL: asetetaan aikarajaus = {timeframe} …")
-        ok = set_kl_timeframe(driver, timeframe, log_cb=log_cb)
-        log_cb(f"Aikarajaus set: {ok}")
-        time.sleep(0.6)
-
-    # Collect KL rows
-    status_cb("KL: kerätään yritysrivit (nimi+sijainti)…")
-    kl_rows = collect_kl_rows_all(driver, status_cb, log_cb, stop_evt)
-
-    if stop_evt.is_set():
-        return kl_rows, []
-
-    if not kl_rows:
-        return [], []
-
-    kl_table = [[r.company, r.location, r.date, r.amount, r.ptype, r.source] for r in kl_rows]
-    kl_path = save_word_table(
-        kl_table,
-        headers=["Yritys", "Sijainti", "Häiriöpäivä", "Summa", "Tyyppi", "Lähde"],
-        filename="kl_rivit.docx",
-    )
-    log_cb(f"Tallennettu: {kl_path}")
-
-    # YTJ loop in tab2
-    results = []
-    progress_cb(0, len(kl_rows))
-
-    driver.switch_to.window(ytj_handle)
-    ytj_open_home(driver)
-
-    for i, r in enumerate(kl_rows, start=1):
+    for i, yt in enumerate(yt_list, start=1):
         if stop_evt.is_set():
             break
 
-        status_cb(f"YTJ: {i}/{len(kl_rows)} — {r.company} ({r.location})")
-        progress_cb(i - 1, len(kl_rows))
+        status_cb(f"YTJ: {i}/{len(yt_list)} {yt}")
+        progress_cb(i - 1, len(yt_list))
 
-        try:
-            data = ytj_get_email_by_company_name(driver, r.company, r.location, log_cb=log_cb)
-        except Exception as e:
-            log_cb(f"YTJ ERROR {r.company}: {e}")
-            data = {"yt": "", "email": "", "url": "", "score": 0}
+        driver.get(YTJ_COMPANY_URL.format(yt))
+        wait_ytj_loaded(driver)
+        click_all_nayta_ytj(driver)
 
-        results.append([
-            r.company,
-            r.location,
-            data.get("yt", ""),
-            data.get("email", ""),
-            data.get("url", ""),
-            str(data.get("score", 0)),
-        ])
-        time.sleep(0.12)
+        email = ""
+        for _ in range(8):
+            email = extract_email_from_ytj(driver)
+            if email:
+                break
+            time.sleep(0.2)
 
-    progress_cb(len(results), len(kl_rows))
+        if email:
+            k = email.lower()
+            if k not in seen:
+                seen.add(k)
+                emails.append(email)
+                log_cb(email)
 
-    out_path = save_word_table(
-        results,
-        headers=["Yritys", "Sijainti", "Y-tunnus", "Sähköposti", "YTJ-linkki", "Score"],
-        filename="tulokset.docx",
-    )
-    log_cb(f"Tallennettu: {out_path}")
+        time.sleep(0.08)
 
-    return kl_rows, results
+    progress_cb(len(emails), max(1, len(yt_list)))
+    return emails
 
 
 # =========================
@@ -910,43 +706,48 @@ class App(tk.Tk):
         self.stop_evt = threading.Event()
         self.worker = None
 
-        self.title("ProtestiBotti (TOIMIVA: HYBRID, NO 9222 + turvalliset klikkaukset)")
-        self.geometry("1040x700")
+        self.title("ProtestiBotti (TOIMIVA: KL Mobile YT -> Word + PDF->YTJ)")
+        self.geometry("1020x680")
 
-        tk.Label(self, text="ProtestiBotti (Hybrid, NO 9222)", font=("Arial", 18, "bold")).pack(pady=8)
+        tk.Label(self, text="ProtestiBotti", font=("Arial", 18, "bold")).pack(pady=8)
+        tk.Label(
+            self,
+            text="Moodit:\n"
+                 "1) Kauppalehti (MOBIILINÄKYMÄ) → klikkaa nuolet → kerää Y-tunnukset → Word\n"
+                 "2) PDF → Y-tunnukset → YTJ sähköpostit → Word",
+            justify="center"
+        ).pack(pady=4)
 
-        top = tk.Frame(self)
-        top.pack(pady=6)
+        btn_row = tk.Frame(self)
+        btn_row.pack(pady=10)
 
-        tk.Label(top, text="Aikarajaus:", font=("Arial", 11)).grid(row=0, column=0, padx=6)
-        self.timeframe = ttk.Combobox(top, values=["Päivä", "Viikko", "Kuukausi"], state="readonly", width=12)
-        self.timeframe.set("Päivä")
-        self.timeframe.grid(row=0, column=1, padx=6)
+        self.btn_kl = tk.Button(btn_row, text="1) KL Mobile → Y-tunnukset", font=("Arial", 12, "bold"), command=self.start_kl_mobile)
+        self.btn_kl.grid(row=0, column=0, padx=8)
 
-        self.btn_start = tk.Button(top, text="Käynnistä HYBRID", font=("Arial", 12, "bold"), command=self.start)
-        self.btn_start.grid(row=0, column=2, padx=10)
+        self.btn_pdf = tk.Button(btn_row, text="2) PDF → YTJ sähköpostit", font=("Arial", 12, "bold"), command=self.start_pdf)
+        self.btn_pdf.grid(row=0, column=1, padx=8)
 
-        self.btn_stop = tk.Button(top, text="STOP", font=("Arial", 12, "bold"), command=self.stop, state="disabled")
-        self.btn_stop.grid(row=0, column=3, padx=6)
+        self.btn_stop = tk.Button(btn_row, text="STOP", font=("Arial", 12, "bold"), command=self.stop, state="disabled")
+        self.btn_stop.grid(row=0, column=2, padx=8)
 
         self.status = tk.Label(self, text="Valmiina.", font=("Arial", 11))
         self.status.pack(pady=6)
 
-        self.progress = ttk.Progressbar(self, orient="horizontal", mode="determinate", length=980)
+        self.progress = ttk.Progressbar(self, orient="horizontal", mode="determinate", length=940)
         self.progress.pack(pady=6)
 
         frame = tk.Frame(self)
         frame.pack(fill="both", expand=True, padx=14, pady=10)
 
-        tk.Label(frame, text="Live-logi:").pack(anchor="w")
-        self.listbox = tk.Listbox(frame, height=22)
+        tk.Label(frame, text="Live-logi (uusimmat alimmaisena):").pack(anchor="w")
+        self.listbox = tk.Listbox(frame, height=20)
         self.listbox.pack(side="left", fill="both", expand=True)
 
         sb = tk.Scrollbar(frame, orient="vertical", command=self.listbox.yview)
         sb.pack(side="right", fill="y")
         self.listbox.configure(yscrollcommand=sb.set)
 
-        tk.Label(self, text=f"Tallennus: {OUT_DIR}", wraplength=1000, justify="center").pack(pady=6)
+        tk.Label(self, text=f"Tallennus: {OUT_DIR}", wraplength=980, justify="center").pack(pady=6)
 
     def ui_log(self, msg):
         line = log_to_file(msg)
@@ -964,56 +765,55 @@ class App(tk.Tk):
         self.progress["value"] = value
         self.update_idletasks()
 
-    def start(self):
-        if self.worker and self.worker.is_alive():
-            return
+    def lock_ui(self):
         self.stop_evt.clear()
-        self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
-        self.worker = threading.Thread(target=self.run, daemon=True)
-        self.worker.start()
+        self.btn_kl.config(state="disabled")
+        self.btn_pdf.config(state="disabled")
+
+    def unlock_ui(self):
+        self.btn_stop.config(state="disabled")
+        self.btn_kl.config(state="normal")
+        self.btn_pdf.config(state="normal")
 
     def stop(self):
         self.stop_evt.set()
         self.set_status("STOP pyydetty – lopetetaan hallitusti…")
         self.btn_stop.config(state="disabled")
 
-    def run(self):
+    # ---- MODE 1: KL Mobile ----
+    def start_kl_mobile(self):
+        if self.worker and self.worker.is_alive():
+            return
+        self.lock_ui()
+        self.worker = threading.Thread(target=self.run_kl_mobile, daemon=True)
+        self.worker.start()
+
+    def run_kl_mobile(self):
         driver = None
         try:
-            self.set_status("Käynnistetään Chrome (pysyvä profiili)…")
-            driver = start_persistent_driver()
+            self.set_status("Käynnistetään Chrome (MOBIILI-emulaatio, pysyvä profiili)…")
+            driver = start_persistent_driver(mobile=True)
 
-            tf = self.timeframe.get().strip()
-            self.set_status(f"Aloitetaan: KL({tf}) → YTJ (nimihaku)…")
-            kl_rows, results = run_hybrid(
-                driver=driver,
-                timeframe=tf,
-                status_cb=self.set_status,
-                progress_cb=self.set_progress,
-                log_cb=self.ui_log,
-                stop_evt=self.stop_evt
-            )
+            self.set_status("KL(mobile): kerätään Y-tunnukset…")
+            yt_list = collect_yts_from_kauppalehti_mobile(driver, self.set_status, self.ui_log, self.stop_evt)
 
             if self.stop_evt.is_set():
                 self.set_status("Pysäytetty.")
                 return
 
-            if not kl_rows:
-                self.set_status("KL: Ei saatu rivejä. Katso debug dumpit output-kansiosta.")
-                messagebox.showwarning("Ei rivejä", f"Kauppalehdestä ei saatu rivejä.\nKatso: {OUT_DIR}")
+            if not yt_list:
+                self.set_status("Ei löytynyt Y-tunnuksia. Katso debug dump output-kansiosta.")
+                messagebox.showwarning("Ei löytynyt", f"Y-tunnuksia ei saatu.\nKatso: {OUT_DIR}")
                 return
 
-            emails = [r[3] for r in results if r and len(r) >= 4 and r[3]]
-            uniq_emails = len(set(e.lower() for e in emails))
+            yt_path = save_word_plain_lines(yt_list, "ytunnukset_kl_mobile.docx")
+            self.ui_log(f"Tallennettu: {yt_path}")
 
             self.set_status("Valmis!")
             messagebox.showinfo(
                 "Valmis",
-                f"Valmis!\n\nKansio:\n{OUT_DIR}\n\n"
-                f"KL rivejä: {len(kl_rows)}\n"
-                f"Sähköposteja (uniikki): {uniq_emails}\n\n"
-                f"Tiedostot:\n- kl_rivit.docx\n- tulokset.docx"
+                f"Valmis!\n\nKansio:\n{OUT_DIR}\n\nY-tunnuksia: {len(yt_list)}\n\nTiedosto:\nytunnukset_kl_mobile.docx"
             )
 
         except WebDriverException as e:
@@ -1030,8 +830,68 @@ class App(tk.Tk):
                     driver.quit()
             except Exception:
                 pass
-            self.btn_start.config(state="normal")
-            self.btn_stop.config(state="disabled")
+            self.unlock_ui()
+
+    # ---- MODE 2: PDF -> YTJ ----
+    def start_pdf(self):
+        path = filedialog.askopenfilename(filetypes=[("PDF files", "*.pdf")])
+        if not path:
+            return
+        if self.worker and self.worker.is_alive():
+            return
+        self.lock_ui()
+        self.worker = threading.Thread(target=self.run_pdf_mode, args=(path,), daemon=True)
+        self.worker.start()
+
+    def run_pdf_mode(self, pdf_path):
+        driver = None
+        try:
+            self.set_status("Luetaan PDF ja kerätään Y-tunnukset…")
+            yt_list = extract_ytunnukset_from_pdf(pdf_path)
+
+            if not yt_list:
+                self.set_status("Ei löytynyt Y-tunnuksia PDF:stä.")
+                messagebox.showwarning("Ei löytynyt", "PDF:stä ei löytynyt yhtään Y-tunnusta.")
+                return
+
+            yt_path = save_word_plain_lines(yt_list, "ytunnukset_pdf.docx")
+            self.ui_log(f"Tallennettu: {yt_path}")
+
+            if self.stop_evt.is_set():
+                self.set_status("Pysäytetty.")
+                return
+
+            self.set_status("Käynnistetään Chrome ja haetaan sähköpostit YTJ:stä…")
+            driver = start_persistent_driver(mobile=False)
+
+            self.set_status("YTJ: haetaan sähköpostit…")
+            emails = fetch_emails_from_ytj(driver, yt_list, self.set_status, self.set_progress, self.ui_log, self.stop_evt)
+
+            if self.stop_evt.is_set():
+                self.set_status("Pysäytetty.")
+                return
+
+            em_path = save_word_plain_lines(emails, "sahkopostit_pdf_ytj.docx")
+            self.ui_log(f"Tallennettu: {em_path}")
+
+            self.set_status("Valmis!")
+            messagebox.showinfo(
+                "Valmis",
+                f"Valmis!\n\nKansio:\n{OUT_DIR}\n\nY-tunnuksia: {len(yt_list)}\nSähköposteja: {len(emails)}\n\n"
+                f"Tiedostot:\nytunnukset_pdf.docx\nsahkopostit_pdf_ytj.docx"
+            )
+
+        except Exception as e:
+            self.ui_log(f"VIRHE: {e}")
+            self.set_status("Virhe. Katso log.txt")
+            messagebox.showerror("Virhe", f"Tuli virhe.\n\n{e}\n\nLogi: {LOG_PATH}")
+        finally:
+            try:
+                if driver:
+                    driver.quit()
+            except Exception:
+                pass
+            self.unlock_ui()
 
 
 if __name__ == "__main__":
