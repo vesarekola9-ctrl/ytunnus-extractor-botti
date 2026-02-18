@@ -7,6 +7,8 @@ import tkinter as tk
 from tkinter import messagebox, filedialog
 from tkinter import ttk
 from urllib.parse import urlparse
+import subprocess
+import shutil
 
 import PyPDF2
 from docx import Document
@@ -24,17 +26,12 @@ from webdriver_manager.chrome import ChromeDriverManager
 #   CONFIG / REGEX
 # =========================
 YT_RE = re.compile(r"\b\d{7}-\d\b|\b\d{8}\b")
-EMAIL_RE = re.compile(r"[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9-.]+")
+EMAIL_RE = re.compile(r"[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9-]+\.[A-Za-z0-9-.]+")
 EMAIL_A_RE = re.compile(r"[A-Za-z0-9_.+-]+\s*\(a\)\s*[A-Za-z0-9-]+\.[A-Za-z0-9-.]+", re.I)
 
 KAUPPALEHTI_URL = "https://www.kauppalehti.fi/yritykset/protestilista"
 YTJ_COMPANY_URL = "https://tietopalvelu.ytj.fi/yritys/{}"
 
-# TÄRKEÄ: valitse sama Chrome-profiili jolla kirjaudut KL:ään NORMAALILLA Chromella
-# Vaihda tarvittaessa: "Profile 1", "Profile 2", ...
-CHROME_PROFILE_DIRECTORY = "Default"
-
-# Login voi käyttää eri hosteja; scrape-vaiheessa pidetään tiukempi guard
 ALLOWED_HOSTS_DURING_LOGIN = {
     "www.kauppalehti.fi",
     "kauppalehti.fi",
@@ -46,10 +43,7 @@ ALLOWED_HOSTS_DURING_LOGIN = {
     "auth.alma.fi",
 }
 
-ALLOWED_KL_HOSTS_DURING_SCRAPE = {
-    "www.kauppalehti.fi",
-    "kauppalehti.fi",
-}
+ALLOWED_KL_HOSTS_DURING_SCRAPE = {"www.kauppalehti.fi", "kauppalehti.fi"}
 
 
 # =========================
@@ -81,6 +75,7 @@ def get_output_dir():
 
 OUT_DIR = get_output_dir()
 LOG_PATH = os.path.join(OUT_DIR, "log.txt")
+CHROMEDRIVER_LOG = os.path.join(OUT_DIR, "chromedriver.log")
 
 
 def log_to_file(msg: str):
@@ -102,7 +97,7 @@ def reset_log():
         pass
     log_to_file(f"Output: {OUT_DIR}")
     log_to_file(f"Logi: {LOG_PATH}")
-    log_to_file(f"Chrome profile dir: {CHROME_PROFILE_DIRECTORY}")
+    log_to_file(f"ChromeDriver log: {CHROMEDRIVER_LOG}")
 
 
 def dump_debug(driver, tag="debug"):
@@ -135,10 +130,10 @@ def normalize_yt(yt: str):
 def pick_email_from_text(text: str) -> str:
     if not text:
         return ""
-    m = EMAIL_RE.search(text)
+    m = re.search(r"[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9-.]+", text)
     if m:
         return m.group(0).strip().replace(" ", "")
-    m2 = EMAIL_A_RE.search(text)
+    m2 = re.search(r"[A-Za-z0-9_.+-]+\s*\(a\)\s*[A-Za-z0-9-]+\.[A-Za-z0-9-.]+", text, re.I)
     if m2:
         return m2.group(0).replace(" ", "").replace("(a)", "@")
     return ""
@@ -174,9 +169,6 @@ def safe_click(driver, elem) -> bool:
         return False
 
 
-# =========================
-#   HOST / CLICK SAFETY
-# =========================
 def current_host(driver) -> str:
     try:
         return urlparse(driver.current_url).netloc.lower()
@@ -227,9 +219,6 @@ def safe_click_with_host_policy(driver, elem, allowed_hosts: set) -> bool:
     return True
 
 
-# =========================
-#   COOKIES (SAFE)
-# =========================
 def try_accept_cookies(driver, allowed_hosts: set):
     texts = {"hyväksy", "hyväksy kaikki", "salli kaikki", "accept", "accept all", "i agree", "ok", "selvä"}
 
@@ -254,16 +243,15 @@ def try_accept_cookies(driver, allowed_hosts: set):
             buttons = root.find_elements(By.XPATH, ".//button|.//*[@role='button']")
         except Exception:
             continue
-
         for b in buttons:
             try:
                 if not b.is_displayed() or not b.is_enabled():
                     continue
                 t = (b.text or "").strip().lower()
                 if t in texts:
-                    if safe_click_with_host_policy(driver, b, allowed_hosts):
-                        time.sleep(0.2)
-                        return
+                    safe_click_with_host_policy(driver, b, allowed_hosts)
+                    time.sleep(0.2)
+                    return
             except Exception:
                 continue
 
@@ -285,23 +273,58 @@ def extract_ytunnukset_from_pdf(pdf_path: str):
 
 
 # =========================
-#   SELENIUM START
-#   -> Uses NORMAL Chrome User Data + profile-directory
+#   CHROME: NORMAL LOGIN PROFILE (NO SELENIUM) + SELENIUM USES SAME DIR
 # =========================
-def get_chrome_user_data_dir():
-    # Windows
-    local = os.environ.get("LOCALAPPDATA", "")
-    if local:
-        return os.path.join(local, "Google", "Chrome", "User Data")
-    # fallback
+def get_bot_profile_dir():
+    # oma profiili, ei Default -> ei kaadu jos Chrome on auki
+    base = get_exe_dir()
+    prof = os.path.join(base, "kl_profile")
+    try:
+        os.makedirs(prof, exist_ok=True)
+        return prof
+    except Exception:
+        home = os.path.expanduser("~")
+        docs = os.path.join(home, "Documents")
+        prof = os.path.join(docs, "ProtestiBotti", "kl_profile")
+        os.makedirs(prof, exist_ok=True)
+        return prof
+
+
+def find_chrome_exe():
+    # 1) PATH
+    p = shutil.which("chrome") or shutil.which("chrome.exe")
+    if p:
+        return p
+
+    # 2) common Windows paths
+    candidates = []
+    pf = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+    pfx = os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")
+    candidates += [
+        os.path.join(pf, "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(pfx, "Google", "Chrome", "Application", "chrome.exe"),
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
     return None
 
 
-def start_driver_with_real_profile(mobile: bool = False):
-    """
-    Avataan Chrome SELENIUMilla mutta käytetään samaa Chrome-profiilia kuin normaali Chrome.
-    -> Kirjaudu KL:ään etukäteen NORMAALILLA Chromella samalla profiililla.
-    """
+def open_normal_chrome_for_login(profile_dir: str):
+    chrome = find_chrome_exe()
+    if not chrome:
+        raise RuntimeError("chrome.exe ei löytynyt. Asenna Google Chrome tai lisää se PATHiin.")
+    # Normaali Chrome (EI selenium) -> kirjautuminen onnistuu
+    args = [
+        chrome,
+        f"--user-data-dir={profile_dir}",
+        "--new-window",
+        KAUPPALEHTI_URL,
+    ]
+    subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def start_selenium_with_profile(profile_dir: str, mobile: bool):
     options = webdriver.ChromeOptions()
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-dev-shm-usage")
@@ -310,12 +333,7 @@ def start_driver_with_real_profile(mobile: bool = False):
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
 
-    user_data = get_chrome_user_data_dir()
-    if not user_data:
-        raise RuntimeError("LOCALAPPDATA ei löytynyt. Windows-polku User Dataan ei selvinnyt.")
-
-    options.add_argument(f"--user-data-dir={user_data}")
-    options.add_argument(f"--profile-directory={CHROME_PROFILE_DIRECTORY}")
+    options.add_argument(f"--user-data-dir={profile_dir}")
 
     if mobile:
         mobile_emulation = {
@@ -327,8 +345,8 @@ def start_driver_with_real_profile(mobile: bool = False):
         options.add_argument("--start-maximized")
 
     driver_path = ChromeDriverManager().install()
-    driver = webdriver.Chrome(service=Service(driver_path), options=options)
-    return driver
+    service = Service(driver_path, log_output=CHROMEDRIVER_LOG)
+    return webdriver.Chrome(service=service, options=options)
 
 
 # =========================
@@ -345,14 +363,14 @@ def page_looks_like_protestilista(driver) -> bool:
 def enforce_kl_guard(driver, log_cb):
     host = current_host(driver)
     if host and host not in ALLOWED_KL_HOSTS_DURING_SCRAPE:
-        log_cb(f"Guard: host '{host}' ei sallittu keruussa -> takaisin protestilistaan")
+        log_cb(f"Guard: host '{host}' -> takaisin protestilistaan")
         driver.get(KAUPPALEHTI_URL)
         WebDriverWait(driver, 25).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
         try_accept_cookies(driver, ALLOWED_KL_HOSTS_DURING_SCRAPE)
         time.sleep(0.6)
 
     if "protestilista" not in (driver.current_url or ""):
-        log_cb("Guard: URL ei ole protestilista -> takaisin protestilistaan")
+        log_cb("Guard: ei protestilista -> takaisin")
         driver.get(KAUPPALEHTI_URL)
         WebDriverWait(driver, 25).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
         try_accept_cookies(driver, ALLOWED_KL_HOSTS_DURING_SCRAPE)
@@ -379,7 +397,7 @@ def click_nayta_lisaa(driver) -> bool:
 
 
 # =========================
-#   KL MOBILE SCRAPE (CHEVRONS)
+#   KL MOBILE SCRAPE
 # =========================
 def extract_yt_from_text_block(text: str) -> str:
     if not text:
@@ -469,16 +487,14 @@ def collect_yts_from_kauppalehti_mobile(driver, status_cb, log_cb, stop_evt, max
     time.sleep(0.6)
 
     if not page_looks_like_protestilista(driver):
-        status_cb("Protestilista ei näy. Varmista että olet kirjautunut KL:ään normaalilla Chromella (sama profiili).")
-        html, png = dump_debug(driver, "kl_not_logged_in_or_blocked")
+        status_cb("Protestilista ei näy. Kirjaudu ensin 'Avaa Login-Chrome' napilla ja sulje se, sitten aloita keruu.")
+        html, png = dump_debug(driver, "kl_not_logged_in")
         log_cb(f"DEBUG dump: {html} | {png}")
         return []
 
     collected = set()
     processed = set()
     rounds_no_new = 0
-
-    time.sleep(0.8)
 
     for _round in range(max_rounds):
         if stop_evt.is_set():
@@ -488,7 +504,7 @@ def collect_yts_from_kauppalehti_mobile(driver, status_cb, log_cb, stop_evt, max
         try_accept_cookies(driver, ALLOWED_KL_HOSTS_DURING_SCRAPE)
 
         toggles = get_mobile_toggles(driver)
-        status_cb(f"KL(mobile): näkyviä nuolia {len(toggles)} | kerätty {len(collected)}")
+        status_cb(f"KL(mobile): nuolia {len(toggles)} | kerätty {len(collected)}")
 
         new_this_round = 0
         for t in toggles:
@@ -644,35 +660,41 @@ class App(tk.Tk):
         self.worker = None
 
         self.driver_kl = None
+        self.profile_dir = get_bot_profile_dir()
 
-        self.title("ProtestiBotti (KL Mobile YT->Word + PDF->YTJ) — real Chrome profile")
+        self.title("ProtestiBotti (KL Login-Chrome -> Selenium scrape + PDF->YTJ)")
         self.geometry("1040x720")
 
         tk.Label(self, text="ProtestiBotti", font=("Arial", 18, "bold")).pack(pady=8)
         tk.Label(
             self,
-            text="HUOM: Kirjaudu Kauppalehteen etukäteen NORMAALILLA Chromella samalla profiililla.\n"
-                 f"Tämä botti käyttää profiilia: {CHROME_PROFILE_DIRECTORY}\n\n"
-                 "Moodit:\n"
-                 "1) KL MOBIILI → ALOITA KERUU → Y-tunnukset Wordiin\n"
-                 "2) PDF → Y-tunnukset → YTJ sähköpostit Wordiin",
+            text="TÄRKEÄ: Kirjautuminen tehdään 'Avaa Login-Chrome' napilla (normaali Chrome, ei Selenium).\n"
+                 "Kun olet kirjautunut, sulje Login-Chrome ja käynnistä keruu.\n\n"
+                 "1) KL Mobile -> Y-tunnukset Wordiin\n"
+                 "2) PDF -> Y-tunnukset -> YTJ sähköpostit Wordiin\n",
             justify="center"
         ).pack(pady=4)
+
+        info = tk.Label(self, text=f"Botin KL-profiili: {self.profile_dir}", wraplength=980, justify="center")
+        info.pack(pady=2)
 
         btn_row = tk.Frame(self)
         btn_row.pack(pady=10)
 
-        self.btn_kl_open = tk.Button(btn_row, text="1) Avaa KL (mobiili)", font=("Arial", 12, "bold"), command=self.start_kl_open)
-        self.btn_kl_open.grid(row=0, column=0, padx=8)
+        self.btn_login = tk.Button(btn_row, text="Avaa Login-Chrome (normaali)", font=("Arial", 12, "bold"), command=self.open_login_chrome)
+        self.btn_login.grid(row=0, column=0, padx=8)
+
+        self.btn_kl_open = tk.Button(btn_row, text="1) Avaa KL (Selenium mobiili)", font=("Arial", 12, "bold"), command=self.start_kl_open)
+        self.btn_kl_open.grid(row=0, column=1, padx=8)
 
         self.btn_kl_start = tk.Button(btn_row, text="ALOITA KERUU", font=("Arial", 12, "bold"), command=self.start_kl_scrape, state="disabled")
-        self.btn_kl_start.grid(row=0, column=1, padx=8)
+        self.btn_kl_start.grid(row=0, column=2, padx=8)
 
         self.btn_pdf = tk.Button(btn_row, text="2) PDF → YTJ sähköpostit", font=("Arial", 12, "bold"), command=self.start_pdf)
-        self.btn_pdf.grid(row=0, column=2, padx=8)
+        self.btn_pdf.grid(row=0, column=3, padx=8)
 
         self.btn_stop = tk.Button(btn_row, text="STOP", font=("Arial", 12, "bold"), command=self.stop, state="disabled")
-        self.btn_stop.grid(row=0, column=3, padx=8)
+        self.btn_stop.grid(row=0, column=4, padx=8)
 
         self.status = tk.Label(self, text="Valmiina.", font=("Arial", 11))
         self.status.pack(pady=6)
@@ -714,16 +736,34 @@ class App(tk.Tk):
         self.btn_stop.config(state="normal")
         self.btn_pdf.config(state="disabled")
         self.btn_kl_open.config(state="disabled")
+        self.btn_login.config(state="disabled")
 
     def unlock_ui(self):
         self.btn_stop.config(state="disabled")
         self.btn_pdf.config(state="normal")
         self.btn_kl_open.config(state="normal")
+        self.btn_login.config(state="normal")
 
     def stop(self):
         self.stop_evt.set()
         self.set_status("STOP pyydetty – lopetetaan hallitusti…")
         self.btn_stop.config(state="disabled")
+
+    def open_login_chrome(self):
+        try:
+            self.set_status("Avaan normaali-Chromen botin profiililla. Kirjaudu KL:ään ja SULJE se Chrome sen jälkeen.")
+            open_normal_chrome_for_login(self.profile_dir)
+            messagebox.showinfo(
+                "Kirjaudu Kauppalehteen",
+                "Normaali Chrome avattiin botin profiililla.\n\n"
+                "1) Kirjaudu Kauppalehteen\n"
+                "2) Varmista että protestilista näkyy\n"
+                "3) SULJE se Chrome kokonaan\n"
+                "4) Palaa bottiin ja paina: '1) Avaa KL (Selenium mobiili)'"
+            )
+        except Exception as e:
+            self.ui_log(f"VIRHE: {e}")
+            messagebox.showerror("Virhe", str(e))
 
     # ---- MODE 1: KL Mobile ----
     def start_kl_open(self):
@@ -736,16 +776,14 @@ class App(tk.Tk):
 
     def run_kl_open(self):
         try:
-            self.set_status("Avaan Chromen mobiili-emulaatiolla (käytössä normaali Chrome-profiili)…")
-            self.driver_kl = start_driver_with_real_profile(mobile=True)
-
-            self.set_status("KL avattu. Jos et ole kirjautunut, sulje botti, kirjaudu normaalilla Chromella samaan profiiliin ja aja uudestaan.")
+            self.set_status("Käynnistän Selenium-Chromen mobiiliemulaatiolla (botin oma profiili)…")
+            self.driver_kl = start_selenium_with_profile(self.profile_dir, mobile=True)
+            self.set_status("Selenium Chrome auki. Paina nyt: ALOITA KERUU")
             self.btn_kl_start.config(state="normal")
-
         except Exception as e:
             self.ui_log(f"VIRHE: {e}")
-            self.set_status("Virhe. Katso log.txt")
-            messagebox.showerror("Virhe", f"Tuli virhe.\n\n{e}\n\nLogi: {LOG_PATH}")
+            self.set_status("Virhe. Katso log.txt ja chromedriver.log")
+            messagebox.showerror("Virhe", f"{e}\n\nKatso:\n{LOG_PATH}\n{CHROMEDRIVER_LOG}")
             try:
                 if self.driver_kl:
                     self.driver_kl.quit()
@@ -756,7 +794,7 @@ class App(tk.Tk):
 
     def start_kl_scrape(self):
         if not self.driver_kl:
-            messagebox.showwarning("Puuttuu", "Avaa ensin KL.")
+            messagebox.showwarning("Puuttuu", "Avaa ensin KL (Selenium).")
             return
         self.btn_kl_start.config(state="disabled")
         threading.Thread(target=self.run_kl_scrape, daemon=True).start()
@@ -771,7 +809,7 @@ class App(tk.Tk):
                 return
 
             if not yt_list:
-                self.set_status("Ei löytynyt Y-tunnuksia. Katso debug dump output-kansiosta.")
+                self.set_status("Ei löytynyt Y-tunnuksia. Katso output-kansion debug-kuvat.")
                 messagebox.showwarning("Ei löytynyt", f"Y-tunnuksia ei saatu.\nKatso: {OUT_DIR}")
                 return
 
@@ -779,19 +817,12 @@ class App(tk.Tk):
             self.ui_log(f"Tallennettu: {yt_path}")
 
             self.set_status("Valmis!")
-            messagebox.showinfo(
-                "Valmis",
-                f"Valmis!\n\nKansio:\n{OUT_DIR}\n\nY-tunnuksia: {len(yt_list)}\n\nTiedosto:\nytunnukset_kl_mobile.docx"
-            )
+            messagebox.showinfo("Valmis", f"Valmis!\n\nY-tunnuksia: {len(yt_list)}\n\n{yt_path}")
 
-        except WebDriverException as e:
-            self.ui_log(f"SELENIUM VIRHE: {e}")
-            self.set_status("Virhe. Katso log.txt")
-            messagebox.showerror("Virhe", f"Selenium/Chrome virhe.\n\n{e}\n\nLogi: {LOG_PATH}")
         except Exception as e:
             self.ui_log(f"VIRHE: {e}")
-            self.set_status("Virhe. Katso log.txt")
-            messagebox.showerror("Virhe", f"Tuli virhe.\n\n{e}\n\nLogi: {LOG_PATH}")
+            self.set_status("Virhe. Katso log.txt ja chromedriver.log")
+            messagebox.showerror("Virhe", f"{e}\n\nKatso:\n{LOG_PATH}\n{CHROMEDRIVER_LOG}")
         finally:
             self.unlock_ui()
 
@@ -820,19 +851,11 @@ class App(tk.Tk):
             yt_path = save_word_plain_lines(yt_list, "ytunnukset_pdf.docx")
             self.ui_log(f"Tallennettu: {yt_path}")
 
-            if self.stop_evt.is_set():
-                self.set_status("Pysäytetty.")
-                return
-
             self.set_status("Käynnistetään Chrome ja haetaan sähköpostit YTJ:stä…")
-            driver = start_driver_with_real_profile(mobile=False)
+            driver = start_selenium_with_profile(self.profile_dir, mobile=False)
 
             self.set_status("YTJ: haetaan sähköpostit…")
             emails = fetch_emails_from_ytj(driver, yt_list, self.set_status, self.set_progress, self.ui_log, self.stop_evt)
-
-            if self.stop_evt.is_set():
-                self.set_status("Pysäytetty.")
-                return
 
             em_path = save_word_plain_lines(emails, "sahkopostit_pdf_ytj.docx")
             self.ui_log(f"Tallennettu: {em_path}")
@@ -840,14 +863,13 @@ class App(tk.Tk):
             self.set_status("Valmis!")
             messagebox.showinfo(
                 "Valmis",
-                f"Valmis!\n\nKansio:\n{OUT_DIR}\n\nY-tunnuksia: {len(yt_list)}\nSähköposteja: {len(emails)}\n\n"
-                f"Tiedostot:\nytunnukset_pdf.docx\nsahkopostit_pdf_ytj.docx"
+                f"Valmis!\n\nY-tunnuksia: {len(yt_list)}\nSähköposteja: {len(emails)}\n\n{yt_path}\n{em_path}"
             )
 
         except Exception as e:
             self.ui_log(f"VIRHE: {e}")
-            self.set_status("Virhe. Katso log.txt")
-            messagebox.showerror("Virhe", f"Tuli virhe.\n\n{e}\n\nLogi: {LOG_PATH}")
+            self.set_status("Virhe. Katso log.txt ja chromedriver.log")
+            messagebox.showerror("Virhe", f"{e}\n\nKatso:\n{LOG_PATH}\n{CHROMEDRIVER_LOG}")
         finally:
             try:
                 if driver:
