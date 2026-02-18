@@ -10,9 +10,6 @@ from tkinter import ttk
 import PyPDF2
 from docx import Document
 
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
-
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -20,6 +17,18 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+
+
+# =========================
+#   OPTIONAL PDF (reportlab)
+# =========================
+HAS_REPORTLAB = False
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    HAS_REPORTLAB = True
+except Exception:
+    HAS_REPORTLAB = False
 
 
 # =========================
@@ -94,6 +103,7 @@ def reset_log():
         pass
     log_to_file(f"Output: {OUT_DIR}")
     log_to_file(f"Logi: {LOG_PATH}")
+    log_to_file(f"reportlab: {'OK' if HAS_REPORTLAB else 'PUUTTUU (PDF pois käytöstä)'}")
 
 
 # =========================
@@ -130,7 +140,22 @@ def save_word_plain_lines(lines, filename):
     return path
 
 
-def save_pdf_lines(lines, filename, title=None):
+def save_txt_lines(lines, filename):
+    path = os.path.join(OUT_DIR, filename)
+    with open(path, "w", encoding="utf-8") as f:
+        for line in lines:
+            if line and str(line).strip():
+                f.write(str(line).strip() + "\n")
+    return path
+
+
+def save_pdf_lines_if_possible(lines, filename, title=None):
+    """
+    Jos reportlab puuttuu, palauttaa None.
+    """
+    if not HAS_REPORTLAB:
+        return None
+
     path = os.path.join(OUT_DIR, filename)
     c = canvas.Canvas(path, pagesize=A4)
     w, h = A4
@@ -142,11 +167,9 @@ def save_pdf_lines(lines, filename, title=None):
         y -= 28
 
     c.setFont("Helvetica", 11)
-
     for line in lines:
         if not line:
             continue
-        # sivunvaihto
         if y < 60:
             c.showPage()
             c.setFont("Helvetica", 11)
@@ -246,17 +269,13 @@ def wait_body(driver, timeout=20):
 
 
 def ytj_open_company_by_name(driver, name: str, status_cb):
-    """
-    Avaa YTJ ja hakee nimellä.
-    Valitsee ensimmäisen osuman listasta (best effort).
-    """
     status_cb(f"YTJ: haku nimellä: {name}")
 
     driver.get(YTJ_HOME)
     wait_body(driver, 25)
     time.sleep(0.4)
 
-    # etsi hakukenttä (YTJ:n etusivulla on yleensä yksi iso input)
+    # etsi hakukenttä
     candidates = []
     for css in ["input[type='search']", "input[type='text']"]:
         try:
@@ -268,11 +287,9 @@ def ytj_open_company_by_name(driver, name: str, status_cb):
     for inp in candidates:
         try:
             if inp.is_displayed() and inp.is_enabled():
-                ph = (inp.get_attribute("placeholder") or "").lower()
-                # hyväksy vaikka ei placeholderia, jos näkyy
                 search_input = inp
-                # jos placeholder viittaa hakuun, priorisoi
-                if "hae" in ph or "lei" in ph or "y-tunnus" in ph or "nimellä" in ph:
+                ph = (inp.get_attribute("placeholder") or "").lower()
+                if "hae" in ph or "y-tunnus" in ph or "toiminimi" in ph:
                     break
         except Exception:
             continue
@@ -287,15 +304,12 @@ def ytj_open_company_by_name(driver, name: str, status_cb):
     search_input.send_keys(name)
     search_input.send_keys(Keys.ENTER)
 
-    # odota että tuloksia tulee tai suoraan yrityssivulle
     time.sleep(1.2)
 
-    # jos mennään suoraan yrityssivulle, ok
     if "/yritys/" in (driver.current_url or ""):
         return True
 
-    # muuten klikkaa ensimmäinen tuloslinkki (best effort)
-    links = []
+    # klikkaa ensimmäinen tuloslinkki
     try:
         links = driver.find_elements(By.XPATH, "//a[contains(@href,'/yritys/')]")
     except Exception:
@@ -315,7 +329,6 @@ def ytj_open_company_by_name(driver, name: str, status_cb):
 
 
 def extract_email_from_ytj_page(driver):
-    # mailto
     try:
         for a in driver.find_elements(By.TAG_NAME, "a"):
             href = (a.get_attribute("href") or "")
@@ -324,7 +337,6 @@ def extract_email_from_ytj_page(driver):
     except Exception:
         pass
 
-    # body regex
     try:
         body = driver.find_element(By.TAG_NAME, "body").text or ""
         return pick_email_from_text(body)
@@ -333,13 +345,8 @@ def extract_email_from_ytj_page(driver):
 
 
 def fetch_emails_from_ytj_by_yts_and_names(driver, yts, names, status_cb, progress_cb, log_cb, stop_evt):
-    """
-    1) Y-tunnukset (varma)
-    2) jos nimiä jäi, haetaan nimellä YTJ:stä (best effort)
-    """
     emails = []
     seen = set()
-
     total = len(yts) + len(names)
     progress_cb(0, max(1, total))
     done = 0
@@ -370,7 +377,7 @@ def fetch_emails_from_ytj_by_yts_and_names(driver, yts, names, status_cb, progre
                 emails.append(email)
                 log_cb(email)
 
-    # 2) Nimillä (best effort)
+    # 2) Nimillä
     for nm in names:
         if stop_evt.is_set():
             break
@@ -379,7 +386,7 @@ def fetch_emails_from_ytj_by_yts_and_names(driver, yts, names, status_cb, progre
 
         ok = ytj_open_company_by_name(driver, nm, status_cb)
         if not ok:
-            log_cb(f"YTJ: ei löytynyt osumaa nimelle: {nm}")
+            log_cb(f"YTJ: ei osumaa nimelle: {nm}")
             continue
 
         email = ""
@@ -408,17 +415,16 @@ class App(tk.Tk):
         reset_log()
 
         self.stop_evt = threading.Event()
-        self.worker = None
 
-        self.title("ProtestiBotti (KL copy/paste -> PDF + PDF->YTJ)")
+        self.title("ProtestiBotti (KL copy/paste → PDF/Word/TXT + PDF→YTJ)")
         self.geometry("1080x820")
 
         tk.Label(self, text="ProtestiBotti", font=("Arial", 18, "bold")).pack(pady=8)
         tk.Label(
             self,
-            text="1) Kauppalehti: SINÄ avaat Chromen ja protestilistan → Ctrl+A/Ctrl+C → liitä tähän.\n"
-                 "   Botti tekee: yritysnimet.pdf + yritysnimet_ja_ytunnukset.pdf (+ Wordit)\n"
-                 "2) PDF → poimii yritysnimet + Y-tunnukset → hakee sähköpostit YTJ:stä (Y-tunnus ensin, muuten nimi)\n",
+            text="1) Kauppalehti: avaa protestilista Chromessa → Ctrl+A / Ctrl+C → liitä tähän → 'Tee tiedostot'\n"
+                 "2) PDF: valitse PDF (nimet ja/tai Y-tunnukset) → botti hakee sähköpostit YTJ:stä (Y-tunnus ensin, muuten nimi)\n"
+                 f"PDF-tuki: {'OK (reportlab asennettu)' if HAS_REPORTLAB else 'PUUTTUU (tekee TXT+DOCX, ei PDF)'}",
             justify="center"
         ).pack(pady=4)
 
@@ -426,18 +432,12 @@ class App(tk.Tk):
         box = tk.LabelFrame(self, text="1) Kauppalehti (copy/paste)", padx=10, pady=10)
         box.pack(fill="x", padx=12, pady=10)
 
-        tk.Label(
-            box,
-            text="Vinkki: Jos avaat siniset nuolet ennen kopiointia, myös Y-tunnukset tulevat mukaan ja haku on varmempi.",
-            justify="left"
-        ).pack(anchor="w")
-
         self.text = tk.Text(box, height=10)
         self.text.pack(fill="x", pady=6)
 
         row = tk.Frame(box)
         row.pack(fill="x")
-        tk.Button(row, text="Tee PDF + Word (nimet + yt)", font=("Arial", 12, "bold"), command=self.run_make_pdfs).pack(side="left")
+        tk.Button(row, text="Tee tiedostot (nimet + yt)", font=("Arial", 12, "bold"), command=self.make_files).pack(side="left")
         tk.Button(row, text="Tyhjennä", command=lambda: self.text.delete("1.0", tk.END)).pack(side="left", padx=8)
 
         # MODE 2
@@ -482,18 +482,18 @@ class App(tk.Tk):
         self.update_idletasks()
 
     # ---------- MODE 1 ----------
-    def run_make_pdfs(self):
+    def make_files(self):
         raw = self.text.get("1.0", tk.END)
         names, yts = parse_names_and_yts_from_copied_text(raw)
 
         if not names and not yts:
-            self.set_status("Ei löytynyt yritysnimiä tai Y-tunnuksia liitetystä tekstistä.")
+            self.set_status("Ei löytynyt yritysnimiä tai Y-tunnuksia.")
             messagebox.showwarning("Ei löytynyt", "Liitä protestilistan sisältö (Ctrl+A/Ctrl+C) ja yritä uudestaan.")
             return
 
         self.set_status(f"Poimittu: nimet={len(names)} | y-tunnukset={len(yts)}")
 
-        # Wordit
+        # DOCX
         if names:
             p1 = save_word_plain_lines(names, "yritysnimet_kauppalehti.docx")
             self.ui_log(f"Tallennettu: {p1}")
@@ -501,28 +501,41 @@ class App(tk.Tk):
             p2 = save_word_plain_lines(yts, "ytunnukset_kauppalehti.docx")
             self.ui_log(f"Tallennettu: {p2}")
 
-        # PDF: pelkät nimet
+        # TXT (varma aina)
         if names:
-            pdf1 = save_pdf_lines(names, "yritysnimet_kauppalehti.pdf", title="Yritysnimet (Kauppalehti protestilista)")
-            self.ui_log(f"Tallennettu: {pdf1}")
-
-        # PDF: nimet + yts (jos löytyy)
-        combined = []
-        if names:
-            combined.append("YRITYSNIMET")
-            combined += names
-            combined.append("")
+            t1 = save_txt_lines(names, "yritysnimet_kauppalehti.txt")
+            self.ui_log(f"Tallennettu: {t1}")
         if yts:
-            combined.append("Y-TUNNUKSET")
-            combined += yts
+            t2 = save_txt_lines(yts, "ytunnukset_kauppalehti.txt")
+            self.ui_log(f"Tallennettu: {t2}")
 
-        pdf2 = save_pdf_lines(combined, "yritysnimet_ja_ytunnukset.pdf", title="Kauppalehti -> poimitut tiedot")
-        self.ui_log(f"Tallennettu: {pdf2}")
+        # PDF (vain jos reportlab löytyy)
+        if HAS_REPORTLAB:
+            if names:
+                pdf1 = save_pdf_lines_if_possible(names, "yritysnimet_kauppalehti.pdf", title="Yritysnimet (Kauppalehti)")
+                if pdf1:
+                    self.ui_log(f"Tallennettu: {pdf1}")
 
-        self.set_status("Valmis (PDF + Word).")
+            combined = []
+            if names:
+                combined.append("YRITYSNIMET")
+                combined += names
+                combined.append("")
+            if yts:
+                combined.append("Y-TUNNUKSET")
+                combined += yts
+
+            pdf2 = save_pdf_lines_if_possible(combined, "yritysnimet_ja_ytunnukset.pdf", title="Kauppalehti -> poimitut tiedot")
+            if pdf2:
+                self.ui_log(f"Tallennettu: {pdf2}")
+        else:
+            self.ui_log("reportlab puuttuu -> PDF:iä ei tehty. (TXT+DOCX luotu)")
+
+        self.set_status("Valmis (tiedostot luotu).")
         messagebox.showinfo(
             "Valmis",
-            f"Valmis!\n\nYritysnimiä: {len(names)}\nY-tunnuksia: {len(yts)}\n\nKansio:\n{OUT_DIR}"
+            f"Valmis!\n\nYritysnimiä: {len(names)}\nY-tunnuksia: {len(yts)}\n\nKansio:\n{OUT_DIR}\n\n"
+            f"{'PDF:t luotu.' if HAS_REPORTLAB else 'PDF:t EI luotu (reportlab puuttuu).'}"
         )
 
     # ---------- MODE 2 ----------
@@ -543,7 +556,6 @@ class App(tk.Tk):
                 messagebox.showwarning("Ei löytynyt", "PDF:stä ei löytynyt nimiä tai Y-tunnuksia.")
                 return
 
-            # tallenna poimitut myös Wordiin
             if names:
                 p1 = save_word_plain_lines(names, "pdf_poimitut_yritysnimet.docx")
                 self.ui_log(f"Tallennettu: {p1}")
