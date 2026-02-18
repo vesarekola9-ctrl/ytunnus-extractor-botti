@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import time
+import subprocess
 import threading
 import tkinter as tk
 from tkinter import messagebox, filedialog
@@ -20,25 +21,14 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 
 # =========================
-#   OPTIONAL PDF (reportlab)
+#   CONFIG / REGEX
 # =========================
-HAS_REPORTLAB = False
-try:
-    from reportlab.lib.pagesizes import A4
-    from reportlab.pdfgen import canvas
-    HAS_REPORTLAB = True
-except Exception:
-    HAS_REPORTLAB = False
+KL_URL = "https://www.kauppalehti.fi/yritykset/protestilista"
 
-
-# =========================
-#   REGEX
-# =========================
 YT_RE = re.compile(r"\b\d{7}-\d\b|\b\d{8}\b")
 EMAIL_RE = re.compile(r"[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9-.]+")
 EMAIL_A_RE = re.compile(r"[A-Za-z0-9_.+-]+\s*\(a\)\s*[A-Za-z0-9-]+\.[A-Za-z0-9-.]+", re.I)
 
-# YTJ
 YTJ_HOME = "https://tietopalvelu.ytj.fi/"
 YTJ_COMPANY_URL = "https://tietopalvelu.ytj.fi/yritys/{}"
 
@@ -103,7 +93,7 @@ def reset_log():
         pass
     log_to_file(f"Output: {OUT_DIR}")
     log_to_file(f"Logi: {LOG_PATH}")
-    log_to_file(f"reportlab: {'OK' if HAS_REPORTLAB else 'PUUTTUU (PDF pois käytöstä)'}")
+    log_to_file("PDF: sisäinen minipdf-writer (ei reportlabia)")
 
 
 # =========================
@@ -149,100 +139,242 @@ def save_txt_lines(lines, filename):
     return path
 
 
-def save_pdf_lines_if_possible(lines, filename, title=None):
-    """
-    Jos reportlab puuttuu, palauttaa None.
-    """
-    if not HAS_REPORTLAB:
-        return None
+# =========================
+#   PDF WITHOUT REPORTLAB (pure python)
+# =========================
+def _pdf_escape_text(s: str) -> str:
+    s = s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    s = s.replace("\t", "    ")
+    return s
 
+
+def save_pdf_lines(lines, filename, title=None):
     path = os.path.join(OUT_DIR, filename)
-    c = canvas.Canvas(path, pagesize=A4)
-    w, h = A4
-    y = h - 60
 
+    PAGE_W, PAGE_H = 595.28, 841.89
+    LEFT = 50
+    TOP = PAGE_H - 60
+    BOTTOM = 60
+    FONT_SIZE = 11
+    LEADING = 14
+
+    out_lines = []
     if title:
-        c.setFont("Helvetica-Bold", 14)
-        c.drawString(50, y, title)
-        y -= 28
-
-    c.setFont("Helvetica", 11)
-    for line in lines:
-        if not line:
+        out_lines.append(title)
+        out_lines.append("")
+    for ln in lines:
+        if ln is None:
             continue
-        if y < 60:
-            c.showPage()
-            c.setFont("Helvetica", 11)
-            y = h - 60
-        c.drawString(50, y, str(line)[:140])
-        y -= 16
+        t = str(ln).strip()
+        if t:
+            out_lines.append(t)
 
-    c.save()
+    max_lines_per_page = int((TOP - BOTTOM) // LEADING)
+    pages = []
+    cur = []
+    for ln in out_lines:
+        cur.append(ln)
+        if len(cur) >= max_lines_per_page:
+            pages.append(cur)
+            cur = []
+    if cur:
+        pages.append(cur)
+    if not pages:
+        pages = [[""]]
+
+    objects = []
+
+    def add_obj(data_bytes: bytes) -> int:
+        objects.append(data_bytes)
+        return len(objects)
+
+    font_obj = add_obj(
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+    )
+
+    page_objs = []
+    pages_obj_id = add_obj(b"<< /Type /Pages /Kids [] /Count 0 >>")
+
+    for page_lines in pages:
+        y = TOP
+        chunks = []
+        chunks.append("BT\n")
+        chunks.append(f"/F1 {FONT_SIZE} Tf\n")
+        chunks.append(f"{LEFT} {y:.2f} Td\n")
+
+        first = True
+        for ln in page_lines:
+            txt = _pdf_escape_text(ln)
+            if not first:
+                chunks.append(f"0 -{LEADING} Td\n")
+            first = False
+            chunks.append(f"({txt}) Tj\n")
+
+        chunks.append("ET\n")
+        content_str = "".join(chunks)
+        content_bytes = content_str.encode("latin-1", errors="replace")
+        stream = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content_bytes), content_bytes)
+        content_obj = add_obj(stream)
+
+        page_dict = (
+            b"<< /Type /Page /Parent %d 0 R "
+            b"/MediaBox [0 0 %.2f %.2f] "
+            b"/Resources << /Font << /F1 %d 0 R >> >> "
+            b"/Contents %d 0 R >>"
+            % (pages_obj_id, PAGE_W, PAGE_H, font_obj, content_obj)
+        )
+        page_obj_id = add_obj(page_dict)
+        page_objs.append(page_obj_id)
+
+    kids = " ".join([f"{pid} 0 R" for pid in page_objs]).encode("ascii")
+    pages_dict = b"<< /Type /Pages /Kids [%s] /Count %d >>" % (kids, len(page_objs))
+    objects[pages_obj_id - 1] = pages_dict
+
+    catalog_obj_id = add_obj(b"<< /Type /Catalog /Pages %d 0 R >>" % pages_obj_id)
+
+    header = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
+    offsets = [0]
+    body = b""
+    for i, obj in enumerate(objects, start=1):
+        offsets.append(len(header) + len(body))
+        body += f"{i} 0 obj\n".encode("ascii") + obj + b"\nendobj\n"
+
+    xref_start = len(header) + len(body)
+    xref = [b"xref\n", f"0 {len(objects)+1}\n".encode("ascii")]
+    xref.append(b"0000000000 65535 f \n")
+    for off in offsets[1:]:
+        xref.append(f"{off:010d} 00000 n \n".encode("ascii"))
+    xref_bytes = b"".join(xref)
+
+    trailer = (
+        b"trailer\n"
+        b"<< /Size %d /Root %d 0 R >>\n"
+        b"startxref\n%d\n%%%%EOF\n"
+        % (len(objects) + 1, catalog_obj_id, xref_start)
+    )
+
+    pdf_bytes = header + body + xref_bytes + trailer
+    with open(path, "wb") as f:
+        f.write(pdf_bytes)
     return path
 
 
 # =========================
-#   MODE 1: KL COPY/PASTE -> NAMES + YTS
+#   SMART PARSER (names + yts)
 # =========================
+def _is_money_line(s: str) -> bool:
+    return bool(re.fullmatch(r"\d{1,3}(\s?\d{3})*\s?€", s.strip()))
+
+
+def _is_date_line(s: str) -> bool:
+    return bool(re.fullmatch(r"\d{1,2}\.\d{1,2}\.\d{4}", s.strip()))
+
+
+def _looks_like_location(s: str) -> bool:
+    s = s.strip()
+    if not s or any(ch.isdigit() for ch in s):
+        return False
+    parts = s.split()
+    if len(parts) != 1:
+        return False
+    if not parts[0][:1].isupper():
+        return False
+    low = s.lower()
+    if any(x in low for x in [" oy", " ab", " ky", " ay", " ry", " tmi", " oyj", " lkv", " osakeyhtiö"]):
+        return False
+    return True
+
+
+def _looks_like_company_name(s: str) -> bool:
+    s = s.strip()
+    if len(s) < 3:
+        return False
+    if not re.search(r"[A-Za-zÅÄÖåäö]", s):
+        return False
+
+    low = s.lower()
+    if low in BAD_LINES:
+        return False
+    if any(b in low for b in BAD_CONTAINS):
+        return False
+    if _is_money_line(s) or _is_date_line(s):
+        return False
+    if "y-tunnus" in low or YT_RE.search(s):
+        return False
+
+    suffix_ok = any(x in low for x in [" oy", " ab", " ky", " ay", " ry", " tmi", " oyj", " ltd", " gmbh", " inc", " lkv"])
+    many_words = len(s.split()) >= 2
+
+    if len(s.split()) == 1 and _looks_like_location(s):
+        return False
+
+    return suffix_ok or many_words
+
+
+def _normalize_name(s: str) -> str:
+    s = re.sub(r"\s+", " ", s.strip())
+    s = s.strip(" -•\u2022")
+    return s
+
+
 def parse_names_and_yts_from_copied_text(raw: str):
     if not raw:
         return [], []
 
-    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-    names = []
     yts = []
-    seen_names = set()
     seen_yts = set()
-
-    # poimi y-tunnukset kaikkialta
     for m in YT_RE.findall(raw):
         n = normalize_yt(m)
         if n and n not in seen_yts:
             seen_yts.add(n)
             yts.append(n)
 
-    for ln in lines:
-        low = ln.lower()
+    lines = [ln.strip() for ln in raw.splitlines() if ln and ln.strip()]
+    lines = [ln for ln in lines if len(ln) >= 2]
 
-        if low in BAD_LINES:
-            continue
-        if any(b in low for b in BAD_CONTAINS):
-            continue
-        if low.startswith("viimeisimmät protestit"):
-            continue
+    names = []
+    seen = set()
 
-        # rahasummat / päivämäärät pois
-        if re.fullmatch(r"\d{1,3}(\s?\d{3})*\s?€", ln):
-            continue
-        if re.fullmatch(r"\d{1,2}\.\d{1,2}\.\d{4}", ln):
-            continue
+    money_idxs = [i for i, ln in enumerate(lines) if _is_money_line(ln)]
+    for i in money_idxs:
+        candidates = []
+        for back in (1, 2, 3):
+            j = i - back
+            if j >= 0:
+                candidates.append(lines[j])
 
-        # jos rivi sisältää y-tunnuksen tai on y-tunnuslabel, ohita nimistä
-        if "y-tunnus" in low:
-            continue
-        if YT_RE.search(ln):
-            continue
+        same_line = lines[i]
+        m = re.search(r"^(.*)\s+\d{1,3}(\s?\d{3})*\s?€$", same_line)
+        if m:
+            candidates.insert(0, m.group(1).strip())
 
-        # nimiheuristiikka
-        if len(ln) < 3:
-            continue
-        if not re.search(r"[A-Za-zÅÄÖåäö]", ln):
-            continue
+        best = ""
+        for c in candidates:
+            c = _normalize_name(c)
+            if _looks_like_company_name(c):
+                best = c
+                break
 
-        # pudota selviä sijainteja (yksisanaiset kaupungit jne.)
-        if len(ln.split()) == 1 and ln[:1].isupper():
-            continue
+        if best:
+            key = best.lower()
+            if key not in seen:
+                seen.add(key)
+                names.append(best)
 
-        key = ln.strip().lower()
-        if key not in seen_names:
-            seen_names.add(key)
-            names.append(ln.strip())
+    if not names:
+        for ln in lines:
+            ln = _normalize_name(ln)
+            if _looks_like_company_name(ln):
+                key = ln.lower()
+                if key not in seen:
+                    seen.add(key)
+                    names.append(ln)
 
     return names, yts
 
 
 # =========================
-#   MODE 2: PDF -> (NAMES + YTS) -> YTJ EMAILS
+#   PDF -> (names + yts)
 # =========================
 def extract_names_and_yts_from_pdf(pdf_path: str):
     text_all = ""
@@ -250,11 +382,12 @@ def extract_names_and_yts_from_pdf(pdf_path: str):
         reader = PyPDF2.PdfReader(f)
         for page in reader.pages:
             text_all += (page.extract_text() or "") + "\n"
-
-    names, yts = parse_names_and_yts_from_copied_text(text_all)
-    return names, yts
+    return parse_names_and_yts_from_copied_text(text_all)
 
 
+# =========================
+#   YTJ (selenium)
+# =========================
 def start_new_driver():
     options = webdriver.ChromeOptions()
     options.add_argument("--start-maximized")
@@ -264,18 +397,16 @@ def start_new_driver():
     return webdriver.Chrome(service=Service(driver_path), options=options)
 
 
-def wait_body(driver, timeout=20):
+def wait_body(driver, timeout=25):
     WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
 
 def ytj_open_company_by_name(driver, name: str, status_cb):
     status_cb(f"YTJ: haku nimellä: {name}")
-
     driver.get(YTJ_HOME)
     wait_body(driver, 25)
     time.sleep(0.4)
 
-    # etsi hakukenttä
     candidates = []
     for css in ["input[type='search']", "input[type='text']"]:
         try:
@@ -303,13 +434,11 @@ def ytj_open_company_by_name(driver, name: str, status_cb):
         pass
     search_input.send_keys(name)
     search_input.send_keys(Keys.ENTER)
-
     time.sleep(1.2)
 
     if "/yritys/" in (driver.current_url or ""):
         return True
 
-    # klikkaa ensimmäinen tuloslinkki
     try:
         links = driver.find_elements(By.XPATH, "//a[contains(@href,'/yritys/')]")
     except Exception:
@@ -324,7 +453,6 @@ def ytj_open_company_by_name(driver, name: str, status_cb):
                     return True
         except Exception:
             continue
-
     return False
 
 
@@ -351,7 +479,6 @@ def fetch_emails_from_ytj_by_yts_and_names(driver, yts, names, status_cb, progre
     progress_cb(0, max(1, total))
     done = 0
 
-    # 1) Y-tunnuksilla
     for yt in yts:
         if stop_evt.is_set():
             break
@@ -377,7 +504,6 @@ def fetch_emails_from_ytj_by_yts_and_names(driver, yts, names, status_cb, progre
                 emails.append(email)
                 log_cb(email)
 
-    # 2) Nimillä
     for nm in names:
         if stop_evt.is_set():
             break
@@ -407,7 +533,92 @@ def fetch_emails_from_ytj_by_yts_and_names(driver, yts, names, status_cb, progre
 
 
 # =========================
-#   GUI
+#   KL "OPEN ALL ARROWS" TOOL (embedded)
+# =========================
+def safe_click(driver, elem):
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", elem)
+        time.sleep(0.05)
+        try:
+            elem.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", elem)
+        return True
+    except Exception:
+        return False
+
+
+def try_accept_cookies(driver):
+    texts = ["Hyväksy", "Hyväksy kaikki", "Salli kaikki", "Accept", "Accept all", "I agree", "OK", "Selvä"]
+    try:
+        buttons = driver.find_elements(By.XPATH, "//button|//a|//*[@role='button']")
+    except Exception:
+        return
+    for b in buttons:
+        try:
+            t = (b.text or "").strip()
+            if not t:
+                continue
+            low = t.lower()
+            if any(x.lower() in low for x in texts):
+                if b.is_displayed() and b.is_enabled():
+                    safe_click(driver, b)
+                    time.sleep(0.25)
+        except Exception:
+            continue
+
+
+def click_all_arrows_once(driver):
+    elems = driver.find_elements(By.CSS_SELECTOR, "[aria-expanded='false']")
+    count = 0
+    for e in elems:
+        try:
+            if e.is_displayed() and e.is_enabled():
+                if safe_click(driver, e):
+                    count += 1
+                    time.sleep(0.01)
+        except Exception:
+            continue
+    return count
+
+
+def click_show_more(driver):
+    try:
+        buttons = driver.find_elements(By.XPATH, "//button|//*[@role='button']")
+    except Exception:
+        return False
+    for b in buttons:
+        try:
+            if not b.is_displayed() or not b.is_enabled():
+                continue
+            if (b.text or "").strip().lower() == "näytä lisää":
+                safe_click(driver, b)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def scroll_to_bottom(driver):
+    try:
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    except Exception:
+        pass
+
+
+def find_chrome_path():
+    candidates = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return None
+
+
+# =========================
+#   GUI APP
 # =========================
 class App(tk.Tk):
     def __init__(self):
@@ -416,40 +627,76 @@ class App(tk.Tk):
 
         self.stop_evt = threading.Event()
 
-        self.title("ProtestiBotti (KL copy/paste → PDF/Word/TXT + PDF→YTJ)")
-        self.geometry("1080x820")
+        # KL tool state
+        self.kl_proc = None
+        self.kl_driver = None
+
+        self.title("ProtestiBotti (All-in-one: KL tool + KL copy/paste + PDF→YTJ)")
+        self.geometry("1120x900")
 
         tk.Label(self, text="ProtestiBotti", font=("Arial", 18, "bold")).pack(pady=8)
         tk.Label(
             self,
-            text="1) Kauppalehti: avaa protestilista Chromessa → Ctrl+A / Ctrl+C → liitä tähän → 'Tee tiedostot'\n"
-                 "2) PDF: valitse PDF (nimet ja/tai Y-tunnukset) → botti hakee sähköpostit YTJ:stä (Y-tunnus ensin, muuten nimi)\n"
-                 f"PDF-tuki: {'OK (reportlab asennettu)' if HAS_REPORTLAB else 'PUUTTUU (tekee TXT+DOCX, ei PDF)'}",
+            text="Sisältää:\n"
+                 "• KL-työkalu: Avaa kaikki nuolet + Näytä lisää (ohjattu Chrome)\n"
+                 "• KL copy/paste → yritysnimet + Y-tunnukset → PDF/DOCX/TXT\n"
+                 "• PDF → YTJ (Y-tunnus ensin, muuten nimi) → sähköpostit Wordiin\n",
             justify="center"
         ).pack(pady=4)
 
-        # MODE 1
-        box = tk.LabelFrame(self, text="1) Kauppalehti (copy/paste)", padx=10, pady=10)
+        # ---------- KL TOOL BOX ----------
+        tool = tk.LabelFrame(self, text="KL-työkalu: Avaa kaikki nuolet", padx=10, pady=10)
+        tool.pack(fill="x", padx=12, pady=10)
+
+        tk.Label(
+            tool,
+            text="Tämä käynnistää oman ohjatun Chromen ja avaa protestilistalla kaikki siniset nuolet + 'Näytä lisää'.\n"
+                 "Vinkki: Sulje normaali Chrome ennen kuin painat Käynnistä (ettei Chrome-profiili lukitu).",
+            justify="left"
+        ).pack(anchor="w")
+
+        tool_row = tk.Frame(tool)
+        tool_row.pack(fill="x", pady=6)
+
+        tk.Button(tool_row, text="1) Käynnistä ohjattu Chrome", font=("Arial", 11, "bold"),
+                  command=self.kl_start_guided_chrome).pack(side="left", padx=6)
+        tk.Button(tool_row, text="2) Avaa protestilista", font=("Arial", 11, "bold"),
+                  command=self.kl_open_page).pack(side="left", padx=6)
+        tk.Button(tool_row, text="3) Avaa kaikki nuolet", font=("Arial", 11, "bold"),
+                  command=self.kl_open_all_arrows).pack(side="left", padx=6)
+        tk.Button(tool_row, text="Sulje KL Chrome", command=self.kl_shutdown).pack(side="left", padx=6)
+
+        # ---------- KL COPY/PASTE BOX ----------
+        box = tk.LabelFrame(self, text="Kauppalehti: copy/paste → tee tiedostot", padx=10, pady=10)
         box.pack(fill="x", padx=12, pady=10)
+
+        tk.Label(
+            box,
+            text="Kun nuolet on auki, tee protestilistassa Ctrl+A → Ctrl+C ja liitä alle → 'Tee tiedostot'.",
+            justify="left"
+        ).pack(anchor="w")
 
         self.text = tk.Text(box, height=10)
         self.text.pack(fill="x", pady=6)
 
         row = tk.Frame(box)
         row.pack(fill="x")
-        tk.Button(row, text="Tee tiedostot (nimet + yt)", font=("Arial", 12, "bold"), command=self.make_files).pack(side="left")
+        tk.Button(row, text="Tee tiedostot (PDF + DOCX + TXT)", font=("Arial", 12, "bold"),
+                  command=self.make_files).pack(side="left")
         tk.Button(row, text="Tyhjennä", command=lambda: self.text.delete("1.0", tk.END)).pack(side="left", padx=8)
 
-        # MODE 2
-        box2 = tk.LabelFrame(self, text="2) PDF → YTJ", padx=10, pady=10)
+        # ---------- PDF → YTJ BOX ----------
+        box2 = tk.LabelFrame(self, text="PDF → YTJ sähköpostit", padx=10, pady=10)
         box2.pack(fill="x", padx=12, pady=10)
 
-        tk.Button(box2, text="Valitse PDF ja hae sähköpostit YTJ:stä", font=("Arial", 12, "bold"), command=self.start_pdf_to_ytj).pack(anchor="w")
+        tk.Button(box2, text="Valitse PDF ja hae sähköpostit YTJ:stä", font=("Arial", 12, "bold"),
+                  command=self.start_pdf_to_ytj).pack(anchor="w")
 
+        # ---------- STATUS / LOG ----------
         self.status = tk.Label(self, text="Valmiina.", font=("Arial", 11))
         self.status.pack(pady=6)
 
-        self.progress = ttk.Progressbar(self, orient="horizontal", mode="determinate", length=1020)
+        self.progress = ttk.Progressbar(self, orient="horizontal", mode="determinate", length=1060)
         self.progress.pack(pady=6)
 
         frame = tk.Frame(self)
@@ -463,7 +710,9 @@ class App(tk.Tk):
         sb.pack(side="right", fill="y")
         self.listbox.configure(yscrollcommand=sb.set)
 
-        tk.Label(self, text=f"Tallennus: {OUT_DIR}", wraplength=1040, justify="center").pack(pady=6)
+        tk.Label(self, text=f"Tallennus: {OUT_DIR}", wraplength=1080, justify="center").pack(pady=6)
+
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def ui_log(self, msg):
         line = log_to_file(msg)
@@ -481,7 +730,136 @@ class App(tk.Tk):
         self.progress["value"] = value
         self.update_idletasks()
 
-    # ---------- MODE 1 ----------
+    # =========================
+    #   KL TOOL actions
+    # =========================
+    def kl_attach_driver(self):
+        if self.kl_driver:
+            return True
+        try:
+            options = webdriver.ChromeOptions()
+            options.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
+            driver_path = ChromeDriverManager().install()
+            self.kl_driver = webdriver.Chrome(service=Service(driver_path), options=options)
+            return True
+        except Exception as e:
+            self.ui_log(f"KL driver attach epäonnistui: {e}")
+            return False
+
+    def kl_start_guided_chrome(self):
+        if self.kl_proc:
+            self.set_status("KL Chrome on jo käynnissä.")
+            return
+
+        chrome_path = find_chrome_path()
+        if not chrome_path:
+            messagebox.showerror("Chrome puuttuu", "En löytänyt chrome.exe oletuspoluista. Asenna Google Chrome.")
+            return
+
+        base = get_exe_dir()
+        profile_dir = os.path.join(base, "KLToolProfile")
+        os.makedirs(profile_dir, exist_ok=True)
+
+        self.set_status("Käynnistän KL-ohjatun Chromen (9222)…")
+        args = [
+            chrome_path,
+            "--remote-debugging-port=9222",
+            f"--user-data-dir={profile_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            KL_URL
+        ]
+        try:
+            self.kl_proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            self.kl_proc = None
+            messagebox.showerror("Ei käynnisty", f"Chrome ei käynnistynyt:\n{e}")
+            return
+
+        time.sleep(1.5)
+        if not self.kl_attach_driver():
+            messagebox.showwarning(
+                "Liitäntä ei onnistunut",
+                "Chrome käynnistyi, mutta Selenium ei saanut yhteyttä.\n"
+                "Varmista että normaali Chrome on suljettu ja yritä uudelleen."
+            )
+            return
+
+        self.set_status("KL Chrome käynnissä. Kirjaudu Kauppalehteen Chromessa jos pyytää.")
+
+    def kl_open_page(self):
+        if not self.kl_attach_driver():
+            messagebox.showwarning("Ei yhteyttä", "Käynnistä KL Chrome ensin.")
+            return
+        try:
+            self.kl_driver.get(KL_URL)
+            wait_body(self.kl_driver, 25)
+            try_accept_cookies(self.kl_driver)
+            self.set_status("Protestilista avattu. Kirjaudu jos pyytää.")
+        except Exception as e:
+            self.ui_log(f"KL avaus epäonnistui: {e}")
+
+    def kl_open_all_arrows(self):
+        if not self.kl_attach_driver():
+            messagebox.showwarning("Ei yhteyttä", "Käynnistä KL Chrome ensin.")
+            return
+
+        def worker():
+            try:
+                self.set_status("KL: avataan nuolet + Näytä lisää…")
+                try_accept_cookies(self.kl_driver)
+
+                rounds = 0
+                total_clicked = 0
+
+                while rounds < 80:
+                    rounds += 1
+                    try_accept_cookies(self.kl_driver)
+
+                    clicked = click_all_arrows_once(self.kl_driver)
+                    total_clicked += clicked
+
+                    scroll_to_bottom(self.kl_driver)
+                    time.sleep(0.6)
+
+                    more = click_show_more(self.kl_driver)
+                    if more:
+                        self.ui_log(f"KL kierros {rounds}: nuolia {clicked}, Näytä lisää: kyllä")
+                        time.sleep(1.2)
+                        continue
+
+                    self.ui_log(f"KL kierros {rounds}: nuolia {clicked}, Näytä lisää: ei")
+                    if clicked == 0:
+                        break
+
+                self.set_status(f"KL valmis! Avattu nuolia ~{total_clicked}. Tee nyt Ctrl+A → Ctrl+C ja liitä bottiin.")
+                messagebox.showinfo("Valmis", "Kaikki mahdolliset nuolet avattu.\n\nTee nyt Ctrl+A → Ctrl+C ja liitä bottiin.")
+            except Exception as e:
+                self.ui_log(f"KL virhe: {e}")
+                messagebox.showerror("Virhe", str(e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def kl_shutdown(self):
+        try:
+            if self.kl_driver:
+                try:
+                    self.kl_driver.quit()
+                except Exception:
+                    pass
+                self.kl_driver = None
+        finally:
+            if self.kl_proc:
+                try:
+                    self.kl_proc.terminate()
+                except Exception:
+                    pass
+                self.kl_proc = None
+        self.set_status("KL Chrome suljettu.")
+
+    # =========================
+    #   KL copy/paste -> files
+    # =========================
     def make_files(self):
         raw = self.text.get("1.0", tk.END)
         names, yts = parse_names_and_yts_from_copied_text(raw)
@@ -493,52 +871,41 @@ class App(tk.Tk):
 
         self.set_status(f"Poimittu: nimet={len(names)} | y-tunnukset={len(yts)}")
 
-        # DOCX
         if names:
             p1 = save_word_plain_lines(names, "yritysnimet_kauppalehti.docx")
             self.ui_log(f"Tallennettu: {p1}")
+            t1 = save_txt_lines(names, "yritysnimet_kauppalehti.txt")
+            self.ui_log(f"Tallennettu: {t1}")
+            pdf1 = save_pdf_lines(names, "yritysnimet_kauppalehti.pdf", title="Yritysnimet (Kauppalehti)")
+            self.ui_log(f"Tallennettu: {pdf1}")
+
         if yts:
             p2 = save_word_plain_lines(yts, "ytunnukset_kauppalehti.docx")
             self.ui_log(f"Tallennettu: {p2}")
-
-        # TXT (varma aina)
-        if names:
-            t1 = save_txt_lines(names, "yritysnimet_kauppalehti.txt")
-            self.ui_log(f"Tallennettu: {t1}")
-        if yts:
             t2 = save_txt_lines(yts, "ytunnukset_kauppalehti.txt")
             self.ui_log(f"Tallennettu: {t2}")
 
-        # PDF (vain jos reportlab löytyy)
-        if HAS_REPORTLAB:
-            if names:
-                pdf1 = save_pdf_lines_if_possible(names, "yritysnimet_kauppalehti.pdf", title="Yritysnimet (Kauppalehti)")
-                if pdf1:
-                    self.ui_log(f"Tallennettu: {pdf1}")
+        combined = []
+        if names:
+            combined.append("YRITYSNIMET")
+            combined += names
+            combined.append("")
+        if yts:
+            combined.append("Y-TUNNUKSET")
+            combined += yts
 
-            combined = []
-            if names:
-                combined.append("YRITYSNIMET")
-                combined += names
-                combined.append("")
-            if yts:
-                combined.append("Y-TUNNUKSET")
-                combined += yts
-
-            pdf2 = save_pdf_lines_if_possible(combined, "yritysnimet_ja_ytunnukset.pdf", title="Kauppalehti -> poimitut tiedot")
-            if pdf2:
-                self.ui_log(f"Tallennettu: {pdf2}")
-        else:
-            self.ui_log("reportlab puuttuu -> PDF:iä ei tehty. (TXT+DOCX luotu)")
+        pdf2 = save_pdf_lines(combined, "yritysnimet_ja_ytunnukset.pdf", title="Kauppalehti -> poimitut tiedot")
+        self.ui_log(f"Tallennettu: {pdf2}")
 
         self.set_status("Valmis (tiedostot luotu).")
         messagebox.showinfo(
             "Valmis",
-            f"Valmis!\n\nYritysnimiä: {len(names)}\nY-tunnuksia: {len(yts)}\n\nKansio:\n{OUT_DIR}\n\n"
-            f"{'PDF:t luotu.' if HAS_REPORTLAB else 'PDF:t EI luotu (reportlab puuttuu).'}"
+            f"Valmis!\n\nYritysnimiä: {len(names)}\nY-tunnuksia: {len(yts)}\n\nKansio:\n{OUT_DIR}"
         )
 
-    # ---------- MODE 2 ----------
+    # =========================
+    #   PDF -> YTJ
+    # =========================
     def start_pdf_to_ytj(self):
         pdf_path = filedialog.askopenfilename(filetypes=[("PDF files", "*.pdf")])
         if not pdf_path:
@@ -595,6 +962,14 @@ class App(tk.Tk):
                     driver.quit()
                 except Exception:
                     pass
+
+    def on_close(self):
+        # sulje KL Chrome jos auki
+        try:
+            self.kl_shutdown()
+        except Exception:
+            pass
+        self.destroy()
 
 
 if __name__ == "__main__":
