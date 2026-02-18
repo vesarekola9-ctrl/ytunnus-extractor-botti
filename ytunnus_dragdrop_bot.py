@@ -253,7 +253,6 @@ def open_new_tab(driver, url="about:blank"):
 #   KAUPPALEHTI PAGE CHECKS
 # =========================
 def page_looks_like_protestilista(driver) -> bool:
-    """Heikko varmistus: sivulla näkyy 'Protestilista'."""
     try:
         body = (driver.find_element(By.TAG_NAME, "body").text or "")
         return "Protestilista" in body
@@ -286,7 +285,7 @@ def ensure_protestilista_open_and_ready(driver, status_cb, log_cb, max_wait_seco
         WebDriverWait(driver, 25).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
         try_accept_cookies(driver)
 
-    # 2) Odota että lista oikeasti näkyy (ja ei ole paywall)
+    # 2) Odota että lista näkyy (ja ei ole paywall)
     start = time.time()
     warned = False
 
@@ -325,7 +324,7 @@ def ensure_protestilista_open_and_ready(driver, status_cb, log_cb, max_wait_seco
 
 
 # =========================
-#   KAUPPALEHTI SCRAPE (ROBUST)
+#   KAUPPALEHTI SCRAPE (CLICK BLUE DOWN ARROWS IN ORDER)
 # =========================
 def click_nayta_lisaa(driver) -> bool:
     """Robusti 'Näytä lisää' / 'Lataa lisää'."""
@@ -333,7 +332,7 @@ def click_nayta_lisaa(driver) -> bool:
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
     except Exception:
         pass
-    time.sleep(0.3)
+    time.sleep(0.25)
 
     for b in driver.find_elements(By.XPATH, "//button|//*[@role='button']|//a"):
         try:
@@ -347,91 +346,71 @@ def click_nayta_lisaa(driver) -> bool:
     return False
 
 
-def get_protestilista_row_toggles(driver):
+def get_main_rows(driver):
     """
-    Etsi toggle-nuolia vain listan riveistä.
-    Ensisijaisesti table/tbody -> aria-expanded.
+    Palauta vain "pää-rivit" (yritysrivit), EI detail-rivejä.
+    KL: detail-rivillä näkyy tekstiä kuten 'Y-tunnus', joten suodatetaan pois.
     """
-    toggles = []
-
-    # 1) table/tbody
-    xpath = (
-        "//table//tbody"
-        "//*[(@aria-expanded='false' or @aria-expanded='true') and "
-        "(self::button or self::a or @role='button')]"
-    )
-    elems = driver.find_elements(By.XPATH, xpath)
-    for e in elems:
+    rows = []
+    for tr in driver.find_elements(By.XPATH, "//table//tbody//tr"):
         try:
-            if e.is_displayed() and e.is_enabled():
-                toggles.append(e)
+            if not tr.is_displayed():
+                continue
+            txt = (tr.text or "").strip()
+            if not txt:
+                continue
+            # detail-rivi sisältää Y-tunnus labelin -> skip
+            if "Y-tunnus" in txt or "Y-TUNNUS" in txt:
+                continue
+            # pää-rivissä pitäisi olla yrityslinkki tai ainakin yritysnimi
+            # (kuvassa yritys on sininen linkki)
+            try:
+                tr.find_element(By.XPATH, ".//a")
+            except Exception:
+                # joskus ei linkkiä, mutta silti ok jos rivissä on useita sarakkeita
+                pass
+            rows.append(tr)
+        except Exception:
+            continue
+    return rows
+
+
+def find_blue_arrow_button_in_row(row):
+    """
+    Etsi rivin sininen alasnuoli (toggle).
+    Tyypillisesti se on button jossa aria-expanded.
+    """
+    # Ensisijainen: aria-expanded button/role=button rivissä
+    candidates = row.find_elements(By.XPATH, ".//*[(@aria-expanded='false' or @aria-expanded='true') and (self::button or @role='button' or self::a)]")
+    for c in candidates:
+        try:
+            if c.is_displayed() and c.is_enabled():
+                return c
         except Exception:
             continue
 
-    # 2) fallback (div-lista tms)
-    if not toggles:
-        elems = driver.find_elements(By.XPATH, "//*[@aria-expanded='false' or @aria-expanded='true']")
-        for e in elems:
-            try:
-                if not (e.is_displayed() and e.is_enabled()):
-                    continue
-                # pitää olla rivikontekstissa
-                e.find_element(By.XPATH, "ancestor::*[self::tr or @role='row'][1]")
-                toggles.append(e)
-            except Exception:
-                continue
-
-    return toggles
-
-
-def toggle_fingerprint(driver, toggle):
-    """Fingerprint togglelle sen rivitekstistä, jotta ei klikata samaa uudelleen."""
-    try:
-        container = toggle.find_element(By.XPATH, "ancestor::tr[1]")
-        txt = (container.text or "").strip().replace("\n", " ")
-        return txt[:200]
-    except Exception:
-        pass
-
-    try:
-        container = toggle.find_element(By.XPATH, "ancestor::*[@role='row'][1]")
-        txt = (container.text or "").strip().replace("\n", " ")
-        return txt[:200]
-    except Exception:
-        pass
-
-    try:
-        return (toggle.get_attribute("aria-expanded") or "") + "|" + (toggle.get_attribute("class") or "")[:120]
-    except Exception:
-        return "unknown"
-
-
-def wait_toggle_state(driver, toggle, want_true: bool, timeout=3.0):
-    end = time.time() + timeout
-    while time.time() < end:
+    # Fallback: joskus nuoli ei kanna aria-expandedia (harvinaista),
+    # etsitään viimeisestä solusta button jossa svg
+    candidates = row.find_elements(By.XPATH, ".//td[last()]//button|.//td[last()]//*[@role='button']")
+    for c in candidates:
         try:
-            val = (toggle.get_attribute("aria-expanded") or "").strip().lower()
-            if want_true and val == "true":
-                return True
-            if (not want_true) and val == "false":
-                return True
+            if c.is_displayed() and c.is_enabled():
+                return c
         except Exception:
-            pass
-        time.sleep(0.05)
-    return False
+            continue
+
+    return None
 
 
-def extract_yt_from_opened_detail(toggle):
+def extract_yt_from_detail_after_row(row):
     """
-    Toggle on rivissä. Detail aukeaa yleensä seuraavaksi <tr>:ksi.
-    Etsitään 'Y-tunnus' ja poimitaan regexillä.
+    Kun pää-rivin nuolta klikataan, detail tulee yleensä seuraavana sibling-tr:nä.
+    Etsitään lähellä olevista sibling-riveistä 'Y-tunnus' ja poimitaan regexillä.
     """
-    # 1) seuraavat sibling-tr:t
     try:
-        tr = toggle.find_element(By.XPATH, "ancestor::tr[1]")
-        for k in range(1, 7):
+        for k in range(1, 6):
             try:
-                sib = tr.find_element(By.XPATH, f"following-sibling::tr[{k}]")
+                sib = row.find_element(By.XPATH, f"following-sibling::tr[{k}]")
                 txt = (sib.text or "")
                 if "Y-tunnus" in txt or "Y-TUNNUS" in txt:
                     for m in YT_RE.findall(txt):
@@ -442,19 +421,6 @@ def extract_yt_from_opened_detail(toggle):
                 continue
     except Exception:
         pass
-
-    # 2) fallback: lähikontaineri
-    try:
-        container = toggle.find_element(By.XPATH, "ancestor::*[self::tr or @role='row' or self::div][1]")
-        txt = container.text or ""
-        if "Y-tunnus" in txt or "Y-TUNNUS" in txt:
-            for m in YT_RE.findall(txt):
-                n = normalize_yt(m)
-                if n:
-                    return n
-    except Exception:
-        pass
-
     return ""
 
 
@@ -466,16 +432,13 @@ def collect_yts_from_kauppalehti(driver, status_cb, log_cb):
         return []
 
     collected = set()
-    processed = set()
+    processed_row_keys = set()
     rounds_without_new = 0
 
-    time.sleep(1.0)
+    time.sleep(0.8)
 
     while True:
-        try:
-            try_accept_cookies(driver)
-        except Exception:
-            pass
+        try_accept_cookies(driver)
 
         # pysy oikealla sivulla
         cur = driver.current_url or ""
@@ -495,36 +458,47 @@ def collect_yts_from_kauppalehti(driver, status_cb, log_cb):
             time.sleep(3)
             continue
 
-        toggles = get_protestilista_row_toggles(driver)
-        if not toggles:
-            status_cb("KL: toggleja ei löydy -> teen debug-dumpin.")
-            html, png = dump_debug(driver, "kl_no_toggles")
+        rows = get_main_rows(driver)
+        if not rows:
+            status_cb("KL: en löydä pää-rivejä taulukosta -> debug-dump.")
+            html, png = dump_debug(driver, "kl_no_rows")
             log_cb(f"DEBUG: {html} | {png}")
             break
 
-        status_cb(f"KL: toggleja {len(toggles)} näkyvissä | kerätty {len(collected)}")
+        status_cb(f"KL: rivejä {len(rows)} näkyvissä | kerätty {len(collected)}")
         new_in_pass = 0
 
-        for idx in range(len(toggles)):
+        # Käydään rivit ylhäältä alas järjestyksessä
+        for idx in range(len(rows)):
             try:
-                toggles = get_protestilista_row_toggles(driver)
-                if idx >= len(toggles):
+                rows = get_main_rows(driver)
+                if idx >= len(rows):
                     break
-                t = toggles[idx]
+                row = rows[idx]
 
-                fp = toggle_fingerprint(driver, t)
-                if fp in processed:
+                row_txt = (row.text or "").strip().replace("\n", " ")
+                row_key = row_txt[:220]
+                if not row_key:
                     continue
-                processed.add(fp)
+                if row_key in processed_row_keys:
+                    continue
+                processed_row_keys.add(row_key)
 
-                if not safe_click(driver, t):
+                arrow = find_blue_arrow_button_in_row(row)
+                if not arrow:
+                    log_cb("SKIP: sinistä nuolta (toggle) ei löytynyt riviltä")
                     continue
 
-                wait_toggle_state(driver, t, want_true=True, timeout=3.0)
+                if not safe_click(driver, arrow):
+                    log_cb("SKIP: nuolen klikkaus epäonnistui")
+                    continue
+
+                # Odota että detail ehtii renderöityä
+                time.sleep(0.20)
 
                 yt = ""
                 for _ in range(40):
-                    yt = extract_yt_from_opened_detail(t)
+                    yt = extract_yt_from_detail_after_row(row)
                     if yt:
                         break
                     time.sleep(0.08)
@@ -534,12 +508,11 @@ def collect_yts_from_kauppalehti(driver, status_cb, log_cb):
                     new_in_pass += 1
                     log_cb(f"+ {yt} (yht {len(collected)})")
                 elif not yt:
-                    log_cb("SKIP: Y-tunnusta ei löytynyt avatusta detailistä")
+                    log_cb("SKIP: detail auki, mutta Y-tunnusta ei löytynyt")
 
-                # sulje takaisin
+                # Sulje detail takaisin (klikataan sama nuoli uudestaan)
                 try:
-                    safe_click(driver, t)
-                    wait_toggle_state(driver, t, want_true=False, timeout=1.5)
+                    safe_click(driver, arrow)
                 except Exception:
                     pass
 
@@ -558,7 +531,7 @@ def collect_yts_from_kauppalehti(driver, status_cb, log_cb):
         # Näytä lisää / Lataa lisää
         if click_nayta_lisaa(driver):
             status_cb("KL: Näytä lisää…")
-            time.sleep(1.4)
+            time.sleep(1.2)
             continue
 
         if rounds_without_new >= 2:
@@ -681,7 +654,7 @@ class App(tk.Tk):
         super().__init__()
         reset_log()
 
-        self.title("ProtestiBotti (KL Protestilista FIX)")
+        self.title("ProtestiBotti (KL: sininen nuoli järjestyksessä)")
         self.geometry("940x600")
 
         tk.Label(self, text="ProtestiBotti", font=("Arial", 18, "bold")).pack(pady=10)
@@ -741,7 +714,7 @@ class App(tk.Tk):
             self.set_status("Liitytään Chrome-bottiin (9222)…")
             driver = attach_to_existing_chrome()
 
-            self.set_status("Kauppalehti: kerätään Y-tunnukset (protestilista fix)…")
+            self.set_status("Kauppalehti: klikataan siniset nuolet ja kerätään Y-tunnukset…")
             yt_list = collect_yts_from_kauppalehti(driver, self.set_status, self.ui_log)
 
             if not yt_list:
