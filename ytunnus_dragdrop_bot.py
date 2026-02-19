@@ -108,7 +108,7 @@ def reset_log():
 
 
 # =========================
-#   CACHE (negatiivinen ok)
+#   CACHE
 # =========================
 def _load_cache():
     try:
@@ -132,10 +132,6 @@ def _save_cache(cache):
         os.replace(tmp, CACHE_PATH)
     except Exception:
         pass
-
-
-def cache_stats(cache):
-    return len(cache.get("yt", {})), len(cache.get("name", {}))
 
 
 def cache_clear():
@@ -488,27 +484,6 @@ def extract_names_and_yts_from_pdf(pdf_path: str):
 
 
 # =========================
-#   SKIP FILTERS (optional)
-# =========================
-def should_skip_name(name: str, skip_asoy: bool, skip_ry: bool, skip_kiinteisto: bool, skip_julkinen: bool) -> bool:
-    n = (name or "").strip()
-    low = n.casefold()
-
-    if skip_asoy and (low.startswith("as oy ") or low.startswith("asunto oy ")):
-        return True
-    if skip_ry and low.endswith(" ry"):
-        return True
-    if skip_kiinteisto and ("kiinteistö" in low or "kiinteisto" in low):
-        return True
-    if skip_julkinen:
-        public_words = ["kunta", "kaupunki", "seurakunta", "hyvinvointialue", "valtion", "virasto", "oppilaitos"]
-        if any(w in low for w in public_words):
-            return True
-
-    return False
-
-
-# =========================
 #   YTJ: Selenium + Throttle + Retry
 # =========================
 def start_new_driver():
@@ -599,7 +574,7 @@ def safe_get(driver, url: str, throttle: Throttle, stop_evt, status_cb, max_atte
 
 
 # =========================
-#   YTJ: ROBUST "SÄHKÖPOSTI -> NÄYTÄ" CLICK (FIX)
+#   YTJ: "OPEN ALL NÄYTÄ" (PDF-BOT STYLE) ✅
 # =========================
 def _js_click(driver, el) -> bool:
     try:
@@ -619,67 +594,91 @@ def _js_click(driver, el) -> bool:
         return False
 
 
-def ytj_click_email_nayta(driver) -> bool:
+def _collect_nayta_buttons(driver):
     """
-    Klikkaa nimenomaan Sähköposti-rivin "Näytä".
-    Tämä on se mitä sulla jää usein painamatta.
+    Kerää kaikki klikattavat elementit, joissa teksti täsmää 'Näytä'.
     """
-    xpaths = [
-        # Table row where left cell contains "Sähköposti", then button/role=button with text "Näytä"
-        "//tr[.//*[contains(normalize-space(.),'Sähköposti')]]"
-        "//*[self::button or self::a or @role='button'][normalize-space()='Näytä']",
-        # Sometimes not inside <tr> (responsive), use any container containing "Sähköposti"
-        "//*[contains(normalize-space(.),'Sähköposti')]/following::*"
-        "[self::button or self::a or @role='button'][normalize-space()='Näytä'][1]",
+    xps = [
+        "//button[normalize-space()='Näytä']",
+        "//a[normalize-space()='Näytä']",
+        "//*[@role='button' and normalize-space()='Näytä']",
+        "//*[self::div or self::span][@role='button' and normalize-space()='Näytä']",
     ]
-    for xp in xpaths:
+    elems = []
+    for xp in xps:
         try:
-            btns = driver.find_elements(By.XPATH, xp)
-            for b in btns:
-                try:
-                    if b.is_displayed() and b.is_enabled():
-                        if _js_click(driver, b):
-                            return True
-                except Exception:
-                    continue
+            elems.extend(driver.find_elements(By.XPATH, xp))
         except Exception:
             continue
-    return False
 
-
-def ytj_click_all_nayta(driver):
-    """
-    1) Klikkaa ensin varmasti Sähköposti->Näytä
-    2) Klikkaa sitten kaikki muut "Näytä" jos näkyy (puhelin jne)
-    """
-    # 1) EMAIL first
-    ytj_click_email_nayta(driver)
-    time.sleep(0.15)
-
-    # 2) others
-    for _ in range(4):
-        clicked = False
+    uniq = []
+    seen = set()
+    for e in elems:
         try:
-            buttons = driver.find_elements(By.XPATH, "//button|//a|//*[@role='button']")
+            if not e.is_displayed() or not e.is_enabled():
+                continue
+            key = (id(e), e.get_attribute("outerHTML")[:120] if e.get_attribute("outerHTML") else id(e))
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(e)
         except Exception:
-            buttons = []
+            continue
 
-        for b in buttons:
+    # järjestetään y-sijainnin mukaan: ylhäältä alas
+    def _y(el):
+        try:
+            return el.location_once_scrolled_into_view.get("y", 10**9)
+        except Exception:
             try:
+                return el.location.get("y", 10**9)
+            except Exception:
+                return 10**9
+
+    uniq.sort(key=_y)
+    return uniq
+
+
+def ytj_open_all_nayta(driver, max_rounds=8):
+    """
+    Avaa kaikki 'Näytä' kohdat useassa kierroksessa.
+    Palauttaa (total_clicked, rounds_done)
+    """
+    total_clicked = 0
+    rounds = 0
+
+    for _ in range(max_rounds):
+        rounds += 1
+        btns = _collect_nayta_buttons(driver)
+        if not btns:
+            break
+
+        clicked_this_round = 0
+
+        for b in btns:
+            try:
+                # jos nappi on jo "kadonnut" tai muuttunut, skip
                 if not b.is_displayed() or not b.is_enabled():
                     continue
-                txt = (b.text or "").strip()
-                if txt.casefold() == "näytä":
-                    if _js_click(driver, b):
-                        clicked = True
-                        time.sleep(0.12)
+                if (b.text or "").strip().casefold() != "näytä":
+                    continue
+
+                if _js_click(driver, b):
+                    clicked_this_round += 1
+                    total_clicked += 1
+                    time.sleep(0.12)
             except StaleElementReferenceException:
                 continue
             except Exception:
                 continue
 
-        if not clicked:
+        # jos ei klikattu mitään kierroksella, lopeta
+        if clicked_this_round == 0:
             break
+
+        time.sleep(0.25)
+
+    return total_clicked, rounds
 
 
 def extract_email_from_ytj_page(driver):
@@ -700,10 +699,7 @@ def extract_email_from_ytj_page(driver):
         return ""
 
 
-def wait_email_appears(driver, timeout=6.0) -> str:
-    """
-    Odota että email ilmestyy sivulle (yleensä Sähköposti-riville) klikkauksen jälkeen.
-    """
+def wait_email_appears(driver, timeout=7.0) -> str:
     end = time.time() + timeout
     last = ""
     while time.time() < end:
@@ -905,9 +901,6 @@ def ytj_open_best_company_by_name_verified(driver, company_name: str, throttle: 
 
 # =========================
 #   FETCH (YT + NAME) + MASTER.CSV
-#   - NEGATIVE CACHE OK
-#   - OUTPUT EMAIL DOCX ALWAYS FILTERED (no empty)
-#   - YTJ clicks "Sähköposti -> Näytä" robustly + waits for reveal
 # =========================
 def fetch_emails_from_ytj_by_yts_and_names(
     driver,
@@ -917,10 +910,6 @@ def fetch_emails_from_ytj_by_yts_and_names(
     progress_cb,
     log_cb,
     stop_evt,
-    skip_asoy=False,
-    skip_ry=False,
-    skip_kiinteisto=False,
-    skip_julkinen=False
 ):
     cache = _load_cache()
     throttle = Throttle()
@@ -941,19 +930,7 @@ def fetch_emails_from_ytj_by_yts_and_names(
         seen_emails.add(k)
         emails_out.append(e)
 
-    # filter names
-    names_in = []
-    for nm in (names or []):
-        nm = (nm or "").strip()
-        if not nm:
-            continue
-        if should_skip_name(nm, skip_asoy, skip_ry, skip_kiinteisto, skip_julkinen):
-            master_rows.append([nm, "", "", "", "SKIPPED", "NAME", int(time.time())])
-            log_cb(f"[SKIP] {nm}")
-            continue
-        names_in.append(nm)
-
-    total = len(yts or []) + len(names_in)
+    total = len(yts or []) + len(names or [])
     progress_cb(0, max(1, total))
     done = 0
 
@@ -991,17 +968,13 @@ def fetch_emails_from_ytj_by_yts_and_names(
             log_cb(f"[FAIL YT] {yt} → (ei saatu ladattua)")
             continue
 
-        # ✅ FIX: click email reveal robustly
-        clicked_email = ytj_click_email_nayta(driver)
-        ytj_click_all_nayta(driver)
+        # ✅ PDF-tyylinen: avaa KAIKKI NÄYTÄ
+        clicked, rounds = ytj_open_all_nayta(driver, max_rounds=8)
+        log_cb(f"[YTJ] Näytä avattu: {clicked} (kierrokset {rounds})")
 
         email = extract_email_from_ytj_page(driver)
-        if not email and clicked_email:
-            email = wait_email_appears(driver, timeout=7.0)
         if not email:
-            # try again (some pages need second click due to sticky header overlays)
-            ytj_click_email_nayta(driver)
-            email = wait_email_appears(driver, timeout=5.5)
+            email = wait_email_appears(driver, timeout=7.5)
 
         if email:
             cache_put_yt(cache, yt, email, "", status="FOUND")
@@ -1017,11 +990,15 @@ def fetch_emails_from_ytj_by_yts_and_names(
             log_cb(f"[LIVE YT] {yt} → (ei sähköpostia)")
 
     # 2) NAMES
-    for nm in names_in:
+    for nm in (names or []):
         if stop_evt.is_set():
             break
         done += 1
         progress_cb(done, total)
+
+        nm = (nm or "").strip()
+        if not nm:
+            continue
 
         status_cb(f"YTJ (nimi): {nm} ({done}/{total})")
 
@@ -1059,15 +1036,13 @@ def fetch_emails_from_ytj_by_yts_and_names(
                 log_cb(f"[LIVE NAME] {nm} ({yt_found}) → (ei saatu yrityssivua)")
                 continue
 
-        clicked_email = ytj_click_email_nayta(driver)
-        ytj_click_all_nayta(driver)
+        # ✅ PDF-tyylinen: avaa KAIKKI NÄYTÄ
+        clicked, rounds = ytj_open_all_nayta(driver, max_rounds=8)
+        log_cb(f"[YTJ] Näytä avattu: {clicked} (kierrokset {rounds})")
 
         email = extract_email_from_ytj_page(driver)
-        if not email and clicked_email:
-            email = wait_email_appears(driver, timeout=7.0)
         if not email:
-            ytj_click_email_nayta(driver)
-            email = wait_email_appears(driver, timeout=5.5)
+            email = wait_email_appears(driver, timeout=7.5)
 
         if email:
             tag = classify_email(email)
@@ -1088,7 +1063,6 @@ def fetch_emails_from_ytj_by_yts_and_names(
 
     progress_cb(total, max(1, total))
 
-    # ✅ Final output: no empties
     emails_out = sorted(set([e.strip() for e in emails_out if e and e.strip()]), key=lambda x: x.lower())
     return emails_out, master_rows
 
@@ -1136,11 +1110,8 @@ class App(tk.Tk):
         reset_log()
 
         self.stop_evt = threading.Event()
-        self.last_emails = []
-        self.last_yts = []
-        self.last_names = []
 
-        self.title("ProtestiBotti ULTIMATE (YTJ Näytä FIXED)")
+        self.title("ProtestiBotti ULTIMATE (YTJ Näytä: OPEN ALL)")
         self.geometry("1100x940")
 
         root = ScrollableFrame(self)
@@ -1153,8 +1124,7 @@ class App(tk.Tk):
             text=(
                 "• KL copy/paste parser → yritysnimet + YT\n"
                 "• PDF → (nimet+YT) → YTJ\n"
-                "• YTJ: klikataan varmasti Sähköposti → Näytä (robust)\n"
-                "• Cache myös NO_EMAIL, mutta lopullinen DOCX sisältää vain oikeat emailit\n"
+                "• YTJ: avaa KAIKKI 'Näytä' (PDF-botin tyyli)\n"
                 "• master.csv statusriveillä\n"
             ),
             justify="center"
@@ -1165,17 +1135,6 @@ class App(tk.Tk):
         tk.Button(ctrl, text="STOP (keskeytä YTJ)", fg="white", bg="#aa0000", command=self.stop_now).pack(side="left", padx=6)
         tk.Button(ctrl, text="Avaa output-kansio", command=self.open_output_folder).pack(side="left", padx=6)
         tk.Button(ctrl, text="Tyhjennä cache", command=self.clear_cache_ui).pack(side="left", padx=6)
-
-        filt = tk.LabelFrame(self.ui, text="Filtterit (nimihaussa)", padx=10, pady=8)
-        filt.pack(fill="x", padx=12, pady=8)
-        self.var_skip_asoy = tk.BooleanVar(value=False)
-        self.var_skip_ry = tk.BooleanVar(value=False)
-        self.var_skip_kiinteisto = tk.BooleanVar(value=False)
-        self.var_skip_julkinen = tk.BooleanVar(value=False)
-        tk.Checkbutton(filt, text="Skip As Oy", variable=self.var_skip_asoy).pack(side="left", padx=8)
-        tk.Checkbutton(filt, text="Skip Ry", variable=self.var_skip_ry).pack(side="left", padx=8)
-        tk.Checkbutton(filt, text="Skip Kiinteistö*", variable=self.var_skip_kiinteisto).pack(side="left", padx=8)
-        tk.Checkbutton(filt, text="Skip Julkinen", variable=self.var_skip_julkinen).pack(side="left", padx=8)
 
         box_yt = tk.LabelFrame(self.ui, text="Liitä Y-tunnukset → YTJ emailit", padx=10, pady=10)
         box_yt.pack(fill="x", padx=12, pady=10)
@@ -1308,14 +1267,9 @@ class App(tk.Tk):
                 progress_cb=self.set_progress,
                 log_cb=self.ui_log,
                 stop_evt=self.stop_evt,
-                skip_asoy=self.var_skip_asoy.get(),
-                skip_ry=self.var_skip_ry.get(),
-                skip_kiinteisto=self.var_skip_kiinteisto.get(),
-                skip_julkinen=self.var_skip_julkinen.get(),
             )
 
             emails_sorted = sorted(set([e for e in emails if e and e.strip()]), key=lambda x: x.lower())
-            self.last_emails = emails_sorted[:]
 
             save_word_plain_lines(emails_sorted, "sahkopostit_ytj.docx")
             save_txt_lines(emails_sorted, "sahkopostit_ytj.txt")
