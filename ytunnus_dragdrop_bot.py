@@ -2,7 +2,6 @@ import os
 import re
 import sys
 import time
-import subprocess
 import threading
 import tkinter as tk
 from tkinter import messagebox, filedialog
@@ -23,8 +22,6 @@ from webdriver_manager.chrome import ChromeDriverManager
 # =========================
 #   CONFIG / REGEX
 # =========================
-KL_URL = "https://www.kauppalehti.fi/yritykset/protestilista"
-
 YT_RE = re.compile(r"\b\d{7}-\d\b|\b\d{8}\b")
 EMAIL_RE = re.compile(r"[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9-.]+")
 EMAIL_A_RE = re.compile(r"[A-Za-z0-9_.+-]+\s*\(a\)\s*[A-Za-z0-9-]+\.[A-Za-z0-9-.]+", re.I)
@@ -260,7 +257,7 @@ def save_pdf_lines(lines, filename, title=None):
 
 
 # =========================
-#   SMART PARSER (names + yts)
+#   SMART PARSER (copy/paste -> names + yts)
 # =========================
 def _is_money_line(s: str) -> bool:
     return bool(re.fullmatch(r"\d{1,3}(\s?\d{3})*\s?€", s.strip()))
@@ -343,11 +340,6 @@ def parse_names_and_yts_from_copied_text(raw: str):
             if j >= 0:
                 candidates.append(lines[j])
 
-        same_line = lines[i]
-        m = re.search(r"^(.*)\s+\d{1,3}(\s?\d{3})*\s?€$", same_line)
-        if m:
-            candidates.insert(0, m.group(1).strip())
-
         best = ""
         for c in candidates:
             c = _normalize_name(c)
@@ -371,6 +363,20 @@ def parse_names_and_yts_from_copied_text(raw: str):
                     names.append(ln)
 
     return names, yts
+
+
+def parse_yts_only(raw: str):
+    """
+    UUSI: Poimii pelkät Y-tunnukset mistä tahansa tekstistä.
+    """
+    yts = []
+    seen = set()
+    for m in YT_RE.findall(raw or ""):
+        n = normalize_yt(m)
+        if n and n not in seen:
+            seen.add(n)
+            yts.append(n)
+    return sorted(yts)
 
 
 # =========================
@@ -533,164 +539,74 @@ def fetch_emails_from_ytj_by_yts_and_names(driver, yts, names, status_cb, progre
 
 
 # =========================
-#   KL "OPEN ALL ARROWS" TOOL (embedded)
-# =========================
-def safe_click(driver, elem):
-    try:
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", elem)
-        time.sleep(0.05)
-        try:
-            elem.click()
-        except Exception:
-            driver.execute_script("arguments[0].click();", elem)
-        return True
-    except Exception:
-        return False
-
-
-def try_accept_cookies(driver):
-    texts = ["Hyväksy", "Hyväksy kaikki", "Salli kaikki", "Accept", "Accept all", "I agree", "OK", "Selvä"]
-    try:
-        buttons = driver.find_elements(By.XPATH, "//button|//a|//*[@role='button']")
-    except Exception:
-        return
-    for b in buttons:
-        try:
-            t = (b.text or "").strip()
-            if not t:
-                continue
-            low = t.lower()
-            if any(x.lower() in low for x in texts):
-                if b.is_displayed() and b.is_enabled():
-                    safe_click(driver, b)
-                    time.sleep(0.25)
-        except Exception:
-            continue
-
-
-def click_all_arrows_once(driver):
-    elems = driver.find_elements(By.CSS_SELECTOR, "[aria-expanded='false']")
-    count = 0
-    for e in elems:
-        try:
-            if e.is_displayed() and e.is_enabled():
-                if safe_click(driver, e):
-                    count += 1
-                    time.sleep(0.01)
-        except Exception:
-            continue
-    return count
-
-
-def click_show_more(driver):
-    try:
-        buttons = driver.find_elements(By.XPATH, "//button|//*[@role='button']")
-    except Exception:
-        return False
-    for b in buttons:
-        try:
-            if not b.is_displayed() or not b.is_enabled():
-                continue
-            if (b.text or "").strip().lower() == "näytä lisää":
-                safe_click(driver, b)
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def scroll_to_bottom(driver):
-    try:
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-    except Exception:
-        pass
-
-
-def find_chrome_path():
-    candidates = [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    ]
-    for c in candidates:
-        if os.path.exists(c):
-            return c
-    return None
-
-
-# =========================
 #   GUI APP
 # =========================
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         reset_log()
-
         self.stop_evt = threading.Event()
 
-        # KL tool state
-        self.kl_proc = None
-        self.kl_driver = None
-
-        self.title("ProtestiBotti (All-in-one: KL tool + KL copy/paste + PDF→YTJ)")
-        self.geometry("1120x900")
+        self.title("ProtestiBotti (YT-only flow + KL + PDF→YTJ)")
+        self.geometry("1120x960")
 
         tk.Label(self, text="ProtestiBotti", font=("Arial", 18, "bold")).pack(pady=8)
         tk.Label(
             self,
-            text="Sisältää:\n"
-                 "• KL-työkalu: Avaa kaikki nuolet + Näytä lisää (ohjattu Chrome)\n"
-                 "• KL copy/paste → yritysnimet + Y-tunnukset → PDF/DOCX/TXT\n"
-                 "• PDF → YTJ (Y-tunnus ensin, muuten nimi) → sähköpostit Wordiin\n",
+            text="Nopein tapa:\n"
+                 "1) Avaa KL nuolilla (Console extractYTs)\n"
+                 "2) Kopioi Y-tunnukset ja liitä alle\n"
+                 "3) Paina 'Tallenna + Hae YTJ sähköpostit'\n",
             justify="center"
         ).pack(pady=4)
 
-        # ---------- KL TOOL BOX ----------
-        tool = tk.LabelFrame(self, text="KL-työkalu: Avaa kaikki nuolet", padx=10, pady=10)
-        tool.pack(fill="x", padx=12, pady=10)
+        # ---------- NEW: YT-only ----------
+        box_yt = tk.LabelFrame(self, text="NOPEA: Liitä Y-tunnuslista → tallenna + hae YTJ sähköpostit", padx=10, pady=10)
+        box_yt.pack(fill="x", padx=12, pady=10)
 
         tk.Label(
-            tool,
-            text="Tämä käynnistää oman ohjatun Chromen ja avaa protestilistalla kaikki siniset nuolet + 'Näytä lisää'.\n"
-                 "Vinkki: Sulje normaali Chrome ennen kuin painat Käynnistä (ettei Chrome-profiili lukitu).",
+            box_yt,
+            text="Liitä tähän pelkät Y-tunnukset (yksi per rivi). Muoto voi olla 1234567-8 tai 12345678.",
             justify="left"
         ).pack(anchor="w")
 
-        tool_row = tk.Frame(tool)
-        tool_row.pack(fill="x", pady=6)
+        self.yt_text = tk.Text(box_yt, height=7)
+        self.yt_text.pack(fill="x", pady=6)
 
-        tk.Button(tool_row, text="1) Käynnistä ohjattu Chrome", font=("Arial", 11, "bold"),
-                  command=self.kl_start_guided_chrome).pack(side="left", padx=6)
-        tk.Button(tool_row, text="2) Avaa protestilista", font=("Arial", 11, "bold"),
-                  command=self.kl_open_page).pack(side="left", padx=6)
-        tk.Button(tool_row, text="3) Avaa kaikki nuolet", font=("Arial", 11, "bold"),
-                  command=self.kl_open_all_arrows).pack(side="left", padx=6)
-        tk.Button(tool_row, text="Sulje KL Chrome", command=self.kl_shutdown).pack(side="left", padx=6)
+        row_yt = tk.Frame(box_yt)
+        row_yt.pack(fill="x")
 
-        # ---------- KL COPY/PASTE BOX ----------
-        box = tk.LabelFrame(self, text="Kauppalehti: copy/paste → tee tiedostot", padx=10, pady=10)
+        tk.Button(row_yt, text="Tallenna YT (PDF+DOCX+TXT)", font=("Arial", 11, "bold"),
+                  command=self.save_yts_only).pack(side="left", padx=6)
+        tk.Button(row_yt, text="Tallenna + Hae YTJ sähköpostit", font=("Arial", 11, "bold"),
+                  command=self.save_and_fetch_yts_only).pack(side="left", padx=6)
+        tk.Button(row_yt, text="Tyhjennä", command=lambda: self.yt_text.delete("1.0", tk.END)).pack(side="left", padx=6)
+
+        # ---------- KL copy/paste ----------
+        box = tk.LabelFrame(self, text="Kauppalehti: copy/paste → nimet + YT → tiedostot", padx=10, pady=10)
         box.pack(fill="x", padx=12, pady=10)
 
         tk.Label(
             box,
-            text="Kun nuolet on auki, tee protestilistassa Ctrl+A → Ctrl+C ja liitä alle → 'Tee tiedostot'.",
+            text="Vaihtoehto: Ctrl+A → Ctrl+C protestilistasta ja liitä tähän. Parseri yrittää poimia yritysnimet ja Y-tunnukset.",
             justify="left"
         ).pack(anchor="w")
 
-        self.text = tk.Text(box, height=10)
+        self.text = tk.Text(box, height=8)
         self.text.pack(fill="x", pady=6)
 
         row = tk.Frame(box)
         row.pack(fill="x")
-        tk.Button(row, text="Tee tiedostot (PDF + DOCX + TXT)", font=("Arial", 12, "bold"),
-                  command=self.make_files).pack(side="left")
-        tk.Button(row, text="Tyhjennä", command=lambda: self.text.delete("1.0", tk.END)).pack(side="left", padx=8)
+        tk.Button(row, text="Tee tiedostot (PDF + DOCX + TXT)", font=("Arial", 11, "bold"),
+                  command=self.make_files).pack(side="left", padx=6)
+        tk.Button(row, text="Tyhjennä", command=lambda: self.text.delete("1.0", tk.END)).pack(side="left", padx=6)
 
-        # ---------- PDF → YTJ BOX ----------
+        # ---------- PDF → YTJ ----------
         box2 = tk.LabelFrame(self, text="PDF → YTJ sähköpostit", padx=10, pady=10)
         box2.pack(fill="x", padx=12, pady=10)
 
-        tk.Button(box2, text="Valitse PDF ja hae sähköpostit YTJ:stä", font=("Arial", 12, "bold"),
-                  command=self.start_pdf_to_ytj).pack(anchor="w")
+        tk.Button(box2, text="Valitse PDF ja hae sähköpostit YTJ:stä", font=("Arial", 11, "bold"),
+                  command=self.start_pdf_to_ytj).pack(anchor="w", padx=6, pady=2)
 
         # ---------- STATUS / LOG ----------
         self.status = tk.Label(self, text="Valmiina.", font=("Arial", 11))
@@ -703,7 +619,7 @@ class App(tk.Tk):
         frame.pack(fill="both", expand=True, padx=14, pady=10)
 
         tk.Label(frame, text="Live-logi (uusimmat alimmaisena):").pack(anchor="w")
-        self.listbox = tk.Listbox(frame, height=18)
+        self.listbox = tk.Listbox(frame, height=16)
         self.listbox.pack(side="left", fill="both", expand=True)
 
         sb = tk.Scrollbar(frame, orient="vertical", command=self.listbox.yview)
@@ -711,8 +627,6 @@ class App(tk.Tk):
         self.listbox.configure(yscrollcommand=sb.set)
 
         tk.Label(self, text=f"Tallennus: {OUT_DIR}", wraplength=1080, justify="center").pack(pady=6)
-
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def ui_log(self, msg):
         line = log_to_file(msg)
@@ -731,131 +645,72 @@ class App(tk.Tk):
         self.update_idletasks()
 
     # =========================
-    #   KL TOOL actions
+    #   NEW: YT-only actions
     # =========================
-    def kl_attach_driver(self):
-        if self.kl_driver:
-            return True
+    def _read_yts_from_box(self):
+        raw = self.yt_text.get("1.0", tk.END)
+        yts = parse_yts_only(raw)
+        return yts
+
+    def save_yts_only(self):
+        yts = self._read_yts_from_box()
+        if not yts:
+            messagebox.showwarning("Ei löytynyt", "Liitä Y-tunnukset ensin.")
+            return
+
+        p_docx = save_word_plain_lines(yts, "ytunnukset_liitetty.docx")
+        p_txt = save_txt_lines(yts, "ytunnukset_liitetty.txt")
+        p_pdf = save_pdf_lines(yts, "ytunnukset_liitetty.pdf", title="Y-tunnukset")
+
+        self.ui_log(f"Tallennettu: {p_docx}")
+        self.ui_log(f"Tallennettu: {p_txt}")
+        self.ui_log(f"Tallennettu: {p_pdf}")
+        self.set_status(f"Tallennettu Y-tunnukset: {len(yts)} kpl")
+        messagebox.showinfo("Tallennettu", f"Tallennettu {len(yts)} Y-tunnusta.\n\nKansio:\n{OUT_DIR}")
+
+    def save_and_fetch_yts_only(self):
+        yts = self._read_yts_from_box()
+        if not yts:
+            messagebox.showwarning("Ei löytynyt", "Liitä Y-tunnukset ensin.")
+            return
+
+        # save first
+        self.save_yts_only()
+
+        # then fetch emails
+        threading.Thread(target=self._run_fetch_emails_yts_only, args=(yts,), daemon=True).start()
+
+    def _run_fetch_emails_yts_only(self, yts):
+        driver = None
         try:
-            options = webdriver.ChromeOptions()
-            options.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
-            driver_path = ChromeDriverManager().install()
-            self.kl_driver = webdriver.Chrome(service=Service(driver_path), options=options)
-            return True
-        except Exception as e:
-            self.ui_log(f"KL driver attach epäonnistui: {e}")
-            return False
+            self.set_status("Käynnistetään Chrome ja haetaan sähköpostit YTJ:stä (Y-tunnuksilla)…")
+            driver = start_new_driver()
 
-    def kl_start_guided_chrome(self):
-        if self.kl_proc:
-            self.set_status("KL Chrome on jo käynnissä.")
-            return
-
-        chrome_path = find_chrome_path()
-        if not chrome_path:
-            messagebox.showerror("Chrome puuttuu", "En löytänyt chrome.exe oletuspoluista. Asenna Google Chrome.")
-            return
-
-        base = get_exe_dir()
-        profile_dir = os.path.join(base, "KLToolProfile")
-        os.makedirs(profile_dir, exist_ok=True)
-
-        self.set_status("Käynnistän KL-ohjatun Chromen (9222)…")
-        args = [
-            chrome_path,
-            "--remote-debugging-port=9222",
-            f"--user-data-dir={profile_dir}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            KL_URL
-        ]
-        try:
-            self.kl_proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception as e:
-            self.kl_proc = None
-            messagebox.showerror("Ei käynnisty", f"Chrome ei käynnistynyt:\n{e}")
-            return
-
-        time.sleep(1.5)
-        if not self.kl_attach_driver():
-            messagebox.showwarning(
-                "Liitäntä ei onnistunut",
-                "Chrome käynnistyi, mutta Selenium ei saanut yhteyttä.\n"
-                "Varmista että normaali Chrome on suljettu ja yritä uudelleen."
+            emails = fetch_emails_from_ytj_by_yts_and_names(
+                driver,
+                yts=yts,
+                names=[],
+                status_cb=self.set_status,
+                progress_cb=self.set_progress,
+                log_cb=self.ui_log,
+                stop_evt=self.stop_evt
             )
-            return
 
-        self.set_status("KL Chrome käynnissä. Kirjaudu Kauppalehteen Chromessa jos pyytää.")
+            em_path = save_word_plain_lines(emails, "sahkopostit_ytj.docx")
+            self.ui_log(f"Tallennettu: {em_path}")
+            self.set_status("Valmis!")
+            messagebox.showinfo("Valmis", f"Sähköposteja löytyi: {len(emails)}\n\nKansio:\n{OUT_DIR}")
 
-    def kl_open_page(self):
-        if not self.kl_attach_driver():
-            messagebox.showwarning("Ei yhteyttä", "Käynnistä KL Chrome ensin.")
-            return
-        try:
-            self.kl_driver.get(KL_URL)
-            wait_body(self.kl_driver, 25)
-            try_accept_cookies(self.kl_driver)
-            self.set_status("Protestilista avattu. Kirjaudu jos pyytää.")
         except Exception as e:
-            self.ui_log(f"KL avaus epäonnistui: {e}")
-
-    def kl_open_all_arrows(self):
-        if not self.kl_attach_driver():
-            messagebox.showwarning("Ei yhteyttä", "Käynnistä KL Chrome ensin.")
-            return
-
-        def worker():
-            try:
-                self.set_status("KL: avataan nuolet + Näytä lisää…")
-                try_accept_cookies(self.kl_driver)
-
-                rounds = 0
-                total_clicked = 0
-
-                while rounds < 80:
-                    rounds += 1
-                    try_accept_cookies(self.kl_driver)
-
-                    clicked = click_all_arrows_once(self.kl_driver)
-                    total_clicked += clicked
-
-                    scroll_to_bottom(self.kl_driver)
-                    time.sleep(0.6)
-
-                    more = click_show_more(self.kl_driver)
-                    if more:
-                        self.ui_log(f"KL kierros {rounds}: nuolia {clicked}, Näytä lisää: kyllä")
-                        time.sleep(1.2)
-                        continue
-
-                    self.ui_log(f"KL kierros {rounds}: nuolia {clicked}, Näytä lisää: ei")
-                    if clicked == 0:
-                        break
-
-                self.set_status(f"KL valmis! Avattu nuolia ~{total_clicked}. Tee nyt Ctrl+A → Ctrl+C ja liitä bottiin.")
-                messagebox.showinfo("Valmis", "Kaikki mahdolliset nuolet avattu.\n\nTee nyt Ctrl+A → Ctrl+C ja liitä bottiin.")
-            except Exception as e:
-                self.ui_log(f"KL virhe: {e}")
-                messagebox.showerror("Virhe", str(e))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def kl_shutdown(self):
-        try:
-            if self.kl_driver:
-                try:
-                    self.kl_driver.quit()
-                except Exception:
-                    pass
-                self.kl_driver = None
+            self.ui_log(f"VIRHE: {e}")
+            self.set_status("Virhe. Katso log.txt")
+            messagebox.showerror("Virhe", f"Tuli virhe.\nKatso log.txt:\n{LOG_PATH}\n\n{e}")
         finally:
-            if self.kl_proc:
+            if driver:
                 try:
-                    self.kl_proc.terminate()
+                    driver.quit()
                 except Exception:
                     pass
-                self.kl_proc = None
-        self.set_status("KL Chrome suljettu.")
 
     # =========================
     #   KL copy/paste -> files
@@ -873,16 +728,16 @@ class App(tk.Tk):
 
         if names:
             p1 = save_word_plain_lines(names, "yritysnimet_kauppalehti.docx")
-            self.ui_log(f"Tallennettu: {p1}")
             t1 = save_txt_lines(names, "yritysnimet_kauppalehti.txt")
-            self.ui_log(f"Tallennettu: {t1}")
             pdf1 = save_pdf_lines(names, "yritysnimet_kauppalehti.pdf", title="Yritysnimet (Kauppalehti)")
+            self.ui_log(f"Tallennettu: {p1}")
+            self.ui_log(f"Tallennettu: {t1}")
             self.ui_log(f"Tallennettu: {pdf1}")
 
         if yts:
             p2 = save_word_plain_lines(yts, "ytunnukset_kauppalehti.docx")
-            self.ui_log(f"Tallennettu: {p2}")
             t2 = save_txt_lines(yts, "ytunnukset_kauppalehti.txt")
+            self.ui_log(f"Tallennettu: {p2}")
             self.ui_log(f"Tallennettu: {t2}")
 
         combined = []
@@ -898,10 +753,7 @@ class App(tk.Tk):
         self.ui_log(f"Tallennettu: {pdf2}")
 
         self.set_status("Valmis (tiedostot luotu).")
-        messagebox.showinfo(
-            "Valmis",
-            f"Valmis!\n\nYritysnimiä: {len(names)}\nY-tunnuksia: {len(yts)}\n\nKansio:\n{OUT_DIR}"
-        )
+        messagebox.showinfo("Valmis", f"Valmis!\n\nNimiä: {len(names)}\nY-tunnuksia: {len(yts)}\n\nKansio:\n{OUT_DIR}")
 
     # =========================
     #   PDF -> YTJ
@@ -962,14 +814,6 @@ class App(tk.Tk):
                     driver.quit()
                 except Exception:
                     pass
-
-    def on_close(self):
-        # sulje KL Chrome jos auki
-        try:
-            self.kl_shutdown()
-        except Exception:
-            pass
-        self.destroy()
 
 
 if __name__ == "__main__":
