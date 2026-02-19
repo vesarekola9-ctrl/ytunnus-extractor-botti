@@ -7,6 +7,7 @@ import csv
 import random
 import threading
 import difflib
+import traceback
 import tkinter as tk
 from tkinter import messagebox, filedialog
 from tkinter import ttk
@@ -574,109 +575,110 @@ def safe_get(driver, url: str, throttle: Throttle, stop_evt, status_cb, max_atte
 
 
 # =========================
-#   YTJ: "OPEN ALL NÄYTÄ" (PDF-BOT STYLE) ✅
+#   YTJ: "OPEN ALL NÄYTÄ" (SHADOW DOM + FALLBACK) ✅
 # =========================
-def _js_click(driver, el) -> bool:
-    try:
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-        time.sleep(0.05)
-    except Exception:
-        pass
-    try:
-        el.click()
-        return True
-    except Exception:
-        pass
-    try:
-        driver.execute_script("arguments[0].click();", el)
-        return True
-    except Exception:
-        return False
-
-
-def _collect_nayta_buttons(driver):
+def ytj_open_all_nayta(driver, max_rounds=10):
     """
-    Kerää kaikki klikattavat elementit, joissa teksti täsmää 'Näytä'.
-    """
-    xps = [
-        "//button[normalize-space()='Näytä']",
-        "//a[normalize-space()='Näytä']",
-        "//*[@role='button' and normalize-space()='Näytä']",
-        "//*[self::div or self::span][@role='button' and normalize-space()='Näytä']",
-    ]
-    elems = []
-    for xp in xps:
-        try:
-            elems.extend(driver.find_elements(By.XPATH, xp))
-        except Exception:
-            continue
-
-    uniq = []
-    seen = set()
-    for e in elems:
-        try:
-            if not e.is_displayed() or not e.is_enabled():
-                continue
-            key = (id(e), e.get_attribute("outerHTML")[:120] if e.get_attribute("outerHTML") else id(e))
-            if key in seen:
-                continue
-            seen.add(key)
-            uniq.append(e)
-        except Exception:
-            continue
-
-    # järjestetään y-sijainnin mukaan: ylhäältä alas
-    def _y(el):
-        try:
-            return el.location_once_scrolled_into_view.get("y", 10**9)
-        except Exception:
-            try:
-                return el.location.get("y", 10**9)
-            except Exception:
-                return 10**9
-
-    uniq.sort(key=_y)
-    return uniq
-
-
-def ytj_open_all_nayta(driver, max_rounds=8):
-    """
-    Avaa kaikki 'Näytä' kohdat useassa kierroksessa.
-    Palauttaa (total_clicked, rounds_done)
+    Avaa kaikki 'Näytä' kohdat YTJ-sivulla.
+    - Klikkaa myös shadow DOMin sisältä löytyvät 'Näytä' (JS traversal)
+    - Fallback Selenium JS-click näkyville napeille
+    Palauttaa: (total_clicked, rounds_done)
     """
     total_clicked = 0
     rounds = 0
 
+    JS_CLICK_NAYTA_SHADOW = r"""
+    const txtEq = (el) => (el && el.textContent ? el.textContent.trim() : "") === "Näytä";
+
+    function clickEl(el) {
+      try { el.scrollIntoView({block:'center'}); } catch(e) {}
+      try { el.click(); return true; } catch(e) {}
+      try {
+        el.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window}));
+        return true;
+      } catch(e) {}
+      return false;
+    }
+
+    function walk(root) {
+      let clicked = 0;
+      const stack = [root];
+      const seen = new Set();
+
+      while (stack.length) {
+        const node = stack.pop();
+        if (!node || seen.has(node)) continue;
+        seen.add(node);
+
+        if (node.shadowRoot) stack.push(node.shadowRoot);
+
+        if (node.querySelectorAll) {
+          const candidates = node.querySelectorAll("button, a, [role='button'], div, span");
+          for (const el of candidates) {
+            if (!el) continue;
+            const r = el.getBoundingClientRect();
+            const visible = r.width > 0 && r.height > 0;
+            if (!visible) continue;
+            if (txtEq(el)) {
+              if (clickEl(el)) clicked++;
+            }
+          }
+        }
+
+        if (node.children && node.children.length) {
+          for (const ch of node.children) stack.push(ch);
+        }
+      }
+      return clicked;
+    }
+
+    return walk(document);
+    """
+
     for _ in range(max_rounds):
         rounds += 1
-        btns = _collect_nayta_buttons(driver)
-        if not btns:
-            break
 
-        clicked_this_round = 0
+        # 1) JS shadow click
+        try:
+            clicked_js = driver.execute_script(JS_CLICK_NAYTA_SHADOW) or 0
+        except Exception:
+            clicked_js = 0
 
-        for b in btns:
-            try:
-                # jos nappi on jo "kadonnut" tai muuttunut, skip
-                if not b.is_displayed() or not b.is_enabled():
+        # 2) Selenium fallback
+        clicked_sel = 0
+        try:
+            btns = driver.find_elements(
+                By.XPATH,
+                "//button[normalize-space()='Näytä']|//a[normalize-space()='Näytä']|//*[@role='button' and normalize-space()='Näytä']"
+            )
+            btns = [b for b in btns if b.is_displayed() and b.is_enabled()]
+
+            def _y(el):
+                try:
+                    return el.location.get("y", 10**9)
+                except Exception:
+                    return 10**9
+
+            btns.sort(key=_y)
+
+            for b in btns:
+                try:
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", b)
+                    driver.execute_script("arguments[0].click();", b)
+                    clicked_sel += 1
+                    time.sleep(0.10)
+                except Exception:
                     continue
-                if (b.text or "").strip().casefold() != "näytä":
-                    continue
+        except Exception:
+            pass
 
-                if _js_click(driver, b):
-                    clicked_this_round += 1
-                    total_clicked += 1
-                    time.sleep(0.12)
-            except StaleElementReferenceException:
-                continue
-            except Exception:
-                continue
+        clicked_this = int(clicked_js) + int(clicked_sel)
+        total_clicked += clicked_this
 
-        # jos ei klikattu mitään kierroksella, lopeta
-        if clicked_this_round == 0:
+        time.sleep(0.35)
+
+        if clicked_this == 0:
             break
-
-        time.sleep(0.25)
 
     return total_clicked, rounds
 
@@ -914,6 +916,9 @@ def fetch_emails_from_ytj_by_yts_and_names(
     cache = _load_cache()
     throttle = Throttle()
 
+    # TURVA: deadman timer (20min max)
+    hard_deadline = time.time() + 60 * 20
+
     master_rows = []  # [yritysnimi, yt, email, tag, status, source, ts]
     emails_out = []
     seen_emails = set()
@@ -936,8 +941,14 @@ def fetch_emails_from_ytj_by_yts_and_names(
 
     # 1) YT
     for yt in (yts or []):
+        if time.time() > hard_deadline:
+            status_cb("HÄTÄSTOP: maksimi ajoaika täynnä → STOP.")
+            stop_evt.set()
+            break
+
         if stop_evt.is_set():
             break
+
         done += 1
         progress_cb(done, total)
 
@@ -968,13 +979,13 @@ def fetch_emails_from_ytj_by_yts_and_names(
             log_cb(f"[FAIL YT] {yt} → (ei saatu ladattua)")
             continue
 
-        # ✅ PDF-tyylinen: avaa KAIKKI NÄYTÄ
-        clicked, rounds = ytj_open_all_nayta(driver, max_rounds=8)
+        # ✅ Avaa KAIKKI NÄYTÄ (shadow + fallback)
+        clicked, rounds = ytj_open_all_nayta(driver, max_rounds=10)
         log_cb(f"[YTJ] Näytä avattu: {clicked} (kierrokset {rounds})")
 
         email = extract_email_from_ytj_page(driver)
         if not email:
-            email = wait_email_appears(driver, timeout=7.5)
+            email = wait_email_appears(driver, timeout=8.0)
 
         if email:
             cache_put_yt(cache, yt, email, "", status="FOUND")
@@ -991,8 +1002,14 @@ def fetch_emails_from_ytj_by_yts_and_names(
 
     # 2) NAMES
     for nm in (names or []):
+        if time.time() > hard_deadline:
+            status_cb("HÄTÄSTOP: maksimi ajoaika täynnä → STOP.")
+            stop_evt.set()
+            break
+
         if stop_evt.is_set():
             break
+
         done += 1
         progress_cb(done, total)
 
@@ -1036,13 +1053,12 @@ def fetch_emails_from_ytj_by_yts_and_names(
                 log_cb(f"[LIVE NAME] {nm} ({yt_found}) → (ei saatu yrityssivua)")
                 continue
 
-        # ✅ PDF-tyylinen: avaa KAIKKI NÄYTÄ
-        clicked, rounds = ytj_open_all_nayta(driver, max_rounds=8)
+        clicked, rounds = ytj_open_all_nayta(driver, max_rounds=10)
         log_cb(f"[YTJ] Näytä avattu: {clicked} (kierrokset {rounds})")
 
         email = extract_email_from_ytj_page(driver)
         if not email:
-            email = wait_email_appears(driver, timeout=7.5)
+            email = wait_email_appears(driver, timeout=8.0)
 
         if email:
             tag = classify_email(email)
@@ -1111,7 +1127,12 @@ class App(tk.Tk):
 
         self.stop_evt = threading.Event()
 
-        self.title("ProtestiBotti ULTIMATE (YTJ Näytä: OPEN ALL)")
+        # TURVA: näppäimistö STOP aina
+        self.bind_all("<Escape>", lambda e: self.stop_now())
+        self.bind_all("<Control-Shift-Q>", lambda e: self.stop_now())
+        self.bind_all("<Control-Shift-S>", lambda e: self.stop_now())
+
+        self.title("ProtestiBotti ULTIMATE (YTJ Näytä: OPEN ALL + TURVA)")
         self.geometry("1100x940")
 
         root = ScrollableFrame(self)
@@ -1124,8 +1145,9 @@ class App(tk.Tk):
             text=(
                 "• KL copy/paste parser → yritysnimet + YT\n"
                 "• PDF → (nimet+YT) → YTJ\n"
-                "• YTJ: avaa KAIKKI 'Näytä' (PDF-botin tyyli)\n"
+                "• YTJ: avaa KAIKKI 'Näytä' (shadow DOM + fallback)\n"
                 "• master.csv statusriveillä\n"
+                "TURVA: ESC / Ctrl+Shift+Q pysäyttää aina + HÄTÄSTOP-ikkuna\n"
             ),
             justify="center"
         ).pack(pady=4)
@@ -1173,7 +1195,30 @@ class App(tk.Tk):
         self.listbox.configure(yscrollcommand=sb.set)
 
         tk.Label(self.ui, text=f"Tallennus: {OUT_DIR}\nCache: {CACHE_PATH}", wraplength=1020, justify="center").pack(pady=10)
+
+        # TURVA: HÄTÄSTOP-ikkuna aina päällä
+        self.create_panic_window()
+
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def create_panic_window(self):
+        w = tk.Toplevel(self)
+        w.title("STOP")
+        w.geometry("260x150+30+30")
+        w.attributes("-topmost", True)
+        w.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        tk.Label(w, text="HÄTÄSTOP", font=("Arial", 14, "bold")).pack(pady=10)
+        tk.Button(
+            w,
+            text="STOP (ESC / Ctrl+Shift+Q)",
+            font=("Arial", 11, "bold"),
+            fg="white",
+            bg="#aa0000",
+            command=self.stop_now
+        ).pack(pady=6)
+        tk.Label(w, text="Pysäyttää YTJ-loopin", font=("Arial", 9)).pack()
+        self._panic_win = w
 
     def ui_log(self, msg):
         line = log_to_file(msg)
@@ -1251,6 +1296,7 @@ class App(tk.Tk):
             self._run_fetch_ytj(yts, names)
         except Exception as e:
             self.ui_log(f"VIRHE: {e}")
+            self.ui_log(traceback.format_exc())
             messagebox.showerror("Virhe", str(e))
 
     def _run_fetch_ytj(self, yts, names):
@@ -1281,6 +1327,7 @@ class App(tk.Tk):
 
         except Exception as e:
             self.ui_log(f"VIRHE: {e}")
+            self.ui_log(traceback.format_exc())
             self.set_status("Virhe. Katso log.txt")
             messagebox.showerror("Virhe", f"{e}\n\nKatso log.txt:\n{LOG_PATH}")
         finally:
