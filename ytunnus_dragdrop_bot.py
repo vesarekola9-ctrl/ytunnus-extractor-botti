@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import time
+import json
 import threading
 import tkinter as tk
 from tkinter import messagebox, filedialog
@@ -39,7 +40,6 @@ BAD_CONTAINS = [
     "protestit", "protestia",
 ]
 
-
 # =========================
 #   PATHS / LOG
 # =========================
@@ -70,6 +70,11 @@ def get_output_dir():
 OUT_DIR = get_output_dir()
 LOG_PATH = os.path.join(OUT_DIR, "log.txt")
 
+# Cache pidetään pysyvästi samassa "ProtestiBotti" juurikansiossa (ei päiväkohtainen)
+CACHE_DIR = os.path.join(os.path.expanduser("~"), "Documents", "ProtestiBotti")
+os.makedirs(CACHE_DIR, exist_ok=True)
+CACHE_PATH = os.path.join(CACHE_DIR, "ytj_cache.json")
+
 
 def log_to_file(msg: str):
     ts = time.strftime("%H:%M:%S")
@@ -90,7 +95,89 @@ def reset_log():
         pass
     log_to_file(f"Output: {OUT_DIR}")
     log_to_file(f"Logi: {LOG_PATH}")
+    log_to_file(f"Cache: {CACHE_PATH}")
     log_to_file("PDF: sisäinen minipdf-writer (ei reportlabia)")
+
+
+# =========================
+#   CACHE (YTJ)
+# =========================
+def _load_cache():
+    try:
+        if os.path.exists(CACHE_PATH):
+            with open(CACHE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    data.setdefault("yt", {})
+                    data.setdefault("name", {})
+                    return data
+    except Exception:
+        pass
+    return {"yt": {}, "name": {}}
+
+
+def _save_cache(cache):
+    try:
+        tmp = CACHE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, CACHE_PATH)
+    except Exception:
+        pass
+
+
+def cache_get_by_yt(cache, yt: str):
+    yt = (yt or "").strip()
+    return cache.get("yt", {}).get(yt)
+
+
+def cache_put_yt(cache, yt: str, email: str, name: str = ""):
+    yt = (yt or "").strip()
+    if not yt:
+        return
+    cache.setdefault("yt", {})
+    cache["yt"][yt] = {
+        "email": (email or "").strip(),
+        "name": (name or "").strip(),
+        "ts": int(time.time()),
+    }
+
+
+def normalize_company_name(name: str) -> str:
+    """
+    Normalisoi yritysnimen cache-avaimeksi + matchaukseen:
+    - lower/casefold
+    - poista erikoismerkit/pisteet/ylimääräiset välit
+    - normalisoi yritysmuotoja kevyesti
+    """
+    s = (name or "").strip().casefold()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"[.,;:()\[\]{}\"'´`]", "", s)
+    s = s.replace("&", " and ")
+    s = re.sub(r"\s+", " ", s).strip()
+
+    # Normalisoi yleisiä yrityspäätteitä (ei täydellinen, mutta auttaa)
+    # esim "oy", "oyj", "ab", "ky", "tmi", "ry"
+    s = re.sub(r"\b(osakeyhtiö|osakeyhtio)\b", "oy", s)
+    return s
+
+
+def cache_get_by_name(cache, name: str):
+    key = normalize_company_name(name)
+    return cache.get("name", {}).get(key)
+
+
+def cache_put_name(cache, name: str, email: str, yt: str = ""):
+    key = normalize_company_name(name)
+    if not key:
+        return
+    cache.setdefault("name", {})
+    cache["name"][key] = {
+        "email": (email or "").strip(),
+        "yt": (yt or "").strip(),
+        "ts": int(time.time()),
+        "raw": (name or "").strip(),
+    }
 
 
 # =========================
@@ -137,7 +224,7 @@ def save_txt_lines(lines, filename):
 
 
 # =========================
-#   PDF WITHOUT REPORTLAB (pure python)
+#   PDF WITHOUT REPORTLAB
 # =========================
 def _pdf_escape_text(s: str) -> str:
     s = s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
@@ -257,7 +344,7 @@ def save_pdf_lines(lines, filename, title=None):
 
 
 # =========================
-#   SMART PARSER (copy/paste -> names + yts)
+#   PARSER
 # =========================
 def _is_money_line(s: str) -> bool:
     return bool(re.fullmatch(r"\d{1,3}(\s?\d{3})*\s?€", s.strip()))
@@ -366,9 +453,6 @@ def parse_names_and_yts_from_copied_text(raw: str):
 
 
 def parse_yts_only(raw: str):
-    """
-    UUSI: Poimii pelkät Y-tunnukset mistä tahansa tekstistä.
-    """
     yts = []
     seen = set()
     for m in YT_RE.findall(raw or ""):
@@ -379,9 +463,6 @@ def parse_yts_only(raw: str):
     return sorted(yts)
 
 
-# =========================
-#   PDF -> (names + yts)
-# =========================
 def extract_names_and_yts_from_pdf(pdf_path: str):
     text_all = ""
     with open(pdf_path, "rb") as f:
@@ -407,12 +488,159 @@ def wait_body(driver, timeout=25):
     WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
 
-def ytj_open_company_by_name(driver, name: str, status_cb):
-    status_cb(f"YTJ: haku nimellä: {name}")
+def extract_email_from_ytj_page(driver):
+    try:
+        for a in driver.find_elements(By.TAG_NAME, "a"):
+            href = (a.get_attribute("href") or "")
+            if href.lower().startswith("mailto:"):
+                return href.split(":", 1)[1].strip()
+    except Exception:
+        pass
+
+    try:
+        body = driver.find_element(By.TAG_NAME, "body").text or ""
+        return pick_email_from_text(body)
+    except Exception:
+        return ""
+
+
+def _candidate_container_text(a):
+    """
+    YTJ-hakutuloksissa linkki on usein kortissa/listassa.
+    Poimitaan ympäriltä tekstiä scorettamista varten.
+    """
+    try:
+        # yleiset: li/div/tr
+        for xp in ["ancestor::li[1]", "ancestor::div[1]", "ancestor::div[2]", "ancestor::tr[1]"]:
+            try:
+                c = a.find_element(By.XPATH, xp)
+                t = (c.text or "").strip()
+                if t:
+                    return t
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        return (a.text or "").strip()
+    except Exception:
+        return ""
+
+
+def _score_candidate(target_norm: str, cand_name: str, context_text: str):
+    cand_norm = normalize_company_name(cand_name)
+    ctx = (context_text or "").casefold()
+
+    score = 0
+
+    # name similarity
+    if cand_norm == target_norm and cand_norm:
+        score += 120
+    if cand_norm and target_norm and cand_norm in target_norm:
+        score += 60
+    if cand_norm and target_norm and target_norm in cand_norm:
+        score += 50
+
+    # token overlap
+    tset = set(target_norm.split())
+    cset = set(cand_norm.split())
+    if tset and cset:
+        inter = len(tset & cset)
+        score += min(40, inter * 8)
+
+    # business form bonuses if present in both
+    for suf in [" oy", " ab", " ky", " ay", " ry", " tmi", " oyj"]:
+        if suf.strip() in target_norm and suf.strip() in cand_norm:
+            score += 6
+
+    # status hints (best-effort)
+    if "aktiivinen" in ctx:
+        score += 8
+    if "konkurss" in ctx:
+        score -= 10
+    if "poistettu" in ctx or "lakan" in ctx:
+        score -= 8
+
+    return score
+
+
+def ytj_find_best_result_link(driver, company_name: str, status_cb):
+    """
+    SMART MATCH:
+    - hakee nimellä
+    - kerää /yritys/ linkit hakutuloksista
+    - scorettää ja valitsee parhaan
+    Palauttaa (yt, url) jos löytyy.
+    """
+    target_norm = normalize_company_name(company_name)
+    status_cb("YTJ: haetaan hakutulokset…")
+
+    # Odota että tuloksia renderöityy
+    end = time.time() + 12
+    links = []
+    while time.time() < end:
+        try:
+            links = driver.find_elements(By.XPATH, "//a[contains(@href,'/yritys/')]")
+            links = [a for a in links if (a.get_attribute("href") or "").count("/yritys/") >= 1]
+            if links:
+                break
+        except Exception:
+            pass
+        time.sleep(0.25)
+
+    if not links:
+        return ("", "")
+
+    best = None
+    best_score = -10**9
+
+    for a in links[:30]:
+        try:
+            href = a.get_attribute("href") or ""
+            if "/yritys/" not in href:
+                continue
+            txt = (a.text or "").strip()
+            ctx = _candidate_container_text(a)
+
+            # YTJ joskus näyttää nimen ympärillä, joskus linkin teksti on tyhjä -> ota rivistä eka "nimi" -rivi
+            cand_name = txt
+            if not cand_name:
+                # yritä ottaa ensimmäinen "nimi"-tyylinen rivi kontekstista
+                lines = [ln.strip() for ln in (ctx or "").splitlines() if ln.strip()]
+                cand_name = lines[0] if lines else ""
+
+            score = _score_candidate(target_norm, cand_name, ctx)
+
+            if score > best_score:
+                best_score = score
+                best = (href, cand_name, ctx)
+        except Exception:
+            continue
+
+    if not best:
+        return ("", "")
+
+    href, cand_name, ctx = best
+    # Poimi yt urlista jos muoto on /yritys/<YT>
+    yt = ""
+    m = re.search(r"/yritys/([^/?#]+)", href)
+    if m:
+        yt = m.group(1).strip()
+    status_cb(f"YTJ smart match: '{company_name}' → '{cand_name}' (score {best_score})")
+    return (yt, href)
+
+
+def ytj_open_company_by_name_smart(driver, company_name: str, status_cb):
+    """
+    Avaa yrityssivu nimellä smart matchilla.
+    Palauttaa (ok, yt_found).
+    """
+    status_cb(f"YTJ: haku nimellä: {company_name}")
     driver.get(YTJ_HOME)
     wait_body(driver, 25)
     time.sleep(0.4)
 
+    # etsi hakukenttä
     candidates = []
     for css in ["input[type='search']", "input[type='text']"]:
         try:
@@ -432,65 +660,59 @@ def ytj_open_company_by_name(driver, name: str, status_cb):
             continue
 
     if not search_input:
-        return False
+        return (False, "")
 
     try:
         search_input.clear()
     except Exception:
         pass
-    search_input.send_keys(name)
+    search_input.send_keys(company_name)
     search_input.send_keys(Keys.ENTER)
+
     time.sleep(1.2)
 
+    # jos suoraan yrityssivulle
     if "/yritys/" in (driver.current_url or ""):
-        return True
+        m = re.search(r"/yritys/([^/?#]+)", driver.current_url or "")
+        yt = m.group(1).strip() if m else ""
+        return (True, yt)
 
-    try:
-        links = driver.find_elements(By.XPATH, "//a[contains(@href,'/yritys/')]")
-    except Exception:
-        links = []
-
-    for a in links:
-        try:
-            if a.is_displayed():
-                a.click()
-                time.sleep(0.9)
-                if "/yritys/" in (driver.current_url or ""):
-                    return True
-        except Exception:
-            continue
-    return False
-
-
-def extract_email_from_ytj_page(driver):
-    try:
-        for a in driver.find_elements(By.TAG_NAME, "a"):
-            href = (a.get_attribute("href") or "")
-            if href.lower().startswith("mailto:"):
-                return href.split(":", 1)[1].strip()
-    except Exception:
-        pass
-
-    try:
-        body = driver.find_element(By.TAG_NAME, "body").text or ""
-        return pick_email_from_text(body)
-    except Exception:
-        return ""
+    yt, url = ytj_find_best_result_link(driver, company_name, status_cb)
+    if url:
+        driver.get(url)
+        time.sleep(0.9)
+        return ("/yritys/" in (driver.current_url or ""), yt)
+    return (False, "")
 
 
 def fetch_emails_from_ytj_by_yts_and_names(driver, yts, names, status_cb, progress_cb, log_cb, stop_evt):
+    cache = _load_cache()
+
     emails = []
-    seen = set()
+    seen_emails = set()
+
     total = len(yts) + len(names)
     progress_cb(0, max(1, total))
     done = 0
 
+    # --- 1) Y-tunnus reitti (cache ensin) ---
     for yt in yts:
         if stop_evt.is_set():
             break
         done += 1
-        status_cb(f"YTJ (Y-tunnus): {yt} ({done}/{total})")
         progress_cb(done, total)
+
+        yt = normalize_yt(yt) or yt
+        status_cb(f"YTJ (Y-tunnus): {yt} ({done}/{total})")
+
+        hit = cache_get_by_yt(cache, yt)
+        if hit and hit.get("email"):
+            email = hit["email"]
+            if email.lower() not in seen_emails:
+                seen_emails.add(email.lower())
+                emails.append(email)
+                log_cb(f"[CACHE YT] {yt} → {email}")
+            continue
 
         driver.get(YTJ_COMPANY_URL.format(yt))
         wait_body(driver, 25)
@@ -504,21 +726,51 @@ def fetch_emails_from_ytj_by_yts_and_names(driver, yts, names, status_cb, progre
             time.sleep(0.2)
 
         if email:
-            k = email.lower()
-            if k not in seen:
-                seen.add(k)
+            cache_put_yt(cache, yt, email)
+            _save_cache(cache)
+            if email.lower() not in seen_emails:
+                seen_emails.add(email.lower())
                 emails.append(email)
-                log_cb(email)
+                log_cb(f"[LIVE YT] {yt} → {email}")
+        else:
+            log_cb(f"[LIVE YT] {yt} → (ei sähköpostia)")
 
+    # --- 2) Nimi reitti (cache → smart match → cache) ---
     for nm in names:
         if stop_evt.is_set():
             break
         done += 1
         progress_cb(done, total)
 
-        ok = ytj_open_company_by_name(driver, nm, status_cb)
+        nm_clean = (nm or "").strip()
+        status_cb(f"YTJ (nimi): {nm_clean} ({done}/{total})")
+
+        hitn = cache_get_by_name(cache, nm_clean)
+        if hitn and hitn.get("email"):
+            email = hitn["email"]
+            if email.lower() not in seen_emails:
+                seen_emails.add(email.lower())
+                emails.append(email)
+                log_cb(f"[CACHE NAME] {nm_clean} → {email}")
+            continue
+
+        # jos cachessa on YT, käytä sitä suoraan
+        if hitn and hitn.get("yt"):
+            yt_cached = hitn["yt"]
+            hity = cache_get_by_yt(cache, yt_cached)
+            if hity and hity.get("email"):
+                email = hity["email"]
+                cache_put_name(cache, nm_clean, email, yt_cached)
+                _save_cache(cache)
+                if email.lower() not in seen_emails:
+                    seen_emails.add(email.lower())
+                    emails.append(email)
+                    log_cb(f"[CACHE NAME->YT] {nm_clean} ({yt_cached}) → {email}")
+                continue
+
+        ok, yt_found = ytj_open_company_by_name_smart(driver, nm_clean, status_cb)
         if not ok:
-            log_cb(f"YTJ: ei osumaa nimelle: {nm}")
+            log_cb(f"[LIVE NAME] ei osumaa: {nm_clean}")
             continue
 
         email = ""
@@ -529,11 +781,24 @@ def fetch_emails_from_ytj_by_yts_and_names(driver, yts, names, status_cb, progre
             time.sleep(0.2)
 
         if email:
-            k = email.lower()
-            if k not in seen:
-                seen.add(k)
+            # päivitä cacheen sekä nimi että yt (jos saatiin)
+            if yt_found:
+                yt_found = normalize_yt(yt_found) or yt_found
+                cache_put_yt(cache, yt_found, email, nm_clean)
+            cache_put_name(cache, nm_clean, email, yt_found)
+            _save_cache(cache)
+
+            if email.lower() not in seen_emails:
+                seen_emails.add(email.lower())
                 emails.append(email)
-                log_cb(email)
+            log_cb(f"[LIVE NAME] {nm_clean} ({yt_found or 'yt?'}) → {email}")
+        else:
+            # tallenna ainakin yt/name jotta seuraava kierros voi käyttää suoraa yt:tä jos löytyy myöhemmin
+            cache_put_name(cache, nm_clean, "", yt_found)
+            if yt_found:
+                cache_put_yt(cache, yt_found, "", nm_clean)
+            _save_cache(cache)
+            log_cb(f"[LIVE NAME] {nm_clean} ({yt_found or 'yt?'}) → (ei sähköpostia)")
 
     return emails
 
@@ -547,26 +812,23 @@ class App(tk.Tk):
         reset_log()
         self.stop_evt = threading.Event()
 
-        self.title("ProtestiBotti (YT-only flow + KL + PDF→YTJ)")
+        self.title("ProtestiBotti v2 (CACHE + Smart YTJ Match)")
         self.geometry("1120x960")
 
-        tk.Label(self, text="ProtestiBotti", font=("Arial", 18, "bold")).pack(pady=8)
+        tk.Label(self, text="ProtestiBotti v2", font=("Arial", 18, "bold")).pack(pady=8)
         tk.Label(
             self,
-            text="Nopein tapa:\n"
-                 "1) Avaa KL nuolilla (Console extractYTs)\n"
-                 "2) Kopioi Y-tunnukset ja liitä alle\n"
-                 "3) Paina 'Tallenna + Hae YTJ sähköpostit'\n",
+            text="Uutta:\n• Cache (ytj_cache.json): nopeuttaa ja vähentää virheitä\n• Smart YTJ Match: nimihaku valitsee parhaan osuman\n",
             justify="center"
         ).pack(pady=4)
 
-        # ---------- NEW: YT-only ----------
+        # ---------- YT-only ----------
         box_yt = tk.LabelFrame(self, text="NOPEA: Liitä Y-tunnuslista → tallenna + hae YTJ sähköpostit", padx=10, pady=10)
         box_yt.pack(fill="x", padx=12, pady=10)
 
         tk.Label(
             box_yt,
-            text="Liitä tähän pelkät Y-tunnukset (yksi per rivi). Muoto voi olla 1234567-8 tai 12345678.",
+            text="Liitä tähän Y-tunnukset (yksi per rivi). Muoto voi olla 1234567-8 tai 12345678.",
             justify="left"
         ).pack(anchor="w")
 
@@ -626,7 +888,7 @@ class App(tk.Tk):
         sb.pack(side="right", fill="y")
         self.listbox.configure(yscrollcommand=sb.set)
 
-        tk.Label(self, text=f"Tallennus: {OUT_DIR}", wraplength=1080, justify="center").pack(pady=6)
+        tk.Label(self, text=f"Tallennus: {OUT_DIR}\nCache: {CACHE_PATH}", wraplength=1080, justify="center").pack(pady=6)
 
     def ui_log(self, msg):
         line = log_to_file(msg)
@@ -645,7 +907,7 @@ class App(tk.Tk):
         self.update_idletasks()
 
     # =========================
-    #   NEW: YT-only actions
+    #   YT-only actions
     # =========================
     def _read_yts_from_box(self):
         raw = self.yt_text.get("1.0", tk.END)
@@ -674,16 +936,13 @@ class App(tk.Tk):
             messagebox.showwarning("Ei löytynyt", "Liitä Y-tunnukset ensin.")
             return
 
-        # save first
         self.save_yts_only()
-
-        # then fetch emails
         threading.Thread(target=self._run_fetch_emails_yts_only, args=(yts,), daemon=True).start()
 
     def _run_fetch_emails_yts_only(self, yts):
         driver = None
         try:
-            self.set_status("Käynnistetään Chrome ja haetaan sähköpostit YTJ:stä (Y-tunnuksilla)…")
+            self.set_status("Käynnistetään Chrome ja haetaan sähköpostit YTJ:stä (CACHE + YT)…")
             driver = start_new_driver()
 
             emails = fetch_emails_from_ytj_by_yts_and_names(
@@ -775,14 +1034,7 @@ class App(tk.Tk):
                 messagebox.showwarning("Ei löytynyt", "PDF:stä ei löytynyt nimiä tai Y-tunnuksia.")
                 return
 
-            if names:
-                p1 = save_word_plain_lines(names, "pdf_poimitut_yritysnimet.docx")
-                self.ui_log(f"Tallennettu: {p1}")
-            if yts:
-                p2 = save_word_plain_lines(yts, "pdf_poimitut_ytunnukset.docx")
-                self.ui_log(f"Tallennettu: {p2}")
-
-            self.set_status("Käynnistetään Chrome ja haetaan sähköpostit YTJ:stä…")
+            self.set_status("Käynnistetään Chrome ja haetaan sähköpostit YTJ:stä (CACHE + Smart Match)…")
             driver = start_new_driver()
 
             emails = fetch_emails_from_ytj_by_yts_and_names(
