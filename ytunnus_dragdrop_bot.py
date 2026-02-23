@@ -575,58 +575,72 @@ def safe_get(driver, url: str, throttle: Throttle, stop_evt, status_cb, max_atte
 
 
 # =========================
-#   YTJ: "OPEN ALL NÄYTÄ" (SHADOW DOM + FALLBACK) ✅
+#   YTJ: "OPEN ALL NÄYTÄ" (FIXED: contains + aria-label/title + shadow DOM) ✅
 # =========================
-def ytj_open_all_nayta(driver, max_rounds=10):
+def ytj_open_all_nayta(driver, max_rounds=12):
     """
-    Avaa kaikki 'Näytä' kohdat YTJ-sivulla.
-    - Klikkaa myös shadow DOMin sisältä löytyvät 'Näytä' (JS traversal)
-    - Fallback Selenium JS-click näkyville napeille
-    Palauttaa: (total_clicked, rounds_done)
+    Avaa kaikki YTJ-sivun 'Näytä...' kohdat.
+    Robust:
+    - toimii myös jos nappi on shadow DOMissa
+    - toimii jos teksti on "Näytä yhteystiedot" / "Näytä tiedot" jne.
+    - toimii myös jos nappi on ikoninen ja 'Näytä' löytyy aria-label/title -attribuuteista
+    Palauttaa (total_clicked, rounds_done)
     """
     total_clicked = 0
     rounds = 0
 
-    JS_CLICK_NAYTA_SHADOW = r"""
-    const txtEq = (el) => (el && el.textContent ? el.textContent.trim() : "") === "Näytä";
-
-    function clickEl(el) {
-      try { el.scrollIntoView({block:'center'}); } catch(e) {}
-      try { el.click(); return true; } catch(e) {}
-      try {
-        el.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window}));
+    JS_CLICK_SHADOW = r"""
+    function norm(s){ return (s||"").replace(/\s+/g," ").trim(); }
+    function isVisible(el){
+      if(!el) return false;
+      const r = el.getBoundingClientRect();
+      return r.width>0 && r.height>0;
+    }
+    function hasNayta(el){
+      const t = norm(el.textContent || "");
+      const al = norm(el.getAttribute("aria-label") || "");
+      const ti = norm(el.getAttribute("title") || "");
+      const low = (t + " " + al + " " + ti).toLowerCase();
+      // hyväksytään "näytä" missä tahansa, mutta pitää olla sana alku tai sisältää
+      return low.includes("näytä");
+    }
+    function clickEl(el){
+      try{ el.scrollIntoView({block:"center"}); }catch(e){}
+      try{ el.click(); return true; }catch(e){}
+      try{
+        el.dispatchEvent(new MouseEvent("mousedown",{bubbles:true,cancelable:true,view:window}));
+        el.dispatchEvent(new MouseEvent("mouseup",{bubbles:true,cancelable:true,view:window}));
+        el.dispatchEvent(new MouseEvent("click",{bubbles:true,cancelable:true,view:window}));
         return true;
-      } catch(e) {}
+      }catch(e){}
       return false;
     }
 
-    function walk(root) {
+    function walk(root){
       let clicked = 0;
       const stack = [root];
       const seen = new Set();
 
-      while (stack.length) {
+      while(stack.length){
         const node = stack.pop();
-        if (!node || seen.has(node)) continue;
+        if(!node || seen.has(node)) continue;
         seen.add(node);
 
-        if (node.shadowRoot) stack.push(node.shadowRoot);
+        if(node.shadowRoot) stack.push(node.shadowRoot);
 
-        if (node.querySelectorAll) {
-          const candidates = node.querySelectorAll("button, a, [role='button'], div, span");
-          for (const el of candidates) {
-            if (!el) continue;
-            const r = el.getBoundingClientRect();
-            const visible = r.width > 0 && r.height > 0;
-            if (!visible) continue;
-            if (txtEq(el)) {
-              if (clickEl(el)) clicked++;
+        if(node.querySelectorAll){
+          const candidates = node.querySelectorAll("button, a, [role='button'], [aria-label], [title]");
+          for(const el of candidates){
+            if(!el) continue;
+            if(!isVisible(el)) continue;
+            if(hasNayta(el)){
+              if(clickEl(el)) clicked++;
             }
           }
         }
 
-        if (node.children && node.children.length) {
-          for (const ch of node.children) stack.push(ch);
+        if(node.children && node.children.length){
+          for(const ch of node.children) stack.push(ch);
         }
       }
       return clicked;
@@ -638,28 +652,24 @@ def ytj_open_all_nayta(driver, max_rounds=10):
     for _ in range(max_rounds):
         rounds += 1
 
-        # 1) JS shadow click
+        # 1) JS traversal (shadow + DOM)
         try:
-            clicked_js = driver.execute_script(JS_CLICK_NAYTA_SHADOW) or 0
+            clicked_js = int(driver.execute_script(JS_CLICK_SHADOW) or 0)
         except Exception:
             clicked_js = 0
 
-        # 2) Selenium fallback
+        # 2) Selenium fallback (contains Näytä OR aria-label/title contains Näytä)
         clicked_sel = 0
         try:
             btns = driver.find_elements(
                 By.XPATH,
-                "//button[normalize-space()='Näytä']|//a[normalize-space()='Näytä']|//*[@role='button' and normalize-space()='Näytä']"
+                "//*[(self::button or self::a or @role='button') and "
+                "(contains(normalize-space(.), 'Näytä') or contains(normalize-space(.), 'näytä') or "
+                " contains(@aria-label, 'Näytä') or contains(@aria-label, 'näytä') or "
+                " contains(@title, 'Näytä') or contains(@title, 'näytä'))]"
             )
             btns = [b for b in btns if b.is_displayed() and b.is_enabled()]
-
-            def _y(el):
-                try:
-                    return el.location.get("y", 10**9)
-                except Exception:
-                    return 10**9
-
-            btns.sort(key=_y)
+            btns.sort(key=lambda el: (el.location.get("y", 10**9), el.location.get("x", 10**9)))
 
             for b in btns:
                 try:
@@ -672,10 +682,11 @@ def ytj_open_all_nayta(driver, max_rounds=10):
         except Exception:
             pass
 
-        clicked_this = int(clicked_js) + int(clicked_sel)
+        clicked_this = clicked_js + clicked_sel
         total_clicked += clicked_this
 
-        time.sleep(0.35)
+        # anna aikaa renderöidä
+        time.sleep(0.45)
 
         if clicked_this == 0:
             break
@@ -701,7 +712,7 @@ def extract_email_from_ytj_page(driver):
         return ""
 
 
-def wait_email_appears(driver, timeout=7.0) -> str:
+def wait_email_appears(driver, timeout=10.0) -> str:
     end = time.time() + timeout
     last = ""
     while time.time() < end:
@@ -916,7 +927,7 @@ def fetch_emails_from_ytj_by_yts_and_names(
     cache = _load_cache()
     throttle = Throttle()
 
-    # TURVA: deadman timer (20min max)
+    # TURVA: deadman timer (20 min)
     hard_deadline = time.time() + 60 * 20
 
     master_rows = []  # [yritysnimi, yt, email, tag, status, source, ts]
@@ -979,13 +990,12 @@ def fetch_emails_from_ytj_by_yts_and_names(
             log_cb(f"[FAIL YT] {yt} → (ei saatu ladattua)")
             continue
 
-        # ✅ Avaa KAIKKI NÄYTÄ (shadow + fallback)
-        clicked, rounds = ytj_open_all_nayta(driver, max_rounds=10)
+        clicked, rounds = ytj_open_all_nayta(driver, max_rounds=12)
         log_cb(f"[YTJ] Näytä avattu: {clicked} (kierrokset {rounds})")
 
         email = extract_email_from_ytj_page(driver)
         if not email:
-            email = wait_email_appears(driver, timeout=8.0)
+            email = wait_email_appears(driver, timeout=10.0)
 
         if email:
             cache_put_yt(cache, yt, email, "", status="FOUND")
@@ -1053,12 +1063,12 @@ def fetch_emails_from_ytj_by_yts_and_names(
                 log_cb(f"[LIVE NAME] {nm} ({yt_found}) → (ei saatu yrityssivua)")
                 continue
 
-        clicked, rounds = ytj_open_all_nayta(driver, max_rounds=10)
+        clicked, rounds = ytj_open_all_nayta(driver, max_rounds=12)
         log_cb(f"[YTJ] Näytä avattu: {clicked} (kierrokset {rounds})")
 
         email = extract_email_from_ytj_page(driver)
         if not email:
-            email = wait_email_appears(driver, timeout=8.0)
+            email = wait_email_appears(driver, timeout=10.0)
 
         if email:
             tag = classify_email(email)
@@ -1132,7 +1142,7 @@ class App(tk.Tk):
         self.bind_all("<Control-Shift-Q>", lambda e: self.stop_now())
         self.bind_all("<Control-Shift-S>", lambda e: self.stop_now())
 
-        self.title("ProtestiBotti ULTIMATE (YTJ Näytä: OPEN ALL + TURVA)")
+        self.title("ProtestiBotti ULTIMATE (YTJ Näytä: FIXED + TURVA)")
         self.geometry("1100x940")
 
         root = ScrollableFrame(self)
@@ -1145,9 +1155,9 @@ class App(tk.Tk):
             text=(
                 "• KL copy/paste parser → yritysnimet + YT\n"
                 "• PDF → (nimet+YT) → YTJ\n"
-                "• YTJ: avaa KAIKKI 'Näytä' (shadow DOM + fallback)\n"
+                "• YTJ: avaa KAIKKI 'Näytä...' (teksti+aria-label+title + shadow DOM)\n"
                 "• master.csv statusriveillä\n"
-                "TURVA: ESC / Ctrl+Shift+Q pysäyttää aina + HÄTÄSTOP-ikkuna\n"
+                "TURVA: ESC / Ctrl+Shift+Q pysäyttää aina + HÄTÄSTOP-ikkuna + 20min deadman\n"
             ),
             justify="center"
         ).pack(pady=4)
@@ -1196,7 +1206,7 @@ class App(tk.Tk):
 
         tk.Label(self.ui, text=f"Tallennus: {OUT_DIR}\nCache: {CACHE_PATH}", wraplength=1020, justify="center").pack(pady=10)
 
-        # TURVA: HÄTÄSTOP-ikkuna aina päällä
+        # TURVA: HÄTÄSTOP-ikkuna
         self.create_panic_window()
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
