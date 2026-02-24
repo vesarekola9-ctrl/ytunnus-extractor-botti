@@ -25,7 +25,6 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      # TÄRKEÄ: käytä cmd:tä, koska ^ jatkorivi toimii vain cmd:ssä
       - name: Build EXE (PyInstaller)
         shell: cmd
         run: |
