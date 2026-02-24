@@ -3,12 +3,14 @@ name: Build exe
 on:
   push:
     branches: ["main"]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-latest
+
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -22,12 +24,24 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Build .exe
+      - name: Build EXE (PyInstaller)
         run: |
-          pyinstaller --onefile --windowed ytunnus_dragdrop_bot.py
+          pyinstaller --noconfirm --clean --onefile --windowed ^
+            --collect-all selenium ^
+            --collect-all webdriver_manager ^
+            ytunnus_dragdrop_bot.py
+
+      - name: SHA256
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash dist\ytunnus_dragdrop_bot.exe -Algorithm SHA256).Hash
+          "SHA256:$hash"
+          $hash | Out-File -Encoding ascii dist\ytunnus_dragdrop_bot.exe.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ytunnus-exe
-          path: dist/ytunnus_dragdrop_bot.exe
+          path: |
+            dist/ytunnus_dragdrop_bot.exe
+            dist/ytunnus_dragdrop_bot.exe.sha256
