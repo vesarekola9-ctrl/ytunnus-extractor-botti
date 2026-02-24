@@ -1,4 +1,6 @@
 PyPDF2
 python-docx
+openpyxl
+tkinterdnd2
 selenium
 webdriver-manager
