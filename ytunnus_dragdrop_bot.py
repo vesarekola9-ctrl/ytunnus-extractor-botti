@@ -12,6 +12,7 @@ import queue
 import PyPDF2
 from docx import Document
 
+# Selenium / webdriver
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
@@ -23,9 +24,11 @@ from selenium.common.exceptions import (
     TimeoutException,
     ElementClickInterceptedException,
 )
-from webdriver_manager.chrome import ChromeDriverManager
 
-import selenium.webdriver.chrome.options
+# Force PyInstaller to see chrome options submodule (prevents missing module in EXE)
+import selenium.webdriver.chrome.options  # noqa: F401
+
+from webdriver_manager.chrome import ChromeDriverManager
 
 
 # =========================
@@ -47,7 +50,7 @@ CHROME_PROFILE_DIR = r"C:\chrome-botti"
 
 
 # =========================
-#   PATHS
+#   PATHS / LOG
 # =========================
 def get_exe_dir():
     if getattr(sys, "frozen", False):
@@ -115,20 +118,14 @@ def normalize_email_obfuscated(s: str) -> str:
         return ""
     x = s.strip()
 
-    # normalize common obfuscations before whitespace removal
     x = x.replace("[at]", "@").replace("[AT]", "@")
     x = x.replace("{at}", "@").replace("{AT}", "@")
     x = x.replace("(at)", "@").replace("(AT)", "@")
     x = x.replace("(a)", "@").replace("(A)", "@")
     x = x.replace("(ät)", "@").replace("ät", "@")
 
-    # " at " patterns (keep safer)
     x = re.sub(r"\s+at\s+", "@", x, flags=re.I)
-
-    # remove all whitespace
     x = re.sub(r"\s+", "", x)
-
-    # handle "nameatdomain.fi" (only if it matches whole)
     x = re.sub(r"^([A-Za-z0-9_.+-]+)at([A-Za-z0-9-]+\.[A-Za-z0-9-.]+)$", r"\1@\2", x, flags=re.I)
     return x
 
@@ -144,12 +141,10 @@ def pick_email_from_text(text: str) -> str:
     if m2:
         return normalize_email_obfuscated(m2.group(0))
 
-    # normalize whole chunk and search again
     t2 = normalize_email_obfuscated(text)
     m3 = EMAIL_RE.search(t2)
     if m3:
         return m3.group(0).strip()
-
     return ""
 
 
@@ -184,9 +179,6 @@ def safe_click(driver, elem) -> bool:
 
 
 def wait_dom_settle(driver, max_wait=2.5):
-    """
-    SPA settle: wait for readyState complete + small delay.
-    """
     end = time.time() + max_wait
     while time.time() < end:
         try:
@@ -200,20 +192,13 @@ def wait_dom_settle(driver, max_wait=2.5):
 
 
 # =========================
-#   Cookie consent (SAFER)
+#   COOKIE CONSENT (SAFER)
 # =========================
 def try_accept_cookies(driver):
-    """
-    Safer consent accept:
-    1) try to find banner/dialog containing cookie/eväste/consent terms
-    2) click accept within that container only
-    3) fallback to minimal global scan (very limited)
-    """
     accept_texts = ["hyväksy", "hyväksy kaikki", "salli kaikki", "accept", "accept all", "i agree", "ok", "selvä"]
-    container_terms = ["eväste", "cookie", "consent", "käyttöehdot", "privacy", "tietosuoja"]
+    container_terms = ["eväste", "cookie", "consent", "privacy", "tietosuoja"]
 
     def click_accept_within(container):
-        btns = []
         try:
             btns = container.find_elements(By.XPATH, ".//button|.//a|.//*[@role='button']")
         except Exception:
@@ -233,7 +218,6 @@ def try_accept_cookies(driver):
                 continue
         return False
 
-    # 1) dialog-like containers first
     containers = []
     for xp in [
         "//*[@role='dialog']",
@@ -245,7 +229,6 @@ def try_accept_cookies(driver):
         except Exception:
             pass
 
-    # filter containers by text
     cand = []
     for c in containers:
         try:
@@ -259,29 +242,27 @@ def try_accept_cookies(driver):
         except Exception:
             continue
 
-    # try click accept in best containers first (shorter text tends to be banners)
     cand.sort(key=lambda e: len((e.text or "")))
     for c in cand[:8]:
         if click_accept_within(c):
             return
 
-    # 2) minimal fallback: only look for very explicit accept buttons
-    for _ in range(2):
+    # minimal fallback
+    try:
+        elems = driver.find_elements(By.XPATH, "//button|//a|//*[@role='button']")
+    except Exception:
+        elems = []
+    for e in elems:
         try:
-            elems = driver.find_elements(By.XPATH, "//button|//a|//*[@role='button']")
-        except Exception:
-            elems = []
-        for e in elems:
-            try:
-                if not e.is_displayed() or not e.is_enabled():
-                    continue
-                t = (e.text or "").strip().lower()
-                if t in ["hyväksy kaikki", "accept all", "salli kaikki"]:
-                    if safe_click(driver, e):
-                        time.sleep(0.2)
-                        return
-            except Exception:
+            if not e.is_displayed() or not e.is_enabled():
                 continue
+            t = (e.text or "").strip().lower()
+            if t in ["hyväksy kaikki", "accept all", "salli kaikki"]:
+                if safe_click(driver, e):
+                    time.sleep(0.2)
+                    return
+        except Exception:
+            continue
 
 
 # =========================
@@ -342,8 +323,6 @@ def start_new_driver():
     options.add_argument("--start-maximized")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-dev-shm-usage")
-
-    # Keep webdriver_manager for your setup; it's fine but can mismatch sometimes.
     driver_path = ChromeDriverManager().install()
     return webdriver.Chrome(service=Service(driver_path), options=options)
 
@@ -351,7 +330,6 @@ def start_new_driver():
 def attach_to_existing_chrome():
     options = webdriver.ChromeOptions()
     options.add_experimental_option("debuggerAddress", f"127.0.0.1:{CHROME_DEBUG_PORT}")
-
     driver_path = ChromeDriverManager().install()
     return webdriver.Chrome(service=Service(driver_path), options=options)
 
@@ -359,17 +337,6 @@ def attach_to_existing_chrome():
 def open_new_tab(driver, url="about:blank"):
     driver.execute_script("window.open(arguments[0], '_blank');", url)
     driver.switch_to.window(driver.window_handles[-1])
-
-
-def list_tabs(driver):
-    tabs = []
-    for h in driver.window_handles:
-        try:
-            driver.switch_to.window(h)
-            tabs.append((driver.title or "", driver.current_url or ""))
-        except Exception:
-            tabs.append(("", ""))
-    return tabs
 
 
 def focus_protestilista_tab(driver) -> bool:
@@ -413,10 +380,7 @@ def page_looks_like_protestilista(driver) -> bool:
 def page_looks_like_login_or_paywall(driver) -> bool:
     try:
         text = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
-        bad_words = [
-            "kirjaudu", "tilaa", "tilaajille", "vahvista henkilöllisyytesi",
-            "sign in", "subscribe", "login"
-        ]
+        bad_words = ["kirjaudu", "tilaa", "tilaajille", "sign in", "subscribe", "login"]
         return any(w in text for w in bad_words)
     except Exception:
         return False
@@ -448,8 +412,7 @@ def ensure_protestilista_open_and_ready(driver, status_cb, log_cb, max_wait_seco
         if page_looks_like_login_or_paywall(driver) and not warned:
             warned = True
             status_cb("Kauppalehti vaatii kirjautumisen/tilaajanäkymän. Kirjaudu Chrome-bottiin.")
-            log_cb("AUTOFIX: waiting for user to login / unlock paywall…")
-            status_cb("Kirjaudu Kauppalehteen AUKI OLEVAAN Chrome-bottiin ja palaa tähän.")
+            log_cb("AUTOFIX: waiting login…")
 
         if time.time() - start > max_wait_seconds:
             status_cb("Aikakatkaisu: protestilista ei tullut näkyviin. Tarkista kirjautuminen.")
@@ -459,9 +422,6 @@ def ensure_protestilista_open_and_ready(driver, status_cb, log_cb, max_wait_seco
         time.sleep(2)
 
 
-# =========================
-#   KAUPPALEHTI SCRAPE
-# =========================
 def click_nayta_lisaa(driver) -> bool:
     try:
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
@@ -488,7 +448,6 @@ def get_visible_toggles(driver):
         try:
             if not e.is_displayed():
                 continue
-            # avoid header thead
             try:
                 e.find_element(By.XPATH, "ancestor::thead")
                 continue
@@ -516,7 +475,6 @@ def wait_toggle_state(toggle, want_true: bool, timeout=2.5):
 
 
 def extract_yt_near_toggle(toggle):
-    # nearest following rows first
     try:
         tr = toggle.find_element(By.XPATH, "ancestor::tr[1]")
         for k in range(1, 6):
@@ -533,7 +491,6 @@ def extract_yt_near_toggle(toggle):
     except Exception:
         pass
 
-    # fallback wider container
     for xp in ["ancestor::tbody[1]", "ancestor::table[1]", "ancestor::div[2]", "ancestor::div[3]"]:
         try:
             c = toggle.find_element(By.XPATH, xp)
@@ -557,13 +514,13 @@ def collect_yts_from_kauppalehti(driver, status_cb, log_cb):
         return []
 
     collected = set()
+    rounds_without_new = 0
     time.sleep(1.0)
 
-    rounds_without_new = 0
     while True:
         toggles = get_visible_toggles(driver)
         if not toggles:
-            status_cb("Kauppalehti: en löydä toggle-nuolia (aria-expanded).")
+            status_cb("Kauppalehti: en löydä toggle-nuolia.")
             log_cb("ERROR: no toggles found")
             break
 
@@ -593,7 +550,6 @@ def collect_yts_from_kauppalehti(driver, status_cb, log_cb):
                     new_in_pass += 1
                     log_cb(f"+ {yt} (yht {len(collected)})")
 
-                # close
                 try:
                     safe_click(driver, t)
                     wait_toggle_state(t, want_true=False, timeout=1.2)
@@ -672,7 +628,6 @@ def _expand_contact_sections_ytj(driver, log_cb=None):
             except Exception:
                 continue
 
-        # dedup
         uniq = []
         seen = set()
         for e in filtered:
@@ -705,15 +660,13 @@ def _expand_contact_sections_ytj(driver, log_cb=None):
 
 
 def _find_contact_container(driver):
-    """
-    Try to locate a container that likely holds contact details.
-    We use it to limit generic "Näytä" clicks.
-    """
     terms = ["yhteystied", "asiointi", "contact", "kontakt"]
-    # find headings/labels and return a reasonable ancestor container
     for term in terms:
         try:
-            anchors = driver.find_elements(By.XPATH, f"//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÅ','abcdefghijklmnopqrstuvwxyzäöå'), '{term}')]")
+            anchors = driver.find_elements(
+                By.XPATH,
+                f"//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÅ','abcdefghijklmnopqrstuvwxyzäöå'), '{term}')]"
+            )
         except Exception:
             anchors = []
         for a in anchors[:8]:
@@ -746,11 +699,6 @@ def _find_email_row_show_button(driver):
         for e in elems:
             try:
                 if e.is_displayed() and e.is_enabled():
-                    # ensure it really says Näytä if possible
-                    t = (e.text or "").strip()
-                    if t and "näytä" not in t.lower():
-                        # might be wrong next sibling button; allow but lower priority
-                        pass
                     return e
             except Exception:
                 continue
@@ -782,11 +730,6 @@ def _find_visible_nayta_candidates_in_scope(scope_elem):
 
 
 def click_all_nayta_ytj(driver, log_cb=None):
-    """
-    1) expand contact sections
-    2) click email-row "Näytä" first (high value)
-    3) only if needed: click remaining "Näytä" inside contact container (NOT whole page)
-    """
     total_clicked = 0
 
     try:
@@ -797,7 +740,6 @@ def click_all_nayta_ytj(driver, log_cb=None):
     try_accept_cookies(driver)
     wait_dom_settle(driver, 1.0)
 
-    # 1) email-row show button
     btn = _find_email_row_show_button(driver)
     if btn:
         try:
@@ -809,12 +751,10 @@ def click_all_nayta_ytj(driver, log_cb=None):
         except Exception:
             pass
 
-    # 2) scope-limited generic "Näytä"
     scope = _find_contact_container(driver)
     if not scope:
-        # if we can't find a contact container, do NOT spam whole page
         if log_cb:
-            log_cb("YTJ: contact-container ei löytynyt -> skipataan massaklikkaus (turvallisuus)")
+            log_cb("YTJ: contact-container ei löytynyt -> skipataan massaklikkaus")
         return total_clicked
 
     for round_idx in range(1, 6):
@@ -823,7 +763,6 @@ def click_all_nayta_ytj(driver, log_cb=None):
 
         candidates = _find_visible_nayta_candidates_in_scope(scope)
 
-        # dedup
         unique = []
         seen = set()
         for c in candidates:
@@ -861,7 +800,6 @@ def click_all_nayta_ytj(driver, log_cb=None):
 
 
 def extract_email_from_ytj(driver):
-    # 1) mailto
     try:
         for a in driver.find_elements(By.TAG_NAME, "a"):
             href = (a.get_attribute("href") or "")
@@ -870,7 +808,6 @@ def extract_email_from_ytj(driver):
     except Exception:
         pass
 
-    # 2) anything containing "Sähköposti"
     try:
         candidates = driver.find_elements(By.XPATH, "//*[contains(normalize-space(.), 'Sähköposti')]")
         for c in candidates:
@@ -880,7 +817,6 @@ def extract_email_from_ytj(driver):
     except Exception:
         pass
 
-    # 3) whole page
     try:
         body = driver.find_element(By.TAG_NAME, "body").text or ""
         return pick_email_from_text(body)
@@ -902,7 +838,7 @@ def fetch_emails_from_ytj(driver, yt_list, status_cb, progress_cb, log_cb):
         try:
             wait_ytj_loaded(driver)
         except TimeoutException:
-            log_cb("YTJ: timeout ladatessa, yritän silti klikata/poimia…")
+            log_cb("YTJ: timeout ladatessa, yritän silti…")
 
         try_accept_cookies(driver)
 
@@ -957,10 +893,10 @@ class App(tk.Tk):
         self._running_lock = threading.Lock()
         self._is_running = False
 
-        self.title("ProtestiBotti (FULL FIX)")
+        self.title("YTunnus extractor botti (FULL FIX)")
         self.geometry("980x620")
 
-        tk.Label(self, text="ProtestiBotti", font=("Arial", 18, "bold")).pack(pady=10)
+        tk.Label(self, text="YTunnus Extractor", font=("Arial", 18, "bold")).pack(pady=10)
         tk.Label(
             self,
             text="Moodit:\n1) Kauppalehti (Chrome debug 9222) → Y-tunnukset → YTJ sähköpostit\n2) PDF → Y-tunnukset → YTJ sähköpostit",
@@ -998,10 +934,8 @@ class App(tk.Tk):
 
         tk.Label(self, text=f"Tallennus: {OUT_DIR}", wraplength=960, justify="center").pack(pady=6)
 
-        # UI queue poller
         self.after(50, self._drain_ui_queue)
 
-    # ---------- thread-safe UI API ----------
     def _post(self, kind, *args):
         self._uiq.put((kind, args))
 
@@ -1034,16 +968,13 @@ class App(tk.Tk):
                         messagebox.showerror(title, text)
                 elif kind == "running":
                     running = args[0]
-                    self._set_buttons_enabled(not running)
+                    state = tk.DISABLED if running else tk.NORMAL
+                    self.btn_open.config(state=state)
+                    self.btn_kl.config(state=state)
+                    self.btn_pdf.config(state=state)
         except queue.Empty:
             pass
         self.after(50, self._drain_ui_queue)
-
-    def _set_buttons_enabled(self, enabled: bool):
-        state = tk.NORMAL if enabled else tk.DISABLED
-        self.btn_open.config(state=state)
-        self.btn_kl.config(state=state)
-        self.btn_pdf.config(state=state)
 
     def ui_log(self, msg):
         self._post("log", msg)
@@ -1076,7 +1007,6 @@ class App(tk.Tk):
             self._is_running = False
         self._post("running", False)
 
-    # ---------- actions ----------
     def open_chrome_bot(self):
         try:
             self.set_status("Avataan Chrome-botti (9222) ja protestilista…")
@@ -1130,7 +1060,6 @@ class App(tk.Tk):
             self.set_status("Virhe. Katso log.txt")
             self.show_error("Virhe", f"Tuli virhe.\nKatso log.txt:\n{LOG_PATH}\n\n{e}")
         finally:
-            # attach-mode: don't quit user's chrome
             self._end_run()
 
     def start_pdf_mode(self):
@@ -1181,4 +1110,3 @@ class App(tk.Tk):
 
 if __name__ == "__main__":
     App().mainloop()
-
