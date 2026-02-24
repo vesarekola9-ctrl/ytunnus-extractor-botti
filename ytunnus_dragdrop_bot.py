@@ -19,7 +19,6 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
     StaleElementReferenceException,
-    WebDriverException,
     TimeoutException,
 )
 from webdriver_manager.chrome import ChromeDriverManager
@@ -38,16 +37,13 @@ KAUPPALEHTI_MATCH = "kauppalehti.fi/yritykset/protestilista"
 YTJ_COMPANY_URL = "https://tietopalvelu.ytj.fi/yritys/{}"
 YTJ_HOME = "https://tietopalvelu.ytj.fi/"
 
-# Yritysmuodot
 COMPANY_FORMS = ["Oy", "Oyj", "Ky", "Tmi", "Ry", "Osk", "Ab", "Ltd", "GmbH", "Inc", "AS"]
 COMPANY_FORM_RE = re.compile(r"\b(" + "|".join(map(re.escape, COMPANY_FORMS)) + r")\b", re.I)
 
-# Poistetaan rivin perästä tyypillisiä sarake- tai metatietoja
 EURO_RE = re.compile(r"(\d[\d\s.,]*\s*€)", re.I)
 DATE_RE = re.compile(r"\b\d{1,2}\.\d{1,2}\.\d{4}\b")
-POSTI_RE = re.compile(r"\b\d{5}\b")  # postinumero
+POSTI_RE = re.compile(r"\b\d{5}\b")
 
-# KL:ssä paikkakunta on usein yksittäinen sana tai 2 sanaa
 LOCATION_HINT_RE = re.compile(r"^[A-Za-zÅÄÖåäö\- ]{2,40}$")
 
 
@@ -104,7 +100,7 @@ def reset_log():
 
 
 # =========================
-#   STOP / SLEEP helpers
+#   STOP / SLEEP
 # =========================
 def safe_sleep(stop_event: threading.Event, seconds: float, step: float = 0.05):
     end = time.time() + seconds
@@ -264,6 +260,145 @@ def attach_to_existing_chrome():
 def open_new_tab(driver, url="about:blank"):
     driver.execute_script("window.open(arguments[0], '_blank');", url)
     driver.switch_to.window(driver.window_handles[-1])
+
+
+# =========================
+#   YTJ (VARMA NÄYTÄ)
+# =========================
+def wait_ytj_loaded_fast(driver):
+    WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    try:
+        WebDriverWait(driver, 12).until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//*[contains(normalize-space(.), 'Sähköposti') or contains(normalize-space(.), 'Y-tunnus') or contains(normalize-space(.), 'Toiminimi')]")
+            )
+        )
+    except Exception:
+        pass
+
+
+def _find_label_rows(driver, label_text: str):
+    label = label_text.strip()
+    candidates = []
+
+    x1 = f"//tr[.//*[contains(normalize-space(.), '{label}')]]"
+    x2 = f"//*[self::div or self::section or self::li][.//*[contains(normalize-space(.), '{label}')]]"
+
+    try:
+        candidates.extend(driver.find_elements(By.XPATH, x1))
+    except Exception:
+        pass
+    try:
+        candidates.extend(driver.find_elements(By.XPATH, x2))
+    except Exception:
+        pass
+
+    out = []
+    for c in candidates:
+        try:
+            if c.is_displayed():
+                out.append(c)
+        except Exception:
+            pass
+    return out
+
+
+def click_show_for_labels(driver, labels=("Sähköposti", "Puhelin", "Puhelinnumero")):
+    for _round in range(3):
+        clicked_any = False
+
+        for lab in labels:
+            rows = _find_label_rows(driver, lab)
+            for row in rows:
+                try:
+                    btns = row.find_elements(
+                        By.XPATH,
+                        ".//button[normalize-space(.)='Näytä' or normalize-space(.)='näytä'] | "
+                        ".//a[normalize-space(.)='Näytä' or normalize-space(.)='näytä'] | "
+                        ".//*[@role='button' and (normalize-space(.)='Näytä' or normalize-space(.)='näytä')]"
+                    )
+                    for b in btns:
+                        try:
+                            if b.is_displayed() and b.is_enabled():
+                                safe_click(driver, b)
+                                clicked_any = True
+                                time.sleep(0.12)
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+
+        if not clicked_any:
+            break
+
+
+def extract_email_from_ytj_fast(driver) -> str:
+    try:
+        mail = driver.find_elements(By.XPATH, "//a[starts-with(translate(@href,'MAILTO','mailto'),'mailto:')]")
+        if mail:
+            href = mail[0].get_attribute("href") or ""
+            e = href.split(":", 1)[1].strip()
+            if e:
+                return e
+    except Exception:
+        pass
+
+    try:
+        rows = _find_label_rows(driver, "Sähköposti")
+        for r in rows:
+            txt = (r.text or "")
+            if "@" in txt:
+                e = pick_email_from_text(txt)
+                if e:
+                    return e
+    except Exception:
+        pass
+
+    try:
+        return pick_email_from_text(driver.find_element(By.TAG_NAME, "body").text or "")
+    except Exception:
+        return ""
+
+
+def fetch_emails_from_ytj_by_yt_fast(driver, stop_event, yt_list, status_cb, progress_cb, log_cb):
+    emails = []
+    seen = set()
+    total = max(1, len(yt_list))
+    progress_cb(0, total)
+
+    for i, yt in enumerate(yt_list, start=1):
+        if should_stop(stop_event):
+            status_cb("STOP: YTJ-haku keskeytetty.")
+            break
+
+        status_cb(f"YTJ: {i}/{len(yt_list)} {yt}")
+        progress_cb(i - 1, total)
+
+        driver.get(YTJ_COMPANY_URL.format(yt))
+        wait_ytj_loaded_fast(driver)
+        try_accept_cookies(driver)
+
+        email = ""
+        for _ in range(8):
+            if should_stop(stop_event):
+                break
+            click_show_for_labels(driver, labels=("Sähköposti",))
+            email = extract_email_from_ytj_fast(driver)
+            if email:
+                break
+            safe_sleep(stop_event, 0.15, step=0.05)
+
+        if email:
+            k = email.lower()
+            if k not in seen:
+                seen.add(k)
+                emails.append(email)
+                log_cb(email)
+
+        safe_sleep(stop_event, 0.02, step=0.02)
+
+    progress_cb(min(len(yt_list), total), total)
+    return emails
 
 
 # =========================
@@ -539,103 +674,6 @@ def collect_yts_from_kauppalehti(driver, stop_event, status_cb, log_cb, locked_h
 
 
 # =========================
-#   YTJ (FAST)
-# =========================
-def wait_ytj_loaded_fast(driver):
-    WebDriverWait(driver, 18).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-
-
-def click_show_for_labels(driver, labels=("Sähköposti", "Puhelin", "Puhelinnumero")):
-    for lab in labels:
-        try:
-            containers = driver.find_elements(
-                By.XPATH,
-                f"//*[self::tr or self::div][.//*[contains(normalize-space(.), '{lab}')]]"
-            )
-            for c in containers:
-                try:
-                    btns = c.find_elements(By.XPATH,
-                        ".//button[normalize-space(.)='Näytä' or normalize-space(.)='näytä'] | .//a[normalize-space(.)='Näytä' or normalize-space(.)='näytä']"
-                    )
-                    for b in btns:
-                        if b.is_displayed() and b.is_enabled():
-                            safe_click(driver, b)
-                except Exception:
-                    continue
-        except Exception:
-            continue
-
-
-def extract_email_from_ytj_fast(driver) -> str:
-    try:
-        mail = driver.find_elements(By.XPATH, "//a[starts-with(translate(@href,'MAILTO','mailto'),'mailto:')]")
-        if mail:
-            href = mail[0].get_attribute("href") or ""
-            return href.split(":", 1)[1].strip()
-    except Exception:
-        pass
-
-    try:
-        rows = driver.find_elements(By.XPATH, "//tr | //div")
-        for r in rows:
-            t = (r.text or "")
-            if "Sähköposti" in t and "@" in t:
-                e = pick_email_from_text(t)
-                if e:
-                    return e
-    except Exception:
-        pass
-
-    try:
-        return pick_email_from_text(driver.find_element(By.TAG_NAME, "body").text or "")
-    except Exception:
-        return ""
-
-
-def fetch_emails_from_ytj_by_yt_fast(driver, stop_event, yt_list, status_cb, progress_cb, log_cb):
-    emails = []
-    seen = set()
-    total = max(1, len(yt_list))
-    progress_cb(0, total)
-
-    for i, yt in enumerate(yt_list, start=1):
-        if should_stop(stop_event):
-            status_cb("STOP: YTJ-haku keskeytetty.")
-            break
-
-        status_cb(f"YTJ: {i}/{len(yt_list)} {yt}")
-        progress_cb(i - 1, total)
-
-        driver.get(YTJ_COMPANY_URL.format(yt))
-        wait_ytj_loaded_fast(driver)
-        try_accept_cookies(driver)
-
-        click_show_for_labels(driver)
-
-        email = ""
-        for _ in range(6):
-            if should_stop(stop_event):
-                break
-            email = extract_email_from_ytj_fast(driver)
-            if email:
-                break
-            safe_sleep(stop_event, 0.12, step=0.03)
-            click_show_for_labels(driver)
-
-        if email:
-            k = email.lower()
-            if k not in seen:
-                seen.add(k)
-                emails.append(email)
-                log_cb(email)
-
-        safe_sleep(stop_event, 0.02, step=0.02)
-
-    progress_cb(min(len(yt_list), total), total)
-    return emails
-
-
-# =========================
 #   MODE 3: PASTE -> (NAME, LOCATION) pairs
 # =========================
 def strip_html(text: str) -> str:
@@ -657,67 +695,41 @@ def clean_line_noise(s: str) -> str:
 
 
 def guess_name_location_from_line(line: str):
-    """
-    Yrittää tulkita Kauppalehti-tyylisen rivin:
-    "Yritys Nimi Oy HELSINKI 12 345 €"
-    tai "Yritys Nimi HELSINKI 12 345 €" (ilman Oy)
-    Palauttaa (name, location) tai (name, "") tai ("","")
-    """
     if not line:
         return "", ""
 
     ln = clean_line_noise(line)
-
-    # Skippaa jos selvästi ei ole dataa
     if EMAIL_RE.search(ln) or YT_RE.search(ln):
         return "", ""
 
-    # Poista euro-osuus (jos löytyy)
     ln_no_euro = EURO_RE.split(ln)[0].strip()
     ln_no_euro = DATE_RE.split(ln_no_euro)[0].strip()
 
-    # Yleinen tapa: sarakkeet ovat peräkkäin; yritä erottaa loppu = paikkakunta
     parts = ln_no_euro.split(" ")
     if len(parts) < 2:
         return "", ""
 
-    # Heuristiikka: viimeinen 1-2 sanaa on paikkakunta (jos ne on kirjaimia)
-    # Esim. "Helsinki" tai "Uusikaupunki" tai "Kemi" tai "Raasepori"
     loc = ""
     name = ln_no_euro
 
-    if len(parts) >= 2:
-        last = parts[-1]
-        last2 = " ".join(parts[-2:]) if len(parts) >= 2 else ""
-        # jos 2 sanan loppu näyttää paikkakunnalta (vain kirjaimia ja välilyöntejä)
-        if LOCATION_HINT_RE.match(last2) and last2[0].isalpha() and last2[0].isupper():
-            # mutta älä tulkitse yritysmuotoa paikkakunnaksi
-            if not COMPANY_FORM_RE.search(last2):
-                loc = last2
-                name = " ".join(parts[:-2]).strip()
-        elif LOCATION_HINT_RE.match(last) and last[0].isalpha() and last[0].isupper():
-            if not COMPANY_FORM_RE.search(last):
-                loc = last
-                name = " ".join(parts[:-1]).strip()
+    last = parts[-1]
+    last2 = " ".join(parts[-2:]) if len(parts) >= 2 else ""
 
-    name = name.strip()
-    loc = loc.strip()
+    if LOCATION_HINT_RE.match(last2) and last2[0].isalpha() and last2[0].isupper() and not COMPANY_FORM_RE.search(last2):
+        loc = last2
+        name = " ".join(parts[:-2]).strip()
+    elif LOCATION_HINT_RE.match(last) and last[0].isalpha() and last[0].isupper() and not COMPANY_FORM_RE.search(last):
+        loc = last
+        name = " ".join(parts[:-1]).strip()
 
-    # Siivoa postinumero-perästä jos jäi
     name = POSTI_RE.split(name)[0].strip()
 
-    # Jos nimi jäi liian lyhyeksi, hylkää
     if len(name) < 3:
         return "", ""
-
-    # Aggressiivinen hyväksyntä: hyväksy jos sisältää kirjaimia
     if not re.search(r"[A-Za-zÅÄÖåäö]", name):
         return "", ""
 
-    # Jos “name” on oikeasti pelkkä paikkakunta tms, hylkää
     if len(name.split()) == 1 and LOCATION_HINT_RE.match(name) and name[0].isupper():
-        # yksittäinen sana voi olla yritys myös, mutta liian riskialtis
-        # hyväksytään jos siinä on yritysmuoto tai erikoismerkki
         if not COMPANY_FORM_RE.search(name) and "-" not in name and "&" not in name:
             return "", ""
 
@@ -725,10 +737,6 @@ def guess_name_location_from_line(line: str):
 
 
 def extract_company_pairs_from_pasted(text: str, aggressive: bool = True):
-    """
-    Palauttaa listan (name, location) -pareja.
-    aggressive=True: hyväksyy myös nimet ilman Oy/Oyj -muotoa.
-    """
     plain = strip_html(text)
     lines = [clean_line_noise(ln) for ln in plain.split("\n")]
     pairs = []
@@ -738,8 +746,7 @@ def extract_company_pairs_from_pasted(text: str, aggressive: bool = True):
         if not ln:
             continue
 
-        # Aggressiivinen: yritä tulkita rivit joissa näkyy € tai muuten listamainen
-        looks_listy = ("€" in ln) or ("Protestilista" not in ln and len(ln) <= 120)
+        looks_listy = ("€" in ln) or ("Protestilista" not in ln and len(ln) <= 140)
 
         if aggressive and looks_listy:
             nm, loc = guess_name_location_from_line(ln)
@@ -750,7 +757,6 @@ def extract_company_pairs_from_pasted(text: str, aggressive: bool = True):
                     pairs.append((nm, loc))
             continue
 
-        # Varovainen fallback: vain jos yritysmuoto löytyy
         if COMPANY_FORM_RE.search(ln):
             nm, loc = guess_name_location_from_line(ln)
             if nm:
@@ -812,12 +818,6 @@ def ytj_open_home_and_find_search(driver):
 
 
 def ytj_search_company_url_by_name_and_location(driver, company_name: str, location_hint: str = "") -> str:
-    """
-    Palauttaa yrityksen YTJ /yritys/ URLin.
-    - täsmäosuma ensin
-    - sitten sisältää
-    - jos location_hint annettu, yritetään valita tulos jonka riviteksti sisältää sen
-    """
     name = (company_name or "").strip()
     if not name:
         return ""
@@ -845,7 +845,6 @@ def ytj_search_company_url_by_name_and_location(driver, company_name: str, locat
     except TimeoutException:
         return ""
 
-    # Kerää tuloslinkkejä + niiden ympärillä oleva tekstirivi
     results = []
     try:
         links = driver.find_elements(By.XPATH, "//a[contains(@href,'/yritys/')]")
@@ -860,7 +859,6 @@ def ytj_search_company_url_by_name_and_location(driver, company_name: str, locat
             txt = (a.text or "").strip()
             if "/yritys/" not in href:
                 continue
-            # ota lähin "kortti/rivi" tekstiksi, jotta location voidaan matchata
             around = ""
             try:
                 parent = a.find_element(By.XPATH, "ancestor::*[self::li or self::div or self::tr][1]")
@@ -877,42 +875,33 @@ def ytj_search_company_url_by_name_and_location(driver, company_name: str, locat
     low = name.lower().strip()
     loc = (location_hint or "").strip().lower()
 
-    # 1) Täsmäosuma + location
     if loc:
         for txt, href, around in results:
             if txt and txt.strip().lower() == low and loc in (around or "").lower():
                 return href
 
-    # 2) Täsmäosuma
     for txt, href, around in results:
         if txt and txt.strip().lower() == low:
             return href
 
-    # 3) Sisältää + location
     if loc:
         for txt, href, around in results:
             if txt and low in txt.strip().lower() and loc in (around or "").lower():
                 return href
 
-    # 4) Sisältää
     for txt, href, around in results:
         if txt and low in txt.strip().lower():
             return href
 
-    # 5) Location-only match (jos nimi on yleinen)
     if loc:
         for txt, href, around in results:
             if loc in (around or "").lower():
                 return href
 
-    # 6) Ekan tuloksen fallback
     return results[0][1]
 
 
 def fetch_emails_from_ytj_by_pairs_fast(driver, stop_event, pairs, status_cb, progress_cb, log_cb):
-    """
-    pairs: list of (name, location)
-    """
     emails = []
     seen = set()
     total = max(1, len(pairs))
@@ -936,17 +925,15 @@ def fetch_emails_from_ytj_by_pairs_fast(driver, stop_event, pairs, status_cb, pr
         wait_ytj_loaded_fast(driver)
         try_accept_cookies(driver)
 
-        click_show_for_labels(driver)
-
         email = ""
-        for _ in range(6):
+        for _ in range(8):
             if should_stop(stop_event):
                 break
+            click_show_for_labels(driver, labels=("Sähköposti",))
             email = extract_email_from_ytj_fast(driver)
             if email:
                 break
-            safe_sleep(stop_event, 0.12, step=0.03)
-            click_show_for_labels(driver)
+            safe_sleep(stop_event, 0.15, step=0.05)
 
         if email:
             k = email.lower()
@@ -995,12 +982,9 @@ def launch_chrome_bot_9222():
 
 
 # =========================
-#   SCROLLABLE ROOT FRAME
+#   SCROLLABLE ROOT FRAME (whole UI)
 # =========================
 class ScrollableFrame(ttk.Frame):
-    """
-    Koko ohjelma scrollattavaksi (hiiren rulla toimii kaikkialla).
-    """
     def __init__(self, container, *args, **kwargs):
         super().__init__(container, *args, **kwargs)
 
@@ -1008,23 +992,16 @@ class ScrollableFrame(ttk.Frame):
         self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
         self.inner = ttk.Frame(self.canvas)
 
-        self.inner.bind(
-            "<Configure>",
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        )
-
+        self.inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
         self.window_id = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
-        self.canvas.configure(yscrollcommand=self.vsb.set)
 
+        self.canvas.configure(yscrollcommand=self.vsb.set)
         self.canvas.pack(side="left", fill="both", expand=True)
         self.vsb.pack(side="right", fill="y")
 
-        # Resize inner width with canvas
         self.canvas.bind("<Configure>", self._on_canvas_configure)
 
-        # Mousewheel support
-        self._bind_mousewheel(self.canvas)
-        self._bind_mousewheel(self.inner)
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
 
     def _on_canvas_configure(self, event):
         try:
@@ -1032,14 +1009,12 @@ class ScrollableFrame(ttk.Frame):
         except Exception:
             pass
 
-    def _bind_mousewheel(self, widget):
-        def _on_mousewheel(event):
-            try:
-                self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-            except Exception:
-                pass
-            return "break"
-        widget.bind_all("<MouseWheel>", _on_mousewheel)
+    def _on_mousewheel(self, event):
+        try:
+            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        except Exception:
+            pass
+        return "break"
 
 
 # =========================
@@ -1050,7 +1025,7 @@ class App(tk.Tk):
         super().__init__()
         reset_log()
 
-        self.title("ProtestiBotti (parannettu Moodi 3 + koko UI scroll + STOP)")
+        self.title("ProtestiBotti (YTJ Näytä fix + Moodi 3 + UI scroll + STOP)")
         self.geometry("1120x860")
 
         self.stop_event = threading.Event()
@@ -1058,8 +1033,7 @@ class App(tk.Tk):
         self.running_driver = None
         self.locked_handle = None
 
-        # Moodi 3 data
-        self.mode3_pairs = []  # list of (name, location)
+        self.mode3_pairs = []
 
         # Hotkey STOP
         self.bind_all("<Control-Shift-KeyPress-Q>", lambda e: self.emergency_stop())
@@ -1078,9 +1052,15 @@ class App(tk.Tk):
         tk.Button(btn_row, text="Kauppalehti → YTJ", font=("Arial", 12), command=self.start_kauppalehti_mode).grid(row=0, column=2, padx=6)
         tk.Button(btn_row, text="PDF → YTJ (nopea)", font=("Arial", 12), command=self.start_pdf_mode).grid(row=0, column=3, padx=6)
 
-        tk.Button(btn_row, text="🛑 STOP (Ctrl+Shift+Q)", font=("Arial", 12, "bold"),
-                  fg="white", bg="#B00020", activebackground="#8C0019",
-                  command=self.emergency_stop).grid(row=0, column=4, padx=10)
+        tk.Button(
+            btn_row,
+            text="🛑 STOP (Ctrl+Shift+Q)",
+            font=("Arial", 12, "bold"),
+            fg="white",
+            bg="#B00020",
+            activebackground="#8C0019",
+            command=self.emergency_stop
+        ).grid(row=0, column=4, padx=10)
 
         self.status = tk.Label(w, text="Valmiina.", font=("Arial", 11))
         self.status.pack(pady=6)
@@ -1088,8 +1068,7 @@ class App(tk.Tk):
         self.progress = ttk.Progressbar(w, orient="horizontal", mode="determinate", length=1060)
         self.progress.pack(pady=6)
 
-        # Moodi 3 UI
-        box = tk.LabelFrame(w, text="MoodI 3 (parannettu): Liitä protestilistan teksti → poimi (nimi + paikkakunta) → poista väärät → hae YTJ", padx=8, pady=8)
+        box = tk.LabelFrame(w, text="MoodI 3: Liitä sivun teksti/HTML → poimi (nimi+paikkakunta) → hae YTJ", padx=8, pady=8)
         box.pack(fill="both", expand=False, padx=12, pady=10)
 
         self.aggressive_var = tk.BooleanVar(value=True)
@@ -1111,7 +1090,6 @@ class App(tk.Tk):
 
         tk.Label(w, text=f"Tallennus: {OUT_DIR}", wraplength=1080, justify="center").pack(pady=6)
 
-        # Logi
         logbox = tk.LabelFrame(w, text="Live-logi", padx=8, pady=8)
         logbox.pack(fill="both", expand=True, padx=12, pady=10)
 
@@ -1122,7 +1100,7 @@ class App(tk.Tk):
         sb.pack(side="right", fill="y")
         self.listbox.configure(yscrollcommand=sb.set)
 
-    # ---------- helpers ----------
+    # ---------- UI helpers ----------
     def ui_log(self, msg):
         line = log_to_file(msg)
         self.listbox.insert(tk.END, line)
@@ -1164,7 +1142,7 @@ class App(tk.Tk):
         except Exception:
             pass
 
-    # ---------- Chrome tools ----------
+    # ---------- Chrome ----------
     def open_chrome_bot(self):
         ok, msg = launch_chrome_bot_9222()
         self.ui_log(msg)
@@ -1183,7 +1161,7 @@ class App(tk.Tk):
             self.ui_log(f"VIRHE lukituksessa: {e}")
             messagebox.showerror("Virhe", f"Lukitus epäonnistui:\n{e}")
 
-    # ---------- Mode 1 ----------
+    # ---------- Mode 1: KL -> YTJ ----------
     def start_kauppalehti_mode(self):
         self._start_worker(self.run_kauppalehti_mode)
 
@@ -1221,7 +1199,7 @@ class App(tk.Tk):
             self.ui_log(f"VIRHE: {e}")
             messagebox.showerror("Virhe", f"Tuli virhe.\nKatso log.txt:\n{LOG_PATH}\n\n{e}")
 
-    # ---------- Mode 2 ----------
+    # ---------- Mode 2: PDF -> YTJ ----------
     def start_pdf_mode(self):
         path = filedialog.askopenfilename(filetypes=[("PDF files", "*.pdf")])
         if path:
@@ -1277,14 +1255,11 @@ class App(tk.Tk):
         self.mode3_pairs = pairs
         self.pairs_list.delete(0, tk.END)
         for nm, loc in pairs:
-            if loc:
-                self.pairs_list.insert(tk.END, f"{nm} | {loc}")
-            else:
-                self.pairs_list.insert(tk.END, nm)
+            self.pairs_list.insert(tk.END, f"{nm} | {loc}" if loc else nm)
 
         self.set_status(f"Poimittu rivejä: {len(pairs)}")
         if not pairs:
-            messagebox.showwarning("Ei löytynyt", "En löytänyt nimiä. Kokeile aggressiivinen ON ja kopioi enemmän sivun sisältöä.")
+            messagebox.showwarning("Ei löytynyt", "En löytänyt nimiä. Kokeile aggressiivinen ON ja kopioi enemmän sisältöä.")
 
     def mode3_remove_selected(self):
         sel = list(self.pairs_list.curselection())
