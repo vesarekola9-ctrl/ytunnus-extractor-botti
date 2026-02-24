@@ -25,6 +25,8 @@ from selenium.common.exceptions import (
 )
 from webdriver_manager.chrome import ChromeDriverManager
 
+import selenium.webdriver.chrome.options
+
 
 # =========================
 #   CONFIG / REGEX
@@ -1179,3 +1181,4 @@ class App(tk.Tk):
 
 if __name__ == "__main__":
     App().mainloop()
+
