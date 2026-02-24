@@ -25,7 +25,7 @@ from selenium.common.exceptions import (
     ElementClickInterceptedException,
 )
 
-# Force PyInstaller to see chrome options submodule (prevents missing module in EXE)
+# Force PyInstaller to include chrome options submodule
 import selenium.webdriver.chrome.options  # noqa: F401
 
 from webdriver_manager.chrome import ChromeDriverManager
@@ -730,6 +730,13 @@ def _find_visible_nayta_candidates_in_scope(scope_elem):
 
 
 def click_all_nayta_ytj(driver, log_cb=None):
+    """
+    1) avaa relevantit accordionit (jos on)
+    2) klikkaa Sähköposti-rivin Näytä (jos löytyy)
+    3) klikkaa muut Näytä-napit:
+        - jos löydetään contact-container → rajataan siihen
+        - muuten fallback: klikkaa Näytä-napit vain TAULUKKO-riveistä
+    """
     total_clicked = 0
 
     try:
@@ -752,54 +759,87 @@ def click_all_nayta_ytj(driver, log_cb=None):
             pass
 
     scope = _find_contact_container(driver)
-    if not scope:
-        if log_cb:
-            log_cb("YTJ: contact-container ei löytynyt -> skipataan massaklikkaus")
+
+    def click_nayta_in_scope(scope_elem, rounds=5):
+        nonlocal total_clicked
+        for round_idx in range(1, rounds + 1):
+            try_accept_cookies(driver)
+            wait_dom_settle(driver, 1.0)
+
+            candidates = _find_visible_nayta_candidates_in_scope(scope_elem)
+
+            unique = []
+            seen = set()
+            for c in candidates:
+                try:
+                    key = (c.get_attribute("outerHTML") or "")[:180]
+                except Exception:
+                    key = str(id(c))
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique.append(c)
+
+            if not unique:
+                break
+
+            clicked_this_round = 0
+            for c in unique:
+                try:
+                    if safe_click(driver, c):
+                        clicked_this_round += 1
+                        total_clicked += 1
+                        time.sleep(0.12)
+                except Exception:
+                    continue
+
+            if log_cb:
+                log_cb(f"YTJ: Näytä-klikkejä (scope) kierros {round_idx}: {clicked_this_round}")
+
+            if clicked_this_round == 0:
+                break
+
+            time.sleep(0.25)
+
+    if scope:
+        click_nayta_in_scope(scope, rounds=5)
         return total_clicked
 
-    for round_idx in range(1, 6):
-        try_accept_cookies(driver)
-        wait_dom_settle(driver, 1.0)
+    # fallback
+    try:
+        if log_cb:
+            log_cb("YTJ: contact-container ei löytynyt -> fallback: klikataan Näytä taulukoista")
 
-        candidates = _find_visible_nayta_candidates_in_scope(scope)
+        rows = driver.find_elements(By.XPATH, "//tr[.//*[normalize-space()='Näytä'] or .//button[normalize-space()='Näytä']]")
+        clicked = 0
 
-        unique = []
-        seen = set()
-        for c in candidates:
+        for r in rows:
             try:
-                key = (c.get_attribute("outerHTML") or "")[:180]
-            except Exception:
-                key = str(id(c))
-            if key in seen:
-                continue
-            seen.add(key)
-            unique.append(c)
-
-        if not unique:
-            break
-
-        clicked_this_round = 0
-        for c in unique:
-            try:
-                if safe_click(driver, c):
-                    clicked_this_round += 1
-                    total_clicked += 1
-                    time.sleep(0.12)
+                btns = r.find_elements(By.XPATH, ".//button[normalize-space()='Näytä'] | .//*[@role='button' and normalize-space()='Näytä'] | .//a[normalize-space()='Näytä']")
+                for b in btns:
+                    try:
+                        if b.is_displayed() and b.is_enabled():
+                            if safe_click(driver, b):
+                                clicked += 1
+                                total_clicked += 1
+                                time.sleep(0.12)
+                    except Exception:
+                        continue
             except Exception:
                 continue
 
         if log_cb:
-            log_cb(f"YTJ: Näytä-klikkejä (scope) kierros {round_idx}: {clicked_this_round}")
-
-        if clicked_this_round == 0:
-            break
+            log_cb(f"YTJ: fallback Näytä-klikkejä taulukoista: {clicked}")
 
         time.sleep(0.25)
+    except Exception:
+        pass
 
     return total_clicked
 
 
 def extract_email_from_ytj(driver):
+    # 1) mailto
     try:
         for a in driver.find_elements(By.TAG_NAME, "a"):
             href = (a.get_attribute("href") or "")
@@ -808,6 +848,7 @@ def extract_email_from_ytj(driver):
     except Exception:
         pass
 
+    # 2) anything containing 'Sähköposti'
     try:
         candidates = driver.find_elements(By.XPATH, "//*[contains(normalize-space(.), 'Sähköposti')]")
         for c in candidates:
@@ -817,6 +858,7 @@ def extract_email_from_ytj(driver):
     except Exception:
         pass
 
+    # 3) whole page text
     try:
         body = driver.find_element(By.TAG_NAME, "body").text or ""
         return pick_email_from_text(body)
@@ -841,6 +883,21 @@ def fetch_emails_from_ytj(driver, yt_list, status_cb, progress_cb, log_cb):
             log_cb("YTJ: timeout ladatessa, yritän silti…")
 
         try_accept_cookies(driver)
+
+        # =========================
+        # HARD SKIP: jos sivulla ei ole sähköposti-kenttää eikä mailto-linkkiä,
+        # niin älä tuhlaa aikaa klikkailuun -> seuraava yritys
+        # =========================
+        try:
+            body_txt = (driver.find_element(By.TAG_NAME, "body").text or "")
+            page_src = (driver.page_source or "").lower()
+            if "Sähköposti" not in body_txt and "mailto:" not in page_src:
+                log_cb("YTJ: ei sähköposti-kenttää eikä mailto-linkkiä -> skipataan yritys.")
+                time.sleep(0.05)
+                continue
+        except Exception:
+            # jos tarkistus epäonnistuu, jatketaan normaalisti
+            pass
 
         email = ""
         for attempt in range(1, 5):
@@ -893,7 +950,7 @@ class App(tk.Tk):
         self._running_lock = threading.Lock()
         self._is_running = False
 
-        self.title("YTunnus extractor botti (FULL FIX)")
+        self.title("YTunnus extractor botti")
         self.geometry("980x620")
 
         tk.Label(self, text="YTunnus Extractor", font=("Arial", 18, "bold")).pack(pady=10)
