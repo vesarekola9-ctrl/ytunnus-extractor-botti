@@ -16,7 +16,11 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import StaleElementReferenceException, WebDriverException
+from selenium.common.exceptions import (
+    StaleElementReferenceException,
+    WebDriverException,
+    TimeoutException,
+)
 from webdriver_manager.chrome import ChromeDriverManager
 
 
@@ -24,8 +28,13 @@ from webdriver_manager.chrome import ChromeDriverManager
 #   CONFIG / REGEX
 # =========================
 YT_RE = re.compile(r"\b\d{7}-\d\b|\b\d{8}\b")
+
 EMAIL_RE = re.compile(r"[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9-.]+")
-EMAIL_A_RE = re.compile(r"[A-Za-z0-9_.+-]+\s*\(a\)\s*[A-Za-z0-9-]+\.[A-Za-z0-9-.]+", re.I)
+# Obfuskaatiot: (a), (at), [at], " at ", "ät" jne.
+EMAIL_OBF_RE = re.compile(
+    r"[A-Za-z0-9_.+-]+\s*(?:\(a\)|\(at\)|\[at\]|\sat\s|\sät\s|\(ät\))\s*[A-Za-z0-9-]+\.[A-Za-z0-9-.]+",
+    re.I
+)
 
 KAUPPALEHTI_URL = "https://www.kauppalehti.fi/yritykset/protestilista"
 YTJ_COMPANY_URL = "https://tietopalvelu.ytj.fi/yritys/{}"
@@ -98,15 +107,37 @@ def normalize_yt(yt: str):
     return None
 
 
+def normalize_email_obfuscated(s: str) -> str:
+    if not s:
+        return ""
+    x = s.strip()
+    x = re.sub(r"\s+", "", x)
+    # normalize obfuscations to @
+    x = x.replace("(a)", "@").replace("(A)", "@")
+    x = x.replace("(at)", "@").replace("(AT)", "@")
+    x = x.replace("[at]", "@").replace("[AT]", "@")
+    # handle rare finnish-ish "ät" or (ät)
+    x = x.replace("(ät)", "@").replace("ät", "@")
+    # handle "...at..." with spaces already removed: we can't safely replace all "at" occurrences
+    # so only replace if it looks like user + at + domain
+    x = re.sub(r"^([A-Za-z0-9_.+-]+)at([A-Za-z0-9-]+\.[A-Za-z0-9-.]+)$", r"\1@\2", x, flags=re.I)
+    return x
+
+
 def pick_email_from_text(text: str) -> str:
     if not text:
         return ""
     m = EMAIL_RE.search(text)
     if m:
-        return m.group(0).strip().replace(" ", "")
-    m2 = EMAIL_A_RE.search(text)
+        return m.group(0).strip()
+    m2 = EMAIL_OBF_RE.search(text)
     if m2:
-        return m2.group(0).replace(" ", "").replace("(a)", "@")
+        return normalize_email_obfuscated(m2.group(0))
+    # second pass: try normalize whole text (sometimes YTJ shows "name (a) domain.fi" across nodes)
+    t2 = normalize_email_obfuscated(text)
+    m3 = EMAIL_RE.search(t2)
+    if m3:
+        return m3.group(0).strip()
     return ""
 
 
@@ -160,6 +191,24 @@ def try_accept_cookies(driver):
                 continue
         if not found:
             break
+
+
+def wait_dom_settle(driver, max_wait=3.0):
+    """
+    YTJ on SPA: joskus klikit/render tapahtuu myöhässä.
+    Tämä odottaa hetken, että document.readyState on complete,
+    ja antaa pienen viiveen renderille.
+    """
+    end = time.time() + max_wait
+    while time.time() < end:
+        try:
+            rs = driver.execute_script("return document.readyState;")
+            if rs == "complete":
+                break
+        except Exception:
+            pass
+        time.sleep(0.05)
+    time.sleep(0.15)
 
 
 # =========================
@@ -538,29 +587,132 @@ def collect_yts_from_kauppalehti(driver, status_cb, log_cb):
 
 
 # =========================
-#   YTJ EMAILS (FIXED "NÄYTÄ")
+#   YTJ EMAILS (ROBUST)
 # =========================
 def wait_ytj_loaded(driver):
-    wait = WebDriverWait(driver, 30)
+    wait = WebDriverWait(driver, 35)
     wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    # YTJ on SPA: varmistetaan että jotain yritystietoa näkyy
+    wait_dom_settle(driver, 2.0)
+    # YTJ SPA: varmistetaan että yritys-sivun sisältöä näkyy
     try:
-        wait.until(EC.presence_of_element_located(
-            (By.XPATH, "//*[contains(., 'Y-tunnus') or contains(., 'Toiminimi') or contains(., 'Yritysmuoto') or contains(., 'Sähköposti')]")
-        ))
+        wait.until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//*[contains(., 'Y-tunnus') or contains(., 'Toiminimi') or contains(., 'Yritysmuoto') or contains(., 'Sähköposti')]")
+            )
+        )
     except Exception:
         pass
+    wait_dom_settle(driver, 1.0)
+
+
+def _expand_contact_sections_ytj(driver, log_cb=None):
+    """
+    YTJ:llä sähköposti voi olla accordionin takana.
+    Avataan kaikki relevantit "Yhteystiedot"/"Asiointikanavat"/"Lisätiedot" -tyyppiset osiot, jos aria-expanded=false.
+    """
+    keywords = ["yhteyst", "asiointi", "lisät", "kontakt", "contact"]
+    xps = [
+        # button/role button, aria-expanded
+        "//*[@aria-expanded='false' and (self::button or @role='button' or self::a)]",
+        "//button[@aria-expanded='false']",
+        "//*[@role='button' and @aria-expanded='false']",
+    ]
+
+    opened = 0
+    for _round in range(3):
+        did = 0
+        try_accept_cookies(driver)
+        wait_dom_settle(driver, 1.0)
+
+        elems = []
+        for xp in xps:
+            try:
+                elems.extend(driver.find_elements(By.XPATH, xp))
+            except Exception:
+                continue
+
+        # Filter: visible + text contains relevant keyword
+        filtered = []
+        for e in elems:
+            try:
+                if not e.is_displayed() or not e.is_enabled():
+                    continue
+                txt = ((e.text or "") + " " + (e.get_attribute("aria-label") or "")).strip().lower()
+                if any(k in txt for k in keywords):
+                    filtered.append(e)
+            except Exception:
+                continue
+
+        # Dedup by outerHTML prefix
+        uniq = []
+        seen = set()
+        for e in filtered:
+            try:
+                key = (e.get_attribute("outerHTML") or "")[:160]
+            except Exception:
+                key = str(id(e))
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(e)
+
+        for e in uniq:
+            try:
+                if safe_click(driver, e):
+                    did += 1
+                    opened += 1
+                    time.sleep(0.15)
+            except Exception:
+                continue
+
+        if log_cb and did:
+            log_cb(f"YTJ: avattiin accordion-osioita: {did}")
+
+        if did == 0:
+            break
+
+    return opened
+
+
+def _find_email_row_show_button(driver):
+    """
+    Täsmähaku: etsitään rivi/alue jossa lukee "Sähköposti" ja sen sisältä "Näytä"-nappi/linkki.
+    Tämä on tärkein klikki.
+    """
+    candidates = []
+    xps = [
+        # Table row variant
+        "//tr[.//*[contains(normalize-space(.), 'Sähköposti')]]//*[self::button or self::a or @role='button'][normalize-space()='Näytä' or .//span[normalize-space()='Näytä']]",
+        # Definition list / div variant
+        "//*[contains(normalize-space(.), 'Sähköposti')]/following::*[self::button or self::a or @role='button'][1]",
+        # aria-label includes sähköposti and näytä
+        "//*[self::button or self::a or @role='button'][contains(translate(@aria-label,'SÄHKÖPOSTINÄYTÄ','sähköpostinäytä'),'sähköposti') and contains(translate(@aria-label,'NÄYTÄ','näytä'),'näytä')]",
+    ]
+    for xp in xps:
+        try:
+            elems = driver.find_elements(By.XPATH, xp)
+            for e in elems:
+                try:
+                    if e.is_displayed() and e.is_enabled():
+                        candidates.append(e)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    # return first best candidate
+    return candidates[0] if candidates else None
 
 
 def _find_visible_nayta_candidates(driver):
-    # Robustit selektorit: button/span/role=button/aria-label
+    # Robustit selektorit: button/span/role=button/aria-label/title
     xpaths = [
         "//button[normalize-space()='Näytä']",
         "//button[.//span[normalize-space()='Näytä']]",
         "//*[@role='button' and normalize-space()='Näytä']",
         "//a[normalize-space()='Näytä']",
-        "//*[@aria-label and contains(translate(@aria-label,'NÄYTÄ','näytä'),'näytä')]",
-        "//*[@title and contains(translate(@title,'NÄYTÄ','näytä'),'näytä')]",
+        "//*[self::button or self::a or @role='button'][contains(translate(@aria-label,'NÄYTÄ','näytä'),'näytä')]",
+        "//*[self::button or self::a or @role='button'][contains(translate(@title,'NÄYTÄ','näytä'),'näytä')]",
     ]
     found = []
     for xp in xpaths:
@@ -579,14 +731,38 @@ def _find_visible_nayta_candidates(driver):
 
 def click_all_nayta_ytj(driver, log_cb=None):
     """
-    Klikkaa kaikki 'Näytä' -napit YTJ:ssä.
-    Tehdään useampi kierros, koska osa nappuloista ilmestyy vasta klikkauksen jälkeen.
+    Klikkaa YTJ:ssä:
+      1) Yhteystieto-osiot auki (accordion)
+      2) Sähköposti-rivin "Näytä" ensisijaisesti
+      3) Sen jälkeen kaikki muut "Näytä" varmistuksena useassa kierroksessa (SPA)
     """
     total_clicked = 0
 
+    # 0) Avataan mahdolliset osiot
+    try:
+        _expand_contact_sections_ytj(driver, log_cb=log_cb)
+    except Exception:
+        pass
+
+    # 1) Täsmäklikki sähköposti-rivin "Näytä"
+    try_accept_cookies(driver)
+    wait_dom_settle(driver, 1.0)
+
+    btn = _find_email_row_show_button(driver)
+    if btn:
+        try:
+            if safe_click(driver, btn):
+                total_clicked += 1
+                if log_cb:
+                    log_cb("YTJ: klikattiin Sähköposti-rivin 'Näytä'")
+                time.sleep(0.25)
+        except Exception:
+            pass
+
+    # 2) Yleiset "Näytä" -napit useassa kierroksessa
     for round_idx in range(1, 7):  # max 6 kierrosta
         try_accept_cookies(driver)
-        time.sleep(0.1)
+        wait_dom_settle(driver, 1.0)
 
         candidates = _find_visible_nayta_candidates(driver)
 
@@ -619,11 +795,9 @@ def click_all_nayta_ytj(driver, log_cb=None):
         if log_cb:
             log_cb(f"YTJ: Näytä-klikkejä kierros {round_idx}: {clicked_this_round}")
 
-        # Jos ei klikattu mitään, lopeta
         if clicked_this_round == 0:
             break
 
-        # anna domille hetki päivittyä
         time.sleep(0.25)
 
     return total_clicked
@@ -639,11 +813,15 @@ def extract_email_from_ytj(driver):
     except Exception:
         pass
 
-    # 2) Sähköposti-rivi (taulukko)
+    # 2) Sähköposti-rivi (taulukko / alue)
     try:
-        rows = driver.find_elements(By.XPATH, "//tr[.//*[contains(normalize-space(.), 'Sähköposti')]]")
-        for r in rows:
-            email = pick_email_from_text(r.text or "")
+        # use broader search than just <tr>
+        candidates = driver.find_elements(
+            By.XPATH,
+            "//*[contains(normalize-space(.), 'Sähköposti')]"
+        )
+        for c in candidates:
+            email = pick_email_from_text(c.text or "")
             if email:
                 return email
     except Exception:
@@ -651,7 +829,8 @@ def extract_email_from_ytj(driver):
 
     # 3) koko sivun teksti
     try:
-        return pick_email_from_text(driver.find_element(By.TAG_NAME, "body").text or "")
+        body = driver.find_element(By.TAG_NAME, "body").text or ""
+        return pick_email_from_text(body)
     except Exception:
         return ""
 
@@ -666,20 +845,41 @@ def fetch_emails_from_ytj(driver, yt_list, status_cb, progress_cb, log_cb):
         progress_cb(i - 1, len(yt_list))
 
         driver.get(YTJ_COMPANY_URL.format(yt))
-        wait_ytj_loaded(driver)
+
+        try:
+            wait_ytj_loaded(driver)
+        except TimeoutException:
+            log_cb("YTJ: timeout ladatessa, yritän silti klikata/poimia…")
+
         try_accept_cookies(driver)
 
-        clicks = click_all_nayta_ytj(driver, log_cb=log_cb)
-
+        # Tee useampi yritys, koska YTJ SPA voi laittaa napit myöhässä
         email = ""
-        for _ in range(10):
-            email = extract_email_from_ytj(driver)
-            if email:
-                break
-            # jos ei löytynyt ja näytä-klikkejä 0, kokeillaan vielä yksi kierros varmuudeksi
-            if clicks == 0:
-                click_all_nayta_ytj(driver, log_cb=log_cb)
-            time.sleep(0.2)
+        for attempt in range(1, 5):
+            try:
+                clicks = click_all_nayta_ytj(driver, log_cb=log_cb)
+                wait_dom_settle(driver, 1.5)
+
+                # Poimi sähköposti useaan kertaan lyhyellä odotuksella
+                for _ in range(8):
+                    email = extract_email_from_ytj(driver)
+                    if email:
+                        break
+                    time.sleep(0.2)
+
+                if email:
+                    break
+
+                log_cb(f"YTJ: ei emailia yritykselle {yt} (attempt {attempt}, clicks {clicks})")
+                # pieni refresh/settle jos ei löydy
+                wait_dom_settle(driver, 1.0)
+            except StaleElementReferenceException:
+                time.sleep(0.2)
+                continue
+            except Exception as e:
+                log_cb(f"YTJ: virhe attempt {attempt}: {e}")
+                time.sleep(0.25)
+                continue
 
         if email:
             k = email.lower()
@@ -702,7 +902,7 @@ class App(tk.Tk):
         super().__init__()
         reset_log()
 
-        self.title("ProtestiBotti (YTJ Näytä-fix)")
+        self.title("ProtestiBotti (YTJ Näytä-robust)")
         self.geometry("980x620")
 
         tk.Label(self, text="ProtestiBotti", font=("Arial", 18, "bold")).pack(pady=10)
