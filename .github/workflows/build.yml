@@ -19,12 +19,15 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
 
+      # TÄRKEÄ: käytä cmd:tä, koska ^ jatkorivi toimii vain cmd:ssä
       - name: Build EXE (PyInstaller)
+        shell: cmd
         run: |
           pyinstaller --noconfirm --clean --onefile --windowed ^
             --collect-all selenium ^
