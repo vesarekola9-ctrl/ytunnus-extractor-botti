@@ -4,7 +4,9 @@
 #   2) Kauppalehti (Chrome debug 9222) -> Y-tunnukset -> YTJ sähköpostit
 #   3) Clipboard (Ctrl+C -> Ctrl+V) -> (Y-tunnukset tai yritysnimet) -> YTJ sähköpostit
 #
-# Päivitykset (tehty pyynnöstä "tee kaikki"):
+# Päivitykset:
+# - Chrome-botin avaus korjattu: EI PowerShell-string-sekoilua.
+#   Käytetään subprocess.Popen([...]) -> ei enää "C:\Program not recognized" -virhettä.
 # - Clipboard: "Tiukka parsinta" (vain Oy/Ab/Ky/Tmi/...) + "Max nimeä" rajoitin
 # - YTJ nimihaku robustimmaksi:
 #   * etsii hakukentän usealla tavalla
@@ -31,6 +33,7 @@ import tkinter as tk
 from tkinter import messagebox, filedialog
 from tkinter import ttk
 from difflib import SequenceMatcher
+import subprocess
 
 import PyPDF2
 from docx import Document
@@ -259,10 +262,6 @@ def extract_yts_from_text(text: str):
 
 
 def extract_names_from_clipboard(text: str, strict: bool, max_names: int):
-    """
-    Heuristiikka: poimi “yritysnimiltä näyttävät” rivit copy/pastesta.
-    strict=True: hyväksyy vain rivit joissa näkyy yritysmuoto (Oy/Ab/Ky/Tmi/...).
-    """
     lines = split_lines(text)
     out = []
     seen = set()
@@ -280,27 +279,21 @@ def extract_names_from_clipboard(text: str, strict: bool, max_names: int):
 
         low = ln.lower()
 
-        # jos rivillä on suoraan ytunnus, ohitetaan nimilistasta
         if YT_RE.search(ln):
             continue
-
         if any(b in low for b in bad_contains):
             continue
-
         if len(ln) < 3:
             continue
-
         digits = sum(ch.isdigit() for ch in ln)
         if digits >= 3:
             continue
-
         if not any(ch.isalpha() for ch in ln):
             continue
 
         name = re.sub(r"\s{2,}", " ", ln).strip()
         if len(name) > 80:
             continue
-
         if strict and not STRICT_FORMS_RE.search(name):
             continue
 
@@ -436,7 +429,10 @@ def ensure_protestilista_open_and_ready(driver, status_cb, log_cb, max_wait_seco
         status_cb("Protestilista-tab ei löytynyt -> avaan protestilistan uuteen tabiin…")
         log_cb("AUTOFIX: opening protestilista in new tab")
         open_new_tab(driver, KAUPPALEHTI_URL)
-        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        try:
+            WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        except Exception:
+            pass
         try_accept_cookies(driver)
 
     start = time.time()
@@ -537,7 +533,6 @@ def extract_yt_from_company_page_in_new_tab(driver, href: str, stop_flag):
 
     yt = ""
     try:
-        # poll instead of long wait for better stop responsiveness
         t0 = time.time()
         while time.time() - t0 < KL_COMPANY_PAGE_TIMEOUT:
             if stop_flag.is_set():
@@ -629,7 +624,6 @@ def collect_yts_from_kauppalehti(driver, status_cb, log_cb, stop_flag):
 
         if click_nayta_lisaa(driver):
             status_cb("Kauppalehti: Näytä lisää…")
-            # poll sleep for stop
             for _ in range(int(KL_LOAD_MORE_WAIT / 0.1)):
                 if stop_flag.is_set():
                     status_cb("Pysäytetty.")
@@ -778,7 +772,6 @@ def fetch_emails_from_ytj(driver, yt_list, status_cb, progress_cb, log_cb, stop_
         time.sleep(YTJ_PER_COMPANY_SLEEP)
 
     progress_cb(len(yt_list), max(1, len(yt_list)))
-    # final partial save too
     try:
         if emails:
             save_word_plain_lines_to_path(emails, PARTIAL_DOCX_PATH)
@@ -800,16 +793,11 @@ def ytj_open_search_home(driver):
 
 
 def find_ytj_search_input(driver):
-    """
-    Robust: yritä löytää hakukenttä usealla tavalla.
-    """
-    # 1) näkyvät search-tyypit
     xpaths = [
         "//input[@type='search']",
         "//input[contains(translate(@placeholder,'HAE','hae'),'hae')]",
         "//input[contains(translate(@aria-label,'HAE','hae'),'hae')]",
         "//input[contains(translate(@name,'HAE','hae'),'hae')]",
-        # joskus input on formissa
         "//form//input",
     ]
     seen = set()
@@ -824,7 +812,6 @@ def find_ytj_search_input(driver):
         except Exception:
             pass
 
-    # fallback: kaikki inputit
     try:
         for e in driver.find_elements(By.XPATH, "//input"):
             if id(e) in seen:
@@ -844,13 +831,11 @@ def find_ytj_search_input(driver):
             ph = (inp.get_attribute("placeholder") or "").lower()
             al = (inp.get_attribute("aria-label") or "").lower()
             nm = (inp.get_attribute("name") or "").lower()
-            # priorisoi "hae"
             if "hae" in ph or "hae" in al or "hae" in nm or t == "search":
                 return inp
         except Exception:
             continue
 
-    # jos mikään ei matchaa, ota eka näkyvä text input
     for inp in cands:
         try:
             if inp.is_displayed() and inp.is_enabled():
@@ -862,11 +847,6 @@ def find_ytj_search_input(driver):
 
 
 def score_result(name_query: str, card_text: str) -> float:
-    """
-    Pisteytys:
-    - nimimätsi (0..1) * 100
-    - +20 jos cardissa näkyy Y-tunnus (7-1 / 8digit)
-    """
     txt = (card_text or "").strip()
     m = similarity(name_query, txt)
     score = m * 100.0
@@ -876,10 +856,6 @@ def score_result(name_query: str, card_text: str) -> float:
 
 
 def ytj_find_company_and_open_best(driver, name: str, stop_flag):
-    """
-    Hakee nimellä ja avaa parhaan tuloksen automaattisesti.
-    Palauttaa True jos päätyi yrityssivulle.
-    """
     ytj_open_search_home(driver)
     if stop_flag.is_set():
         return False
@@ -898,11 +874,9 @@ def ytj_find_company_and_open_best(driver, name: str, stop_flag):
     except Exception:
         return False
 
-    # odota tuloksia ja pisteytä
     best_link = None
     best_score = -1.0
 
-    # poll loop (stop responsive)
     t0 = time.time()
     while time.time() - t0 < 10.0:
         if stop_flag.is_set():
@@ -913,7 +887,6 @@ def ytj_find_company_and_open_best(driver, name: str, stop_flag):
         except Exception:
             pass
 
-        # Etsi kortteja / listaelementtejä joista löytyy linkki yritykseen
         candidate_links = []
         xps = [
             "//a[contains(@href,'/yritys/') or contains(@href,'/company/')]",
@@ -925,7 +898,6 @@ def ytj_find_company_and_open_best(driver, name: str, stop_flag):
             except Exception:
                 pass
 
-        # Pisteytä top N linkkiä (ettei mee hitaaksi)
         checked = 0
         for a in candidate_links:
             if checked >= 25:
@@ -937,7 +909,6 @@ def ytj_find_company_and_open_best(driver, name: str, stop_flag):
                 if not href or "tietopalvelu.ytj.fi" not in href:
                     continue
 
-                # card text: lähin parent joka sisältää myös ytunnuksen usein
                 card_text = ""
                 try:
                     card = a.find_element(By.XPATH, "ancestor::*[self::li or self::div or self::article][1]")
@@ -976,9 +947,9 @@ def ytj_find_company_and_open_best(driver, name: str, stop_flag):
 
 
 # =========================
-#   CHROME BOT LAUNCHER (9222)
+#   CHROME BOT LAUNCHER (9222)  [FIXED]
 # =========================
-def build_chrome_bot_command():
+def build_chrome_bot_args():
     base = get_exe_dir()
     profile_dir = os.path.join(base, "chrome_bot_profile")
     os.makedirs(profile_dir, exist_ok=True)
@@ -993,18 +964,20 @@ def build_chrome_bot_command():
             chrome_exe = p
             break
     if chrome_exe is None:
-        chrome_exe = "chrome"
+        chrome_exe = "chrome"  # fallback PATH
 
-    cmd = f"\"{chrome_exe}\" --remote-debugging-port=9222 --user-data-dir=\"{profile_dir}\""
-    return cmd, profile_dir
+    args = [
+        chrome_exe,
+        "--remote-debugging-port=9222",
+        f"--user-data-dir={profile_dir}",
+    ]
+    return args
 
 
 def launch_chrome_bot():
-    cmd, _ = build_chrome_bot_command()
-    ps = f'Start-Process -FilePath powershell -ArgumentList \'-NoExit\', \'-Command\', \'{cmd}\''
-
     try:
-        os.system(f'powershell -NoProfile -ExecutionPolicy Bypass -Command "{ps}"')
+        args = build_chrome_bot_args()
+        subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
     except Exception:
         return False
@@ -1051,7 +1024,6 @@ class App(BaseTk):
         self.title("ProtestiBotti (Kauppalehti + PDF + Clipboard -> YTJ)")
         self.geometry("980x820")
 
-        # ESC STOP
         self.bind_all("<Escape>", lambda e: self.request_stop())
 
         outer = ScrollableFrame(self)
@@ -1083,7 +1055,6 @@ class App(BaseTk):
         self.progress = ttk.Progressbar(root, orient="horizontal", mode="determinate", length=920)
         self.progress.pack(pady=6)
 
-        # PDF drop zone
         self.drop_var = tk.StringVar(value="PDF: Pudota tähän (tai paina PDF → YTJ ja valitse tiedosto)")
         drop = tk.Label(root, textvariable=self.drop_var, relief="groove", height=2)
         drop.pack(fill="x", padx=14, pady=6)
@@ -1091,7 +1062,6 @@ class App(BaseTk):
             drop.drop_target_register(DND_FILES)
             drop.dnd_bind("<<Drop>>", self._on_drop_pdf)
 
-        # Clipboard controls
         clip_opts = tk.Frame(root)
         clip_opts.pack(fill="x", padx=14, pady=(10, 2))
 
@@ -1100,8 +1070,7 @@ class App(BaseTk):
 
         tk.Label(clip_opts, text="Max nimeä:").pack(side="left", padx=(18, 6))
         self.max_names_var = tk.IntVar(value=400)
-        max_spin = tk.Spinbox(clip_opts, from_=10, to=5000, textvariable=self.max_names_var, width=7)
-        max_spin.pack(side="left")
+        tk.Spinbox(clip_opts, from_=10, to=5000, textvariable=self.max_names_var, width=7).pack(side="left")
 
         tk.Label(root, text="Clipboard (Ctrl+V tähän) → hae sähköpostit YTJ:stä:", font=("Arial", 11, "bold")).pack(pady=(6, 4))
         self.clip_text = tk.Text(root, height=8, wrap="word")
@@ -1166,9 +1135,6 @@ class App(BaseTk):
         else:
             messagebox.showwarning("Ei PDF", "Pudotettu tiedosto ei ollut .pdf")
 
-    # =========================
-    #   KAUPPALEHTI MODE
-    # =========================
     def start_kauppalehti_mode(self):
         self.clear_stop()
         threading.Thread(target=self.run_kauppalehti_mode, daemon=True).start()
@@ -1216,11 +1182,8 @@ class App(BaseTk):
             self.set_status("Virhe. Katso log.txt")
             messagebox.showerror("Virhe", f"Tuli virhe.\nKatso log.txt:\n{LOG_PATH}\n\n{e}")
         finally:
-            pass  # ei suljeta käyttäjän Chromea
+            pass
 
-    # =========================
-    #   PDF MODE
-    # =========================
     def start_pdf_mode(self):
         self.clear_stop()
         path = filedialog.askopenfilename(filetypes=[("PDF files", "*.pdf")])
@@ -1269,9 +1232,6 @@ class App(BaseTk):
                 except Exception:
                     pass
 
-    # =========================
-    #   CLIPBOARD MODE
-    # =========================
     def start_clipboard_mode(self):
         self.clear_stop()
         text = self.clip_text.get("1.0", tk.END).strip()
@@ -1283,7 +1243,6 @@ class App(BaseTk):
     def run_clipboard_mode(self, text: str):
         driver = None
         try:
-            # 1) jos tekstissä on Y-tunnuksia, käytä niitä suoraan
             yt_list = extract_yts_from_text(text)
 
             if yt_list:
@@ -1301,7 +1260,6 @@ class App(BaseTk):
                 messagebox.showinfo("Valmis", f"Valmis!\n\nKansio:\n{OUT_DIR}\n\nSähköposteja: {len(emails)}")
                 return
 
-            # 2) muuten parsitaan nimet ja haetaan email nimellä (automaattisesti paras osuma)
             strict = bool(self.strict_var.get())
             max_names = int(self.max_names_var.get() or 400)
 
@@ -1370,7 +1328,6 @@ class App(BaseTk):
                 self.set_status("Pysäytetty.")
                 return
 
-            # final save
             if emails:
                 try:
                     save_word_plain_lines_to_path(emails, PARTIAL_DOCX_PATH)
