@@ -2,21 +2,11 @@
 # ProtestiBotti:
 #   1) PDF -> Y-tunnukset -> YTJ sähköpostit
 #   2) Kauppalehti (Chrome debug 9222) -> Y-tunnukset -> YTJ sähköpostit
-#   3) Clipboard (Ctrl+C -> Ctrl+V) -> (Y-tunnukset tai yritysnimet) -> YTJ sähköpostit
+#   3) Clipboard (Ctrl+C -> Ctrl+V) -> yritysnimet -> YTJ: Y-tunnukset -> YTJ: sähköpostit (Näytä klikataan)
 #
-# Päivitykset:
-# - Chrome-botin avaus korjattu: EI PowerShell-string-sekoilua.
-#   Käytetään subprocess.Popen([...]) -> ei enää "C:\Program not recognized" -virhettä.
-# - Clipboard: "Tiukka parsinta" (vain Oy/Ab/Ky/Tmi/...) + "Max nimeä" rajoitin
-# - YTJ nimihaku robustimmaksi:
-#   * etsii hakukentän usealla tavalla
-#   * pisteyttää tulokset (nimimätsi + näkyykö Y-tunnus)
-#   * avaa parhaan osuman automaattisesti (ei kysymyksiä)
-# - Crash-recovery:
-#   * kirjoittaa found-emailit myös emails_tmp.txt:iin lennosta
-#   * päivittää sahkopostit_partial.docx joka 25 uuden sähköpostin välein
-# - Stop (ESC / Pysäytä) tarkistuksia tihennetty odotussilmukoihin
-# - Kauppalehti fallback-ohje: jos ei löydy linkkejä/rivejä, ohjaa Clipboard-moodiin
+# UI-päivitys:
+# - Keskitetty HUD (max-leveys) + scroll
+# - Suomi-teema (sininen/valkoinen) nappeihin ja otsikoihin
 #
 # Riippuvuudet:
 #   pip install selenium webdriver-manager PyPDF2 python-docx tkinterdnd2
@@ -69,6 +59,10 @@ YTJ_PER_COMPANY_SLEEP = 0.03
 KL_LOAD_MORE_WAIT = 1.1
 KL_COMPANY_PAGE_TIMEOUT = 18
 KL_AFTER_OPEN_SLEEP = 0.05
+
+# Clipboard: nimihaku -> ytunnus
+CLIP_YTJ_SEARCH_TIMEOUT = 10.0
+CLIP_PER_NAME_SLEEP = 0.02
 
 # Crash-recovery / partial save
 PARTIAL_SAVE_EVERY_NEW_EMAILS = 25
@@ -141,7 +135,6 @@ def reset_log():
     except Exception:
         pass
 
-    # reset tmp emails file too
     try:
         with open(EMAILS_TMP_PATH, "w", encoding="utf-8") as f:
             f.write("")
@@ -270,7 +263,7 @@ def extract_names_from_clipboard(text: str, strict: bool, max_names: int):
         "näytä lisää", "protestilista", "kauppalehti", "kirjaudu", "tilaa", "tilaajille",
         "€", "eur", "summa", "viiväst", "päivä", "päivää", "päivämäärä",
         "y-tunnus", "y tunnus", "ytunnus", "osoite", "postinumero",
-        "toiminimi", "sähköposti", "puhelin", "www.", "http",
+        "sähköposti", "puhelin", "www.", "http",
     ]
 
     for ln in lines:
@@ -278,7 +271,6 @@ def extract_names_from_clipboard(text: str, strict: bool, max_names: int):
             break
 
         low = ln.lower()
-
         if YT_RE.search(ln):
             continue
         if any(b in low for b in bad_contains):
@@ -307,12 +299,14 @@ def extract_names_from_clipboard(text: str, strict: bool, max_names: int):
     return out
 
 
-def similarity(a: str, b: str) -> float:
-    a = (a or "").strip().lower()
-    b = (b or "").strip().lower()
-    if not a or not b:
-        return 0.0
-    return SequenceMatcher(None, a, b).ratio()
+def extract_yt_from_text_anywhere(txt: str) -> str:
+    if not txt:
+        return ""
+    for m in YT_RE.findall(txt):
+        n = normalize_yt(m)
+        if n:
+            return n
+    return ""
 
 
 # =========================
@@ -359,40 +353,21 @@ def open_new_tab(driver, url="about:blank"):
     driver.switch_to.window(driver.window_handles[-1])
 
 
-def list_tabs(driver):
-    tabs = []
-    for h in driver.window_handles:
-        try:
-            driver.switch_to.window(h)
-            tabs.append((driver.title or "", driver.current_url or ""))
-        except Exception:
-            tabs.append(("", ""))
-    return tabs
-
-
-def focus_kauppalehti_tab(driver, log_cb=None) -> bool:
-    found = False
+# =========================
+#   KAUPPALEHTI (kerää YT)
+# =========================
+def focus_kauppalehti_tab(driver) -> bool:
     for handle in driver.window_handles:
         try:
             driver.switch_to.window(handle)
             url = (driver.current_url or "")
             if KAUPPALEHTI_MATCH in url:
-                found = True
-                break
+                return True
         except Exception:
             continue
-
-    if log_cb:
-        log_cb("Chrome TAB LISTA (title | url):")
-        for title, url in list_tabs(driver):
-            log_cb(f"  {title} | {url}")
-
-    return found
+    return False
 
 
-# =========================
-#   KAUPPALEHTI HELPERS
-# =========================
 def page_looks_like_protestilista(driver) -> bool:
     try:
         rows = driver.find_elements(By.XPATH, "//table//tbody//tr")
@@ -400,7 +375,6 @@ def page_looks_like_protestilista(driver) -> bool:
             return True
     except Exception:
         pass
-
     try:
         for b in driver.find_elements(By.XPATH, "//button|//*[@role='button']"):
             if (b.text or "").strip().lower() == "näytä lisää":
@@ -423,7 +397,7 @@ def page_looks_like_login_or_paywall(driver) -> bool:
 
 
 def ensure_protestilista_open_and_ready(driver, status_cb, log_cb, max_wait_seconds=900, stop_flag=None) -> bool:
-    if focus_kauppalehti_tab(driver, log_cb):
+    if focus_kauppalehti_tab(driver):
         status_cb("Löytyi protestilista-tab.")
     else:
         status_cb("Protestilista-tab ei löytynyt -> avaan protestilistan uuteen tabiin…")
@@ -437,7 +411,6 @@ def ensure_protestilista_open_and_ready(driver, status_cb, log_cb, max_wait_seco
 
     start = time.time()
     warned = False
-
     while True:
         if stop_flag and stop_flag.is_set():
             status_cb("Pysäytetty.")
@@ -496,15 +469,11 @@ def get_company_hrefs_from_visible_rows(driver):
                 continue
             links = r.find_elements(By.XPATH, ".//td[1]//a[contains(@href,'/yritykset/') and normalize-space(.)!='']")
             for a in links:
-                try:
-                    href = (a.get_attribute("href") or "").strip()
-                    if href and "/yritykset/" in href:
-                        hrefs.append(href)
-                except Exception:
-                    continue
+                href = (a.get_attribute("href") or "").strip()
+                if href and "/yritykset/" in href:
+                    hrefs.append(href)
         except Exception:
             continue
-
     out = []
     seen = set()
     for h in hrefs:
@@ -514,23 +483,11 @@ def get_company_hrefs_from_visible_rows(driver):
     return out
 
 
-def extract_yt_from_text_anywhere(txt: str) -> str:
-    if not txt:
-        return ""
-    for m in YT_RE.findall(txt):
-        n = normalize_yt(m)
-        if n:
-            return n
-    return ""
-
-
 def extract_yt_from_company_page_in_new_tab(driver, href: str, stop_flag):
     if stop_flag.is_set():
         return ""
-
     parent = driver.current_window_handle
     open_new_tab(driver, href)
-
     yt = ""
     try:
         t0 = time.time()
@@ -560,11 +517,7 @@ def extract_yt_from_company_page_in_new_tab(driver, href: str, stop_flag):
         try:
             driver.switch_to.window(parent)
         except Exception:
-            try:
-                driver.switch_to.window(driver.window_handles[0])
-            except Exception:
-                pass
-
+            pass
     return yt
 
 
@@ -575,48 +528,36 @@ def collect_yts_from_kauppalehti(driver, status_cb, log_cb, stop_flag):
         pass
     try_accept_cookies(driver)
 
-    if not ensure_protestilista_open_and_ready(driver, status_cb, log_cb, max_wait_seconds=900, stop_flag=stop_flag):
+    if not ensure_protestilista_open_and_ready(driver, status_cb, log_cb, stop_flag=stop_flag):
         return []
 
     collected = set()
     seen_hrefs = set()
-    loops = 0
 
     while True:
         if stop_flag.is_set():
             status_cb("Pysäytetty.")
             break
 
-        loops += 1
         hrefs = get_company_hrefs_from_visible_rows(driver)
-
         if not hrefs:
             status_cb("Kauppalehti: en löydä yrityslinkkejä. Käytä Clipboard-moodia (Ctrl+A Ctrl+C -> Ctrl+V).")
-            log_cb("ERROR: no company hrefs found (DOM/paywall). Suggest clipboard mode.")
+            log_cb("ERROR: no company hrefs found")
             break
 
         new_hrefs = [h for h in hrefs if h not in seen_hrefs]
         status_cb(f"Kauppalehti: linkkejä {len(hrefs)} | uudet {len(new_hrefs)} | Y-tunnuksia {len(collected)}")
 
-        got_this_pass = 0
+        got = 0
         for href in new_hrefs:
             if stop_flag.is_set():
-                status_cb("Pysäytetty.")
                 break
-
             seen_hrefs.add(href)
-            try:
-                yt = extract_yt_from_company_page_in_new_tab(driver, href, stop_flag)
-                if yt and yt not in collected:
-                    collected.add(yt)
-                    got_this_pass += 1
-                    log_cb(f"+ {yt} (yht {len(collected)})")
-                elif not yt:
-                    log_cb("SKIP: Y-tunnusta ei löytynyt yrityssivulta")
-            except StaleElementReferenceException:
-                continue
-            except Exception as e:
-                log_cb(f"SKIP: yrityssivu error: {e}")
+            yt = extract_yt_from_company_page_in_new_tab(driver, href, stop_flag)
+            if yt and yt not in collected:
+                collected.add(yt)
+                got += 1
+                log_cb(f"+ {yt} (yht {len(collected)})")
 
         if stop_flag.is_set():
             status_cb("Pysäytetty.")
@@ -624,11 +565,7 @@ def collect_yts_from_kauppalehti(driver, status_cb, log_cb, stop_flag):
 
         if click_nayta_lisaa(driver):
             status_cb("Kauppalehti: Näytä lisää…")
-            for _ in range(int(KL_LOAD_MORE_WAIT / 0.1)):
-                if stop_flag.is_set():
-                    status_cb("Pysäytetty.")
-                    break
-                time.sleep(0.1)
+            time.sleep(KL_LOAD_MORE_WAIT)
             try:
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             except Exception:
@@ -636,19 +573,15 @@ def collect_yts_from_kauppalehti(driver, status_cb, log_cb, stop_flag):
             time.sleep(0.25)
             continue
 
-        if got_this_pass == 0 and len(new_hrefs) == 0:
-            status_cb("Kauppalehti: ei uusia linkkejä + ei Näytä lisää -> valmis.")
-            break
-
-        if loops >= 3 and got_this_pass == 0 and len(new_hrefs) > 0:
-            status_cb("Kauppalehti: uusia linkkejä mutta ei Y-tunnuksia -> lopetan (paywall/DOM-muutos?).")
+        if got == 0 and not new_hrefs:
+            status_cb("Kauppalehti: valmis.")
             break
 
     return sorted(collected)
 
 
 # =========================
-#   YTJ EMAILS (YT tiedossa)
+#   YTJ (email)
 # =========================
 def click_all_nayta_ytj(driver):
     for _ in range(YTJ_NAYTA_PASSES):
@@ -723,7 +656,7 @@ def fetch_emails_from_ytj(driver, yt_list, status_cb, progress_cb, log_cb, stop_
             status_cb("Pysäytetty.")
             break
 
-        status_cb(f"YTJ: {i}/{len(yt_list)} {yt}")
+        status_cb(f"YTJ email: {i}/{len(yt_list)} {yt}")
         progress_cb(i - 1, len(yt_list))
 
         try:
@@ -781,7 +714,7 @@ def fetch_emails_from_ytj(driver, yt_list, status_cb, progress_cb, log_cb, stop_
 
 
 # =========================
-#   YTJ NAME SEARCH (robust)
+#   YTJ nimi -> YT
 # =========================
 def ytj_open_search_home(driver):
     driver.get("https://tietopalvelu.ytj.fi/")
@@ -800,24 +733,14 @@ def find_ytj_search_input(driver):
         "//input[contains(translate(@name,'HAE','hae'),'hae')]",
         "//form//input",
     ]
-    seen = set()
     cands = []
     for xp in xpaths:
         try:
-            for e in driver.find_elements(By.XPATH, xp):
-                if id(e) in seen:
-                    continue
-                seen.add(id(e))
-                cands.append(e)
+            cands.extend(driver.find_elements(By.XPATH, xp))
         except Exception:
             pass
-
     try:
-        for e in driver.find_elements(By.XPATH, "//input"):
-            if id(e) in seen:
-                continue
-            seen.add(id(e))
-            cands.append(e)
+        cands.extend(driver.find_elements(By.XPATH, "//input"))
     except Exception:
         pass
 
@@ -848,7 +771,7 @@ def find_ytj_search_input(driver):
 
 def score_result(name_query: str, card_text: str) -> float:
     txt = (card_text or "").strip()
-    m = similarity(name_query, txt)
+    m = SequenceMatcher(None, (name_query or "").lower(), txt.lower()).ratio()
     score = m * 100.0
     if extract_yt_from_text_anywhere(txt):
         score += 20.0
@@ -878,7 +801,7 @@ def ytj_find_company_and_open_best(driver, name: str, stop_flag):
     best_score = -1.0
 
     t0 = time.time()
-    while time.time() - t0 < 10.0:
+    while time.time() - t0 < CLIP_YTJ_SEARCH_TIMEOUT:
         if stop_flag.is_set():
             return False
 
@@ -889,7 +812,7 @@ def ytj_find_company_and_open_best(driver, name: str, stop_flag):
 
         candidate_links = []
         xps = [
-            "//a[contains(@href,'/yritys/') or contains(@href,'/company/')]",
+            "//a[contains(@href,'/yritys/')]",
             "//a[contains(@href,'yritys')]",
         ]
         for xp in xps:
@@ -900,7 +823,7 @@ def ytj_find_company_and_open_best(driver, name: str, stop_flag):
 
         checked = 0
         for a in candidate_links:
-            if checked >= 25:
+            if checked >= 30:
                 break
             try:
                 if not a.is_displayed():
@@ -909,15 +832,11 @@ def ytj_find_company_and_open_best(driver, name: str, stop_flag):
                 if not href or "tietopalvelu.ytj.fi" not in href:
                     continue
 
-                card_text = ""
                 try:
                     card = a.find_element(By.XPATH, "ancestor::*[self::li or self::div or self::article][1]")
                     card_text = (card.text or "")
                 except Exception:
-                    try:
-                        card_text = (a.text or "")
-                    except Exception:
-                        card_text = ""
+                    card_text = (a.text or "")
 
                 s = score_result(name, card_text)
                 checked += 1
@@ -929,7 +848,6 @@ def ytj_find_company_and_open_best(driver, name: str, stop_flag):
 
         if best_link:
             break
-
         time.sleep(0.2)
 
     if not best_link:
@@ -944,6 +862,18 @@ def ytj_find_company_and_open_best(driver, name: str, stop_flag):
         return True
     except Exception:
         return False
+
+
+def ytj_name_to_yt(driver, name: str, stop_flag) -> str:
+    ok = ytj_find_company_and_open_best(driver, name, stop_flag)
+    if not ok:
+        return ""
+    try_accept_cookies(driver)
+    try:
+        body = driver.find_element(By.TAG_NAME, "body").text or ""
+    except Exception:
+        body = ""
+    return extract_yt_from_text_anywhere(body)
 
 
 # =========================
@@ -964,14 +894,13 @@ def build_chrome_bot_args():
             chrome_exe = p
             break
     if chrome_exe is None:
-        chrome_exe = "chrome"  # fallback PATH
+        chrome_exe = "chrome"
 
-    args = [
+    return [
         chrome_exe,
         "--remote-debugging-port=9222",
         f"--user-data-dir={profile_dir}",
     ]
-    return args
 
 
 def launch_chrome_bot():
@@ -984,31 +913,39 @@ def launch_chrome_bot():
 
 
 # =========================
-#   GUI (scroll + stop)
+#   UI (Centered + Finland theme)
 # =========================
 class ScrollableFrame(ttk.Frame):
-    def __init__(self, container, *args, **kwargs):
+    def __init__(self, container, max_width=980, *args, **kwargs):
         super().__init__(container, *args, **kwargs)
-        canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
-        self.scrollable_frame = ttk.Frame(canvas)
+        self.max_width = max_width
 
+        self.canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+
+        self.scrollable_frame = ttk.Frame(self.canvas)
+
+        self._win = self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="n")
         self.scrollable_frame.bind(
             "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
         )
+        self.canvas.configure(yscrollcommand=scrollbar.set)
 
-        canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        canvas.pack(side="left", fill="both", expand=True)
+        self.canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
         def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self.canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
-        self.canvas = canvas
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+
+    def _on_canvas_configure(self, event):
+        new_w = min(self.max_width, max(320, event.width))
+        self.canvas.itemconfigure(self._win, width=new_w)
+        x = event.width // 2
+        self.canvas.coords(self._win, (x, 0))
 
 
 BaseTk = TkinterDnD.Tk if HAS_DND else tk.Tk
@@ -1018,81 +955,117 @@ class App(BaseTk):
     def __init__(self):
         super().__init__()
         reset_log()
-
         self.stop_flag = threading.Event()
 
-        self.title("ProtestiBotti (Kauppalehti + PDF + Clipboard -> YTJ)")
-        self.geometry("980x820")
+        # Finland theme
+        self.FI_BLUE = "#003580"
+        self.FI_WHITE = "#FFFFFF"
+        self.FI_BG = "#F7F9FC"
 
+        self.configure(bg=self.FI_BG)
+
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+
+        style.configure("App.TFrame", background=self.FI_BG)
+        style.configure("App.TLabel", background=self.FI_BG, foreground=self.FI_BLUE, font=("Arial", 11))
+        style.configure("Title.TLabel", background=self.FI_BG, foreground=self.FI_BLUE, font=("Arial", 20, "bold"))
+
+        style.configure("Finn.TButton", font=("Arial", 12, "bold"), padding=(14, 10))
+        style.map("Finn.TButton",
+                  background=[("active", "#002B66"), ("!active", self.FI_BLUE), ("disabled", "#9FB3D1")],
+                  foreground=[("!disabled", self.FI_WHITE), ("disabled", "#EEF3FF")])
+
+        style.configure("Finn.TCheckbutton", background=self.FI_BG, foreground=self.FI_BLUE)
+
+        self.title("ProtestiBotti (Kauppalehti + PDF + Clipboard -> YTJ)")
+        self.geometry("980x860")
         self.bind_all("<Escape>", lambda e: self.request_stop())
 
-        outer = ScrollableFrame(self)
+        outer = ScrollableFrame(self, max_width=980)
         outer.pack(fill="both", expand=True)
         root = outer.scrollable_frame
+        root.configure(style="App.TFrame")
 
-        tk.Label(root, text="ProtestiBotti", font=("Arial", 18, "bold")).pack(pady=10)
-        tk.Label(
+        ttk.Label(root, text="ProtestiBotti", style="Title.TLabel").pack(pady=(12, 8))
+        ttk.Label(
             root,
             text="Moodit:\n"
                  "1) Kauppalehti (Chrome debug 9222) → Y-tunnukset → YTJ sähköpostit\n"
                  "2) PDF → Y-tunnukset → YTJ sähköpostit\n"
-                 "3) Clipboard: Ctrl+A Ctrl+C sivulta → Ctrl+V bottiin → YTJ sähköpostit\n\n"
+                 "3) Clipboard: Ctrl+A Ctrl+C sivulta → Ctrl+V bottiin → Nimet → YT → Email\n\n"
                  "Hätäseis: Pysäytä-nappi tai ESC.",
+            style="App.TLabel",
             justify="center"
-        ).pack(pady=4)
+        ).pack(pady=6)
 
-        btn_row = tk.Frame(root)
-        btn_row.pack(pady=8)
+        btn_row = ttk.Frame(root, style="App.TFrame")
+        btn_row.pack(pady=10, fill="x")
 
-        tk.Button(btn_row, text="Avaa Chrome-botti (9222)", font=("Arial", 12), command=self.open_chrome_bot).grid(row=0, column=0, padx=8)
-        tk.Button(btn_row, text="Kauppalehti → YTJ", font=("Arial", 12), command=self.start_kauppalehti_mode).grid(row=0, column=1, padx=8)
-        tk.Button(btn_row, text="PDF → YTJ", font=("Arial", 12), command=self.start_pdf_mode).grid(row=0, column=2, padx=8)
-        tk.Button(btn_row, text="Pysäytä", font=("Arial", 12), command=self.request_stop).grid(row=0, column=3, padx=8)
+        ttk.Button(btn_row, text="Avaa Chrome-botti (9222)", style="Finn.TButton", command=self.open_chrome_bot).grid(row=0, column=0, padx=8, pady=6)
+        ttk.Button(btn_row, text="Kauppalehti → YTJ", style="Finn.TButton", command=self.start_kauppalehti_mode).grid(row=0, column=1, padx=8, pady=6)
+        ttk.Button(btn_row, text="PDF → YTJ", style="Finn.TButton", command=self.start_pdf_mode).grid(row=0, column=2, padx=8, pady=6)
+        ttk.Button(btn_row, text="Pysäytä", style="Finn.TButton", command=self.request_stop).grid(row=0, column=3, padx=8, pady=6)
 
-        self.status = tk.Label(root, text="Valmiina.", font=("Arial", 11))
-        self.status.pack(pady=6)
+        for c in range(4):
+            btn_row.grid_columnconfigure(c, weight=1)
+
+        self.status = ttk.Label(root, text="Valmiina.", style="App.TLabel")
+        self.status.pack(pady=8)
 
         self.progress = ttk.Progressbar(root, orient="horizontal", mode="determinate", length=920)
         self.progress.pack(pady=6)
 
+        # PDF drop zone
         self.drop_var = tk.StringVar(value="PDF: Pudota tähän (tai paina PDF → YTJ ja valitse tiedosto)")
-        drop = tk.Label(root, textvariable=self.drop_var, relief="groove", height=2)
+        drop = tk.Label(root, textvariable=self.drop_var, relief="groove", height=2, bg=self.FI_WHITE, fg=self.FI_BLUE)
         drop.pack(fill="x", padx=14, pady=6)
         if HAS_DND:
             drop.drop_target_register(DND_FILES)
             drop.dnd_bind("<<Drop>>", self._on_drop_pdf)
 
-        clip_opts = tk.Frame(root)
+        # Clipboard controls
+        clip_opts = ttk.Frame(root, style="App.TFrame")
         clip_opts.pack(fill="x", padx=14, pady=(10, 2))
 
         self.strict_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(clip_opts, text="Tiukka parsinta (vain Oy/Ab/Ky/Tmi/...)", variable=self.strict_var).pack(side="left")
+        ttk.Checkbutton(
+            clip_opts,
+            text="Tiukka parsinta (vain Oy/Ab/Ky/Tmi/...)",
+            variable=self.strict_var,
+            style="Finn.TCheckbutton",
+        ).pack(side="left")
 
-        tk.Label(clip_opts, text="Max nimeä:").pack(side="left", padx=(18, 6))
+        ttk.Label(clip_opts, text="Max nimeä:", style="App.TLabel").pack(side="left", padx=(18, 6))
         self.max_names_var = tk.IntVar(value=400)
         tk.Spinbox(clip_opts, from_=10, to=5000, textvariable=self.max_names_var, width=7).pack(side="left")
 
-        tk.Label(root, text="Clipboard (Ctrl+V tähän) → hae sähköpostit YTJ:stä:", font=("Arial", 11, "bold")).pack(pady=(6, 4))
-        self.clip_text = tk.Text(root, height=8, wrap="word")
+        ttk.Label(root, text="Clipboard (Ctrl+V tähän):", style="App.TLabel").pack(pady=(8, 4))
+        self.clip_text = tk.Text(root, height=8, wrap="word", bg=self.FI_WHITE, fg="#111111", insertbackground=self.FI_BLUE)
         self.clip_text.pack(fill="x", padx=14)
 
-        clip_btn_row = tk.Frame(root)
-        clip_btn_row.pack(pady=6)
-        tk.Button(clip_btn_row, text="Clipboard → YTJ", font=("Arial", 12), command=self.start_clipboard_mode).pack()
+        clip_btn_row = ttk.Frame(root, style="App.TFrame")
+        clip_btn_row.pack(pady=8)
+        ttk.Button(clip_btn_row, text="Clipboard → (Nimet → YT → Email)", style="Finn.TButton", command=self.start_clipboard_mode).pack()
 
-        frame = tk.Frame(root)
+        # Log area
+        frame = ttk.Frame(root, style="App.TFrame")
         frame.pack(fill="both", expand=True, padx=14, pady=10)
 
-        tk.Label(frame, text="Live-logi (uusimmat alimmaisena):").pack(anchor="w")
-        self.listbox = tk.Listbox(frame, height=18)
+        ttk.Label(frame, text="Live-logi (uusimmat alimmaisena):", style="App.TLabel").pack(anchor="w")
+        self.listbox = tk.Listbox(frame, height=18, bg=self.FI_WHITE, fg="#111111")
         self.listbox.pack(side="left", fill="both", expand=True)
 
-        sb = tk.Scrollbar(frame, orient="vertical", command=self.listbox.yview)
+        sb = ttk.Scrollbar(frame, orient="vertical", command=self.listbox.yview)
         sb.pack(side="right", fill="y")
         self.listbox.configure(yscrollcommand=sb.set)
 
-        tk.Label(root, text=f"Tallennus: {OUT_DIR}", wraplength=940, justify="center").pack(pady=6)
+        ttk.Label(root, text=f"Tallennus: {OUT_DIR}", style="App.TLabel", justify="center").pack(pady=6)
 
+    # ---- UI helpers
     def request_stop(self):
         self.stop_flag.set()
         self.ui_log("STOP: käyttäjä pyysi pysäytystä.")
@@ -1117,6 +1090,7 @@ class App(BaseTk):
         self.progress["value"] = value
         self.update_idletasks()
 
+    # ---- actions
     def open_chrome_bot(self):
         ok = launch_chrome_bot()
         if ok:
@@ -1135,6 +1109,9 @@ class App(BaseTk):
         else:
             messagebox.showwarning("Ei PDF", "Pudotettu tiedosto ei ollut .pdf")
 
+    # =========================
+    #   KAUPPALEHTI MODE
+    # =========================
     def start_kauppalehti_mode(self):
         self.clear_stop()
         threading.Thread(target=self.run_kauppalehti_mode, daemon=True).start()
@@ -1181,9 +1158,10 @@ class App(BaseTk):
             self.ui_log(f"VIRHE: {e}")
             self.set_status("Virhe. Katso log.txt")
             messagebox.showerror("Virhe", f"Tuli virhe.\nKatso log.txt:\n{LOG_PATH}\n\n{e}")
-        finally:
-            pass
 
+    # =========================
+    #   PDF MODE
+    # =========================
     def start_pdf_mode(self):
         self.clear_stop()
         path = filedialog.askopenfilename(filetypes=[("PDF files", "*.pdf")])
@@ -1232,6 +1210,9 @@ class App(BaseTk):
                 except Exception:
                     pass
 
+    # =========================
+    #   CLIPBOARD MODE
+    # =========================
     def start_clipboard_mode(self):
         self.clear_stop()
         text = self.clip_text.get("1.0", tk.END).strip()
@@ -1243,12 +1224,11 @@ class App(BaseTk):
     def run_clipboard_mode(self, text: str):
         driver = None
         try:
-            yt_list = extract_yts_from_text(text)
-
-            if yt_list:
-                self.set_status("Clipboard: löytyi Y-tunnukset tekstistä → haetaan sähköpostit…")
+            yt_list_direct = extract_yts_from_text(text)
+            if yt_list_direct:
+                self.set_status(f"Clipboard: löytyi {len(yt_list_direct)} Y-tunnusta → haetaan sähköpostit…")
                 driver = start_new_driver()
-                emails = fetch_emails_from_ytj(driver, yt_list, self.set_status, self.set_progress, self.ui_log, self.stop_flag)
+                emails = fetch_emails_from_ytj(driver, yt_list_direct, self.set_status, self.set_progress, self.ui_log, self.stop_flag)
 
                 if self.stop_flag.is_set():
                     self.set_status("Pysäytetty.")
@@ -1262,82 +1242,61 @@ class App(BaseTk):
 
             strict = bool(self.strict_var.get())
             max_names = int(self.max_names_var.get() or 400)
-
             names = extract_names_from_clipboard(text, strict=strict, max_names=max_names)
+
             if not names:
-                self.set_status("Clipboard: en löytänyt Y-tunnuksia enkä yritysnimiä.")
-                messagebox.showwarning("Ei löytynyt", "Tekstistä ei saatu irti Y-tunnuksia tai yritysnimiä.\nKokeile ottaa Tiukka parsinta pois.")
+                self.set_status("Clipboard: en löytänyt yritysnimiä.")
+                messagebox.showwarning("Ei löytynyt", "Tekstistä ei saatu irti yritysnimiä.\nKokeile ottaa Tiukka parsinta pois.")
                 return
 
-            self.set_status(f"Käynnistetään Chrome ja haetaan sähköpostit YTJ:stä (nimihaku)… (nimiä {len(names)})")
+            self.set_status(f"Clipboard: haetaan Y-tunnukset YTJ:stä nimillä… (nimiä {len(names)})")
             driver = start_new_driver()
 
-            emails = []
-            seen = set()
-            new_since_partial = 0
-
+            yts = []
+            seen_yts = set()
             self.set_progress(0, max(1, len(names)))
 
             for i, name in enumerate(names, start=1):
                 if self.stop_flag.is_set():
                     self.set_status("Pysäytetty.")
-                    break
+                    return
 
-                self.set_status(f"YTJ nimihaku: {i}/{len(names)}  {name}")
+                self.set_status(f"YTJ Y-tunnus: {i}/{len(names)}  {name}")
                 self.set_progress(i - 1, len(names))
 
-                ok = ytj_find_company_and_open_best(driver, name, self.stop_flag)
-                if not ok:
-                    self.ui_log(f"NOT FOUND: {name}")
-                    continue
+                yt = ytj_name_to_yt(driver, name, self.stop_flag)
+                if yt:
+                    if yt not in seen_yts:
+                        seen_yts.add(yt)
+                        yts.append(yt)
+                        self.ui_log(f"+YT {yt}  ({len(yts)})")
+                else:
+                    self.ui_log(f"YT NOT FOUND: {name}")
 
-                try_accept_cookies(driver)
-                click_all_nayta_ytj(driver)
-
-                email = ""
-                for _ in range(YTJ_RETRY_READS):
-                    if self.stop_flag.is_set():
-                        break
-                    email = extract_email_from_ytj(driver)
-                    if email:
-                        break
-                    time.sleep(YTJ_RETRY_SLEEP)
-
-                if email:
-                    k = email.lower()
-                    if k not in seen:
-                        seen.add(k)
-                        emails.append(email)
-                        append_email_tmp(email)
-                        self.ui_log(email)
-                        new_since_partial += 1
-
-                        if new_since_partial >= PARTIAL_SAVE_EVERY_NEW_EMAILS:
-                            try:
-                                save_word_plain_lines_to_path(emails, PARTIAL_DOCX_PATH)
-                                self.ui_log(f"(partial) Tallennettu: {PARTIAL_DOCX_PATH}")
-                            except Exception:
-                                pass
-                            new_since_partial = 0
-
-                time.sleep(YTJ_PER_COMPANY_SLEEP)
+                time.sleep(CLIP_PER_NAME_SLEEP)
 
             self.set_progress(len(names), max(1, len(names)))
+
+            if not yts:
+                self.set_status("Ei löytynyt yhtään Y-tunnusta nimillä.")
+                messagebox.showwarning("Ei löytynyt", "YTJ-nimihaulla ei saatu yhtään Y-tunnusta.\nKokeile: Tiukka parsinta pois.")
+                return
+
+            self.set_status(f"YTJ: haetaan sähköpostit {len(yts)} Y-tunnuksella…")
+            emails = fetch_emails_from_ytj(driver, yts, self.set_status, self.set_progress, self.ui_log, self.stop_flag)
 
             if self.stop_flag.is_set():
                 self.set_status("Pysäytetty.")
                 return
 
-            if emails:
-                try:
-                    save_word_plain_lines_to_path(emails, PARTIAL_DOCX_PATH)
-                except Exception:
-                    pass
-
             em_path = save_word_plain_lines(emails, "sahkopostit.docx")
             self.ui_log(f"Tallennettu: {em_path}")
+
             self.set_status("Valmis!")
-            messagebox.showinfo("Valmis", f"Valmis!\n\nKansio:\n{OUT_DIR}\n\nSähköposteja: {len(emails)}")
+            messagebox.showinfo(
+                "Valmis",
+                f"Valmis!\n\nKansio:\n{OUT_DIR}\n\nNimiä: {len(names)}\nY-tunnuksia: {len(yts)}\nSähköposteja: {len(emails)}"
+            )
 
         except Exception as e:
             self.ui_log(f"VIRHE: {e}")
