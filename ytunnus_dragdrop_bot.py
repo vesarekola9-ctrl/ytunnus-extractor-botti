@@ -4,12 +4,21 @@
 #   2) Kauppalehti (Chrome debug 9222) -> Y-tunnukset -> YTJ sähköpostit
 #   3) Clipboard (Ctrl+C -> Ctrl+V) -> yritysnimet -> YTJ: Y-tunnukset -> YTJ: sähköpostit (Näytä klikataan)
 #
-# UI-päivitys:
-# - Keskitetty HUD (max-leveys) + scroll
-# - Suomi-teema (sininen/valkoinen) nappeihin ja otsikoihin
+# FIX:
+# - Sähköpostit tallentuvat aina uuteen Wordiin saman päivän kansiossa:
+#     sahkopostit_001.docx, sahkopostit_002.docx, ...
+#   eikä ylikirjoita aiempaa.
+#
+# UI:
+# - Musta tausta + punaiset napit
+# - Kuvia kulmiin + glow (Pillowlla) + hover nappeihin
 #
 # Riippuvuudet:
 #   pip install selenium webdriver-manager PyPDF2 python-docx tkinterdnd2
+#   pip install pillow   (SUOSITUS: jotta .jpg kuvat + glow toimii)
+#
+# Kuvat samaan kansioon kuin tämä .py / exe:
+#   h1.jpg, h.jpg, uo.png, polis.jpg, vero.png
 #
 # Build:
 #   pyinstaller --noconfirm --onefile --windowed --name ProtestiBotti protestibotti.py
@@ -34,7 +43,6 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
-    StaleElementReferenceException,
     WebDriverException,
     TimeoutException,
 )
@@ -46,6 +54,13 @@ try:
     HAS_DND = True
 except Exception:
     HAS_DND = False
+
+# Optional: Pillow for JPG/PNG scaling + glow
+try:
+    from PIL import Image, ImageTk, ImageFilter, ImageOps  # type: ignore
+    HAS_PIL = True
+except Exception:
+    HAS_PIL = False
 
 # =========================
 #   TUNING (NOPEUS)
@@ -60,11 +75,9 @@ KL_LOAD_MORE_WAIT = 1.1
 KL_COMPANY_PAGE_TIMEOUT = 18
 KL_AFTER_OPEN_SLEEP = 0.05
 
-# Clipboard: nimihaku -> ytunnus
 CLIP_YTJ_SEARCH_TIMEOUT = 10.0
 CLIP_PER_NAME_SLEEP = 0.02
 
-# Crash-recovery / partial save
 PARTIAL_SAVE_EVERY_NEW_EMAILS = 25
 
 # =========================
@@ -78,7 +91,6 @@ KAUPPALEHTI_URL = "https://www.kauppalehti.fi/yritykset/protestilista"
 KAUPPALEHTI_MATCH = "kauppalehti.fi/yritykset/protestilista"
 YTJ_COMPANY_URL = "https://tietopalvelu.ytj.fi/yritys/{}"
 
-# Tiukka parsinta: yritysmuodot joita usein näkyy nimessä
 STRICT_FORMS_RE = re.compile(
     r"\b(oy|ab|ky|tmi|oyj|osakeyhtiö|kommandiittiyhtiö|toiminimi|as\.|ltd|llc|inc|gmbh)\b",
     re.IGNORECASE,
@@ -134,15 +146,40 @@ def reset_log():
             f.write("=== BOTTI KÄYNNISTETTY ===\n")
     except Exception:
         pass
-
     try:
         with open(EMAILS_TMP_PATH, "w", encoding="utf-8") as f:
             f.write("")
     except Exception:
         pass
-
     log_to_file(f"Output: {OUT_DIR}")
     log_to_file(f"Logi: {LOG_PATH}")
+
+
+# =========================
+#   UNIQUE FILE NAMES (FIX)
+# =========================
+def next_indexed_docx(prefix: str, start_at: int = 1) -> str:
+    """
+    Returns a path like OUT_DIR/prefix_001.docx that doesn't exist yet.
+    Example: prefix="sahkopostit" -> sahkopostit_001.docx, sahkopostit_002.docx, ...
+    """
+    i = start_at
+    while True:
+        name = f"{prefix}_{i:03d}.docx"
+        path = os.path.join(OUT_DIR, name)
+        if not os.path.exists(path):
+            return path
+        i += 1
+
+
+def save_word_unique(lines, prefix: str):
+    path = next_indexed_docx(prefix)
+    doc = Document()
+    for line in lines:
+        if line:
+            doc.add_paragraph(line)
+    doc.save(path)
+    return path
 
 
 # =========================
@@ -811,11 +848,7 @@ def ytj_find_company_and_open_best(driver, name: str, stop_flag):
             pass
 
         candidate_links = []
-        xps = [
-            "//a[contains(@href,'/yritys/')]",
-            "//a[contains(@href,'yritys')]",
-        ]
-        for xp in xps:
+        for xp in ("//a[contains(@href,'/yritys/')]", "//a[contains(@href,'yritys')]"):
             try:
                 candidate_links.extend(driver.find_elements(By.XPATH, xp))
             except Exception:
@@ -877,7 +910,7 @@ def ytj_name_to_yt(driver, name: str, stop_flag) -> str:
 
 
 # =========================
-#   CHROME BOT LAUNCHER (9222)  [FIXED]
+#   CHROME BOT LAUNCHER (9222)
 # =========================
 def build_chrome_bot_args():
     base = get_exe_dir()
@@ -913,7 +946,7 @@ def launch_chrome_bot():
 
 
 # =========================
-#   UI (Centered + Finland theme)
+#   UI
 # =========================
 class ScrollableFrame(ttk.Frame):
     def __init__(self, container, max_width=980, *args, **kwargs):
@@ -924,8 +957,8 @@ class ScrollableFrame(ttk.Frame):
         scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
 
         self.scrollable_frame = ttk.Frame(self.canvas)
-
         self._win = self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="n")
+
         self.scrollable_frame.bind(
             "<Configure>",
             lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
@@ -957,115 +990,198 @@ class App(BaseTk):
         reset_log()
         self.stop_flag = threading.Event()
 
-        # Finland theme
-        self.FI_BLUE = "#003580"
-        self.FI_WHITE = "#FFFFFF"
-        self.FI_BG = "#F7F9FC"
+        self.BG = "#000000"
+        self.FG = "#FFFFFF"
+        self.RED = "#B00020"
+        self.RED_HOVER = "#E0002A"
+        self.PANEL = "#0B0B0B"
+        self.BORDER = "#222222"
+        self.MUTED = "#CFCFCF"
 
-        self.configure(bg=self.FI_BG)
-
-        style = ttk.Style()
-        try:
-            style.theme_use("clam")
-        except Exception:
-            pass
-
-        style.configure("App.TFrame", background=self.FI_BG)
-        style.configure("App.TLabel", background=self.FI_BG, foreground=self.FI_BLUE, font=("Arial", 11))
-        style.configure("Title.TLabel", background=self.FI_BG, foreground=self.FI_BLUE, font=("Arial", 20, "bold"))
-
-        style.configure("Finn.TButton", font=("Arial", 12, "bold"), padding=(14, 10))
-        style.map("Finn.TButton",
-                  background=[("active", "#002B66"), ("!active", self.FI_BLUE), ("disabled", "#9FB3D1")],
-                  foreground=[("!disabled", self.FI_WHITE), ("disabled", "#EEF3FF")])
-
-        style.configure("Finn.TCheckbutton", background=self.FI_BG, foreground=self.FI_BLUE)
-
-        self.title("ProtestiBotti (Kauppalehti + PDF + Clipboard -> YTJ)")
-        self.geometry("980x860")
+        self.configure(bg=self.BG)
+        self.title("ProtestiBotti")
+        self.geometry("980x900")
         self.bind_all("<Escape>", lambda e: self.request_stop())
 
         outer = ScrollableFrame(self, max_width=980)
         outer.pack(fill="both", expand=True)
+        try:
+            outer.canvas.configure(bg=self.BG)
+        except Exception:
+            pass
+
         root = outer.scrollable_frame
-        root.configure(style="App.TFrame")
+        self.main = tk.Frame(root, bg=self.BG)
+        self.main.pack(fill="both", expand=True)
 
-        ttk.Label(root, text="ProtestiBotti", style="Title.TLabel").pack(pady=(12, 8))
-        ttk.Label(
-            root,
-            text="Moodit:\n"
-                 "1) Kauppalehti (Chrome debug 9222) → Y-tunnukset → YTJ sähköpostit\n"
-                 "2) PDF → Y-tunnukset → YTJ sähköpostit\n"
-                 "3) Clipboard: Ctrl+A Ctrl+C sivulta → Ctrl+V bottiin → Nimet → YT → Email\n\n"
-                 "Hätäseis: Pysäytä-nappi tai ESC.",
-            style="App.TLabel",
-            justify="center"
-        ).pack(pady=6)
+        self._img_refs = {}
 
-        btn_row = ttk.Frame(root, style="App.TFrame")
-        btn_row.pack(pady=10, fill="x")
+        # Corner images
+        self.corner_tl = tk.Label(self.main, bg=self.BG)
+        self.corner_tr = tk.Label(self.main, bg=self.BG)
+        self.corner_bl = tk.Label(self.main, bg=self.BG)
+        self.corner_br = tk.Label(self.main, bg=self.BG)
 
-        ttk.Button(btn_row, text="Avaa Chrome-botti (9222)", style="Finn.TButton", command=self.open_chrome_bot).grid(row=0, column=0, padx=8, pady=6)
-        ttk.Button(btn_row, text="Kauppalehti → YTJ", style="Finn.TButton", command=self.start_kauppalehti_mode).grid(row=0, column=1, padx=8, pady=6)
-        ttk.Button(btn_row, text="PDF → YTJ", style="Finn.TButton", command=self.start_pdf_mode).grid(row=0, column=2, padx=8, pady=6)
-        ttk.Button(btn_row, text="Pysäytä", style="Finn.TButton", command=self.request_stop).grid(row=0, column=3, padx=8, pady=6)
+        self.corner_tl.place(x=10, y=10, anchor="nw")
+        self.corner_tr.place(relx=1.0, x=-10, y=10, anchor="ne")
+        self.corner_bl.place(x=10, rely=1.0, y=-10, anchor="sw")
+        self.corner_br.place(relx=1.0, x=-10, rely=1.0, y=-10, anchor="se")
 
-        for c in range(4):
-            btn_row.grid_columnconfigure(c, weight=1)
+        self._set_image_glow(self.corner_tl, "h1.jpg", (160, 95))
+        self._set_image_glow(self.corner_tr, "h.jpg", (160, 95))
+        self._set_image_glow(self.corner_bl, "uo.png", (220, 60))
+        self._set_image_glow(self.corner_br, "vero.png", (220, 60))
 
-        self.status = ttk.Label(root, text="Valmiina.", style="App.TLabel")
-        self.status.pack(pady=8)
+        title_wrap = tk.Frame(self.main, bg=self.BG)
+        title_wrap.pack(pady=(26, 6))
+        tk.Label(title_wrap, text="ProtestiBotti", bg=self.BG, fg=self.FG, font=("Arial", 24, "bold")).pack()
+        tk.Label(title_wrap, text="PDF / Kauppalehti / Clipboard → YTJ → sähköpostit", bg=self.BG, fg=self.MUTED, font=("Arial", 10)).pack(pady=(4, 0))
 
-        self.progress = ttk.Progressbar(root, orient="horizontal", mode="determinate", length=920)
+        logo_strip = tk.Frame(self.main, bg=self.BG)
+        logo_strip.pack(pady=(6, 10))
+        self.logo_mid = tk.Label(logo_strip, bg=self.BG)
+        self.logo_mid.pack()
+        self._set_image_glow(self.logo_mid, "polis.jpg", (240, 72), glow_alpha=150)
+
+        btn_row = tk.Frame(self.main, bg=self.BG)
+        btn_row.pack(pady=8)
+        self._mk_btn(btn_row, "Avaa Chrome-botti (9222)", self.open_chrome_bot).grid(row=0, column=0, padx=6, pady=6)
+        self._mk_btn(btn_row, "Kauppalehti → YTJ", self.start_kauppalehti_mode).grid(row=0, column=1, padx=6, pady=6)
+        self._mk_btn(btn_row, "PDF → YTJ", self.start_pdf_mode).grid(row=0, column=2, padx=6, pady=6)
+        self._mk_btn(btn_row, "Pysäytä", self.request_stop).grid(row=0, column=3, padx=6, pady=6)
+
+        self.status = tk.Label(self.main, text="Valmiina.", bg=self.BG, fg=self.FG, font=("Arial", 11))
+        self.status.pack(pady=6)
+
+        self.progress = ttk.Progressbar(self.main, orient="horizontal", mode="determinate", length=920)
         self.progress.pack(pady=6)
 
-        # PDF drop zone
         self.drop_var = tk.StringVar(value="PDF: Pudota tähän (tai paina PDF → YTJ ja valitse tiedosto)")
-        drop = tk.Label(root, textvariable=self.drop_var, relief="groove", height=2, bg=self.FI_WHITE, fg=self.FI_BLUE)
+        drop = tk.Label(self.main, textvariable=self.drop_var, relief="groove",
+                        bg=self.PANEL, fg=self.FG, bd=1, highlightthickness=1, highlightbackground=self.BORDER, height=2)
         drop.pack(fill="x", padx=14, pady=6)
         if HAS_DND:
             drop.drop_target_register(DND_FILES)
             drop.dnd_bind("<<Drop>>", self._on_drop_pdf)
 
-        # Clipboard controls
-        clip_opts = ttk.Frame(root, style="App.TFrame")
-        clip_opts.pack(fill="x", padx=14, pady=(10, 2))
+        clip_wrap = tk.Frame(self.main, bg=self.BG)
+        clip_wrap.pack(fill="x", padx=14, pady=(10, 2))
 
         self.strict_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            clip_opts,
+        tk.Checkbutton(
+            clip_wrap,
             text="Tiukka parsinta (vain Oy/Ab/Ky/Tmi/...)",
             variable=self.strict_var,
-            style="Finn.TCheckbutton",
+            bg=self.BG, fg=self.FG,
+            selectcolor=self.PANEL,
+            activebackground=self.BG, activeforeground=self.FG
         ).pack(side="left")
 
-        ttk.Label(clip_opts, text="Max nimeä:", style="App.TLabel").pack(side="left", padx=(18, 6))
+        tk.Label(clip_wrap, text="Max nimeä:", bg=self.BG, fg=self.FG).pack(side="left", padx=(18, 6))
         self.max_names_var = tk.IntVar(value=400)
-        tk.Spinbox(clip_opts, from_=10, to=5000, textvariable=self.max_names_var, width=7).pack(side="left")
+        tk.Spinbox(clip_wrap, from_=10, to=5000, textvariable=self.max_names_var, width=7,
+                   bg=self.PANEL, fg=self.FG, insertbackground=self.FG).pack(side="left")
 
-        ttk.Label(root, text="Clipboard (Ctrl+V tähän):", style="App.TLabel").pack(pady=(8, 4))
-        self.clip_text = tk.Text(root, height=8, wrap="word", bg=self.FI_WHITE, fg="#111111", insertbackground=self.FI_BLUE)
+        tk.Label(self.main, text="Clipboard (Ctrl+V tähän):", bg=self.BG, fg=self.FG, font=("Arial", 11, "bold")).pack(pady=(10, 4))
+        self.clip_text = tk.Text(self.main, height=8, wrap="word", bg=self.PANEL, fg=self.FG, insertbackground=self.FG,
+                                 highlightthickness=1, highlightbackground=self.BORDER)
         self.clip_text.pack(fill="x", padx=14)
 
-        clip_btn_row = ttk.Frame(root, style="App.TFrame")
+        clip_btn_row = tk.Frame(self.main, bg=self.BG)
         clip_btn_row.pack(pady=8)
-        ttk.Button(clip_btn_row, text="Clipboard → (Nimet → YT → Email)", style="Finn.TButton", command=self.start_clipboard_mode).pack()
+        self._mk_btn(clip_btn_row, "Clipboard → (Nimet → YT → Email)", self.start_clipboard_mode).pack()
 
-        # Log area
-        frame = ttk.Frame(root, style="App.TFrame")
-        frame.pack(fill="both", expand=True, padx=14, pady=10)
+        log_frame = tk.Frame(self.main, bg=self.BG)
+        log_frame.pack(fill="both", expand=True, padx=14, pady=10)
 
-        ttk.Label(frame, text="Live-logi (uusimmat alimmaisena):", style="App.TLabel").pack(anchor="w")
-        self.listbox = tk.Listbox(frame, height=18, bg=self.FI_WHITE, fg="#111111")
+        tk.Label(log_frame, text="Live-logi (uusimmat alimmaisena):", bg=self.BG, fg=self.FG).pack(anchor="w")
+
+        box_wrap = tk.Frame(log_frame, bg=self.BG)
+        box_wrap.pack(fill="both", expand=True)
+
+        self.listbox = tk.Listbox(box_wrap, height=18, bg=self.PANEL, fg=self.FG,
+                                  highlightthickness=1, highlightbackground=self.BORDER, selectbackground=self.RED)
         self.listbox.pack(side="left", fill="both", expand=True)
 
-        sb = ttk.Scrollbar(frame, orient="vertical", command=self.listbox.yview)
+        sb = ttk.Scrollbar(box_wrap, orient="vertical", command=self.listbox.yview)
         sb.pack(side="right", fill="y")
         self.listbox.configure(yscrollcommand=sb.set)
 
-        ttk.Label(root, text=f"Tallennus: {OUT_DIR}", style="App.TLabel", justify="center").pack(pady=6)
+        tk.Label(self.main, text=f"Tallennus: {OUT_DIR}", bg=self.BG, fg=self.MUTED, justify="center").pack(pady=(0, 14))
 
-    # ---- UI helpers
+        if not HAS_PIL:
+            self.ui_log("HUOM: Pillow puuttuu -> .jpg ja glow ei toimi. Asenna: pip install pillow")
+
+    def _mk_btn(self, parent, text, cmd):
+        b = tk.Button(
+            parent,
+            text=text,
+            command=cmd,
+            bg=self.RED,
+            fg=self.FG,
+            activebackground=self.RED_HOVER,
+            activeforeground=self.FG,
+            relief="flat",
+            padx=14,
+            pady=10,
+            font=("Arial", 11, "bold"),
+        )
+        b.bind("<Enter>", lambda e: b.configure(bg=self.RED_HOVER))
+        b.bind("<Leave>", lambda e: b.configure(bg=self.RED))
+        return b
+
+    def _set_image_glow(self, label: tk.Label, filename: str, size_hw, glow_alpha=180):
+        path = os.path.join(get_exe_dir(), filename)
+        if not os.path.exists(path):
+            self.ui_log(f"HUOM: kuva puuttuu: {filename} (laita samaan kansioon kuin botti)")
+            label.configure(text=f"[{filename} puuttuu]", fg="#888888", bg=self.BG)
+            return
+
+        w, h = size_hw
+        try:
+            if HAS_PIL:
+                img = Image.open(path)
+                if img.mode not in ("RGB", "RGBA"):
+                    img = img.convert("RGBA")
+                img = ImageOps.contain(img, (w, h))
+                if img.mode != "RGBA":
+                    img = img.convert("RGBA")
+
+                # if jpg, create alpha to avoid full rectangle glow
+                if filename.lower().endswith((".jpg", ".jpeg")):
+                    gray = img.convert("L")
+                    mask = gray.point(lambda p: 255 if p < 245 else 0)
+                    img.putalpha(mask)
+
+                alpha = img.split()[-1]
+                glow = Image.new("RGBA", img.size, (255, 0, 40, glow_alpha))
+                glow.putalpha(alpha)
+
+                pad = 16
+                glow_pad = Image.new("RGBA", (glow.size[0] + pad * 2, glow.size[1] + pad * 2), (0, 0, 0, 0))
+                img_pad = Image.new("RGBA", (img.size[0] + pad * 2, img.size[1] + pad * 2), (0, 0, 0, 0))
+                glow_pad.paste(glow, (pad, pad))
+                img_pad.paste(img, (pad, pad))
+                glow_blur = glow_pad.filter(ImageFilter.GaussianBlur(radius=10))
+                out = Image.alpha_composite(glow_blur, img_pad)
+
+                photo = ImageTk.PhotoImage(out)
+                label.configure(image=photo)
+                self._img_refs[filename] = photo
+                return
+
+            if filename.lower().endswith(".png"):
+                photo = tk.PhotoImage(file=path)
+                label.configure(image=photo)
+                self._img_refs[filename] = photo
+                return
+
+        except Exception as e:
+            self.ui_log(f"KUVA ERROR {filename}: {e}")
+
+        label.configure(text=f"[ei voi näyttää: {filename}]", fg="#888888", bg=self.BG)
+
+    # ---------- UI helpers ----------
     def request_stop(self):
         self.stop_flag.set()
         self.ui_log("STOP: käyttäjä pyysi pysäytystä.")
@@ -1076,9 +1192,12 @@ class App(BaseTk):
 
     def ui_log(self, msg):
         line = log_to_file(msg)
-        self.listbox.insert(tk.END, line)
-        self.listbox.yview_moveto(1.0)
-        self.update_idletasks()
+        try:
+            self.listbox.insert(tk.END, line)
+            self.listbox.yview_moveto(1.0)
+            self.update_idletasks()
+        except Exception:
+            pass
 
     def set_status(self, s):
         self.status.config(text=s)
@@ -1090,7 +1209,7 @@ class App(BaseTk):
         self.progress["value"] = value
         self.update_idletasks()
 
-    # ---- actions
+    # ---------- actions ----------
     def open_chrome_bot(self):
         ok = launch_chrome_bot()
         if ok:
@@ -1122,7 +1241,7 @@ class App(BaseTk):
             self.set_status("Liitytään Chrome-bottiin (9222)…")
             driver = attach_to_existing_chrome()
 
-            self.set_status("Kauppalehti: kerätään Y-tunnukset (yrityssivut linkeistä)…")
+            self.set_status("Kauppalehti: kerätään Y-tunnukset…")
             yt_list = collect_yts_from_kauppalehti(driver, self.set_status, self.ui_log, self.stop_flag)
 
             if self.stop_flag.is_set():
@@ -1144,7 +1263,7 @@ class App(BaseTk):
                 self.set_status("Pysäytetty.")
                 return
 
-            em_path = save_word_plain_lines(emails, "sahkopostit.docx")
+            em_path = save_word_unique(emails, "sahkopostit")
             self.ui_log(f"Tallennettu: {em_path}")
 
             self.set_status("Valmis!")
@@ -1193,7 +1312,8 @@ class App(BaseTk):
                 self.set_status("Pysäytetty.")
                 return
 
-            em_path = save_word_plain_lines(emails, "sahkopostit.docx")
+            # FIX: always new file
+            em_path = save_word_unique(emails, "sahkopostit")
             self.ui_log(f"Tallennettu: {em_path}")
 
             self.set_status("Valmis!")
@@ -1234,7 +1354,7 @@ class App(BaseTk):
                     self.set_status("Pysäytetty.")
                     return
 
-                em_path = save_word_plain_lines(emails, "sahkopostit.docx")
+                em_path = save_word_unique(emails, "sahkopostit")
                 self.ui_log(f"Tallennettu: {em_path}")
                 self.set_status("Valmis!")
                 messagebox.showinfo("Valmis", f"Valmis!\n\nKansio:\n{OUT_DIR}\n\nSähköposteja: {len(emails)}")
@@ -1289,7 +1409,7 @@ class App(BaseTk):
                 self.set_status("Pysäytetty.")
                 return
 
-            em_path = save_word_plain_lines(emails, "sahkopostit.docx")
+            em_path = save_word_unique(emails, "sahkopostit")
             self.ui_log(f"Tallennettu: {em_path}")
 
             self.set_status("Valmis!")
