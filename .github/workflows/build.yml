@@ -1,36 +1,5 @@
-name: Build Windows EXE
-
-on:
-  push:
-    branches: [ "main" ]
-  workflow_dispatch:
-
-jobs:
-  build:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
-
-      - name: Build exe (with assets)
-        shell: pwsh
-        run: |
-          pyinstaller --noconfirm --clean --onefile --windowed --name ProtestiBotti `
-            --add-data "assets;assets" `
-            protestibotti.py
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ProtestiBotti-Windows
-          path: dist/ProtestiBotti.exe
+- name: Build exe
+  shell: pwsh
+  run: |
+    pyinstaller --noconfirm --clean --onefile --windowed --name FinnishBusinessEmailFinder `
+      finnish_business_email_finder.py
