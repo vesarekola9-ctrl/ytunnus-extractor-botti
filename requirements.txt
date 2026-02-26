@@ -4,4 +4,3 @@ selenium
 webdriver-manager
 openpyxl
 tkinterdnd2
-pillow
