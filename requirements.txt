@@ -1,6 +1,7 @@
-selenium
-webdriver-manager
 PyPDF2
 python-docx
+selenium
+webdriver-manager
+openpyxl
 tkinterdnd2
 pillow
