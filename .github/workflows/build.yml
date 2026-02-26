@@ -2,4 +2,4 @@
   shell: pwsh
   run: |
     pyinstaller --noconfirm --clean --onefile --windowed --name FinnishBusinessEmailFinder `
-      finnish_business_email_finder.py
+      ytunnus_dragdrop_bot.py
