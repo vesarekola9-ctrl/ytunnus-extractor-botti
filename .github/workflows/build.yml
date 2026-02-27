@@ -21,22 +21,57 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Debug - list repo files
+        shell: pwsh
+        run: |
+          Write-Host "=== Repo root ==="
+          Get-ChildItem -Name
+          Write-Host "=== Tree (depth 3) ==="
+          Get-ChildItem -Recurse | Select-Object -First 200
+
       - name: Install dependencies
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          python -c "import sys; print(sys.version)"
+          python -c "import PyPDF2, docx, openpyxl; print('core libs ok')"
+          python -c "import selenium, webdriver_manager; print('selenium ok')"
+
+      - name: Pick entrypoint automatically
+        id: pick
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $preferred = @("app.py","protestibotti.py","ytunnus_dragdrop_bot.py","ytunnus_dragdrop_bot_v2.py")
+          $ENTRYPOINT = $null
+
+          foreach ($p in $preferred) {
+            if (Test-Path $p) { $ENTRYPOINT = $p; break }
+          }
+
+          if (-not $ENTRYPOINT) {
+            $candidates = Get-ChildItem -File -Filter *.py | Where-Object { $_.Name -notmatch '^test' } | Select-Object -First 1
+            if ($candidates) { $ENTRYPOINT = $candidates.Name }
+          }
+
+          if (-not $ENTRYPOINT) {
+            Write-Host "ERROR: No python entrypoint found in repo root."
+            Get-ChildItem -Name
+            exit 1
+          }
+
+          Write-Host "ENTRYPOINT=$ENTRYPOINT"
+          "ENTRYPOINT=$ENTRYPOINT" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Build EXE with PyInstaller
         shell: pwsh
         run: |
-          $ENTRYPOINT = "app.py"
-          if (!(Test-Path $ENTRYPOINT)) {
-            Write-Host "ERROR: Entry point not found: $ENTRYPOINT"
-            Write-Host "Repo root files:"
-            Get-ChildItem -Name
-            exit 1
-          }
+          $ErrorActionPreference = "Stop"
+          $ENTRYPOINT = "${{ steps.pick.outputs.ENTRYPOINT }}"
+          Write-Host "Building from: $ENTRYPOINT"
 
           pyinstaller `
             --noconfirm `
@@ -46,12 +81,27 @@ jobs:
             --name "FinnishBusinessEmailFinder" `
             --collect-all selenium `
             --collect-all webdriver_manager `
-            --collect-all tkinterdnd2 `
             --collect-all openpyxl `
             $ENTRYPOINT
 
-      - name: Upload artifact
+          if (!(Test-Path "dist/FinnishBusinessEmailFinder.exe")) {
+            Write-Host "ERROR: EXE was not produced."
+            Write-Host "Dist contents:"
+            Get-ChildItem dist -Recurse -ErrorAction SilentlyContinue
+            exit 1
+          }
+
+      - name: Upload artifact (EXE)
         uses: actions/upload-artifact@v4
         with:
           name: FinnishBusinessEmailFinder-win64
           path: dist/FinnishBusinessEmailFinder.exe
+
+      - name: Upload artifact (build logs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyinstaller-build-output
+          path: |
+            build/**
+            dist/**
