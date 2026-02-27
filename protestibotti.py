@@ -1,9 +1,10 @@
-# protestibotti.py
+# app.py
 # Finnish Business Email Finder
-# FIXES:
-# - Avoid selenium.webdriver.chrome.options import
-# - YTJ name search uses correct company-search field (not Y-tunnus-only box)
-# - UI: scrollable layout + "Tyhjennä" button for clipboard
+# - PDF -> YTJ (emails)
+# - Clipboard -> (emails / y-tunnus / names) -> YTJ (emails)
+# UI: scrollable + "Tyhjennä" button
+# Selenium: uses webdriver.ChromeOptions() (no Options import)
+# YTJ name search: selects correct company-search input (not Y-tunnus-only)
 
 import os
 import re
@@ -38,6 +39,7 @@ except Exception:
 
 APP_BUILD = "2026-02-27_scroll_and_clear"
 
+# --- tuning ---
 YTJ_PAGE_LOAD_TIMEOUT = 18
 YTJ_RETRY_READS = 5
 YTJ_RETRY_SLEEP = 0.12
@@ -47,6 +49,7 @@ YTJ_PER_COMPANY_SLEEP = 0.02
 NAME_SEARCH_TIMEOUT = 10.0
 NAME_SEARCH_SLEEP = 0.18
 
+# --- regex ---
 YT_RE = re.compile(r"\b\d{7}-\d\b|\b\d{8}\b")
 EMAIL_RE = re.compile(r"[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9-.]+")
 EMAIL_A_RE = re.compile(r"[A-Za-z0-9_.+-]+\s*\(a\)\s*[A-Za-z0-9-]+\.[A-Za-z0-9-.]+", re.I)
@@ -55,7 +58,8 @@ YTJ_COMPANY_URL = "https://tietopalvelu.ytj.fi/yritys/{}"
 YTJ_SEARCH_URLS = ["https://tietopalvelu.ytj.fi/haku", "https://tietopalvelu.ytj.fi/"]
 
 STRICT_FORMS_RE = re.compile(
-    r"\b(oy|ab|ky|tmi|oyj|osakeyhtiö|kommandiittiyhtiö|toiminimi|as\.|ltd|llc|inc|gmbh)\b", re.I
+    r"\b(oy|ab|ky|tmi|oyj|osakeyhtiö|kommandiittiyhtiö|toiminimi|as\.|ltd|llc|inc|gmbh)\b",
+    re.I,
 )
 
 
@@ -63,7 +67,7 @@ STRICT_FORMS_RE = re.compile(
 #   SCROLLABLE UI WRAPPER
 # =========================
 class ScrollableFrame(ttk.Frame):
-    """A scrollable frame using a canvas. Mouse wheel scrolls the content."""
+    """Canvas-based scrollable frame. Mouse wheel scrolls the whole UI."""
     def __init__(self, container, *args, **kwargs):
         super().__init__(container, *args, **kwargs)
 
@@ -80,24 +84,16 @@ class ScrollableFrame(ttk.Frame):
         self.inner.bind("<Configure>", self._on_inner_configure)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
 
-        # mouse wheel
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)  # Windows
-        self.canvas.bind_all("<Shift-MouseWheel>", self._on_shift_mousewheel)
 
     def _on_inner_configure(self, event):
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
     def _on_canvas_configure(self, event):
-        # make inner frame width match canvas
         self.canvas.itemconfigure(self._win, width=event.width)
 
     def _on_mousewheel(self, event):
-        # delta is 120 multiples on Windows
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-    def _on_shift_mousewheel(self, event):
-        # optional: horizontal not used now
-        pass
 
 
 BaseTk = TkinterDnD.Tk if HAS_DND else tk.Tk
@@ -459,7 +455,7 @@ def find_ytj_company_search_input(driver):
             iid = _attr(inp, "id").lower()
             text = " ".join([ph, al, nm, iid]).strip()
 
-            # reject yt-only
+            # reject y-tunnus-only inputs
             if "y-tunnus" in text and ("yritys" not in text and "toiminimi" not in text and "nimi" not in text):
                 continue
 
@@ -479,6 +475,7 @@ def find_ytj_company_search_input(driver):
 
             if score <= 0:
                 continue
+
             candidates.append((score, inp))
         except Exception:
             continue
@@ -549,6 +546,7 @@ def ytj_name_to_yt(driver, name: str, stop_flag: threading.Event):
     best_link = None
     best_score = -1.0
     t0 = time.time()
+
     while time.time() - t0 < NAME_SEARCH_TIMEOUT:
         if stop_flag.is_set():
             return ""
@@ -570,11 +568,13 @@ def ytj_name_to_yt(driver, name: str, stop_flag: threading.Event):
                 href = (a.get_attribute("href") or "")
                 if not href or "tietopalvelu.ytj.fi" not in href:
                     continue
+
                 try:
                     card = a.find_element(By.XPATH, "ancestor::*[self::li or self::div or self::article][1]")
                     card_text = (card.text or "")
                 except Exception:
                     card_text = (a.text or "")
+
                 s = score_result(name, card_text)
                 checked += 1
                 if s > best_score:
@@ -585,6 +585,7 @@ def ytj_name_to_yt(driver, name: str, stop_flag: threading.Event):
 
         if best_link:
             break
+
         time.sleep(NAME_SEARCH_SLEEP)
 
     if not best_link:
@@ -663,6 +664,7 @@ def pipeline_clipboard(run: RunContext, text: str, strict: bool, max_names: int,
     for nm in names:
         rows.append({"name": nm, "yt": "", "email": "", "source": "clipboard->ytj", "notes": "name found in pasted text"})
 
+    # dedup
     seen = set()
     dedup = []
     for r in rows:
@@ -707,8 +709,8 @@ def pipeline_clipboard(run: RunContext, text: str, strict: bool, max_names: int,
             else:
                 if not name:
                     continue
-                status_cb(f"YTJ yrityshaku: {idx}/{len(todo)} {name}")
 
+                status_cb(f"YTJ yrityshaku: {idx}/{len(todo)} {name}")
                 yt2 = name_cache.get(name)
                 if yt2 is None:
                     yt2 = ytj_name_to_yt(driver, name, stop_flag)
@@ -819,7 +821,6 @@ class App(BaseTk):
         self._ui_log("Clipboard tyhjennetty.")
 
     def _build_ui(self):
-        # Scrollable root
         outer = ScrollableFrame(self)
         outer.pack(fill="both", expand=True)
         root = outer.inner
@@ -884,7 +885,6 @@ class App(BaseTk):
                    bg="#ffffff", fg=self.TEXT, insertbackground=self.TEXT,
                    highlightthickness=1, highlightbackground=self.BORDER).pack(side="left")
 
-        # NEW: clear button
         self._btn(top, "Tyhjennä", self.clear_clipboard_text, kind="grey").pack(side="right", padx=6)
 
         tk.Label(clip_card, text="Liitä tähän (Ctrl+V):", bg=self.CARD, fg=self.MUTED,
@@ -943,9 +943,14 @@ class App(BaseTk):
             if not rows:
                 self._set_status("Ei löytynyt tuloksia.")
                 return
+
             save_results_xlsx(self.run, rows)
             save_emails_docx(self.run, emails)
-            messagebox.showinfo("Valmis", f"Valmis!\n\nKansio:\n{self.run.run_dir}\n\nRivejä: {len(rows)}\nSähköposteja: {len(emails)}")
+
+            messagebox.showinfo(
+                "Valmis",
+                f"Valmis!\n\nKansio:\n{self.run.run_dir}\n\nRivejä: {len(rows)}\nSähköposteja: {len(emails)}"
+            )
             self._set_status("Valmis!")
         except Exception as e:
             self._ui_log(f"VIRHE: {e}")
@@ -965,16 +970,26 @@ class App(BaseTk):
             self._set_status("Aloitetaan Clipboard ajo…")
             strict = bool(self.strict_var.get())
             max_names = int(self.max_names_var.get() or 400)
-            rows, emails = pipeline_clipboard(self.run, text, strict, max_names, self._set_status, self._set_progress, self.stop_flag)
+
+            rows, emails = pipeline_clipboard(
+                self.run, text, strict, max_names,
+                self._set_status, self._set_progress, self.stop_flag
+            )
+
             if self.stop_flag.is_set():
                 self._set_status("Pysäytetty.")
                 return
             if not rows:
                 self._set_status("Ei löytynyt tuloksia.")
                 return
+
             save_results_xlsx(self.run, rows)
             save_emails_docx(self.run, emails)
-            messagebox.showinfo("Valmis", f"Valmis!\n\nKansio:\n{self.run.run_dir}\n\nRivejä: {len(rows)}\nSähköposteja: {len(emails)}")
+
+            messagebox.showinfo(
+                "Valmis",
+                f"Valmis!\n\nKansio:\n{self.run.run_dir}\n\nRivejä: {len(rows)}\nSähköposteja: {len(emails)}"
+            )
             self._set_status("Valmis!")
         except Exception as e:
             self._ui_log(f"VIRHE: {e}")
