@@ -1,10 +1,10 @@
 # protestibotti.py
-# Finnish Business Email Finder (Commercial clean version)
+# Finnish Business Email Finder (clean commercial build)
 #
 # Modes:
 #   1) PDF -> Y-tunnukset -> YTJ -> sähköpostit
-#   2) Clipboard (Ctrl+A+C any website -> Ctrl+V app)
-#        -> extracts: emails / y-tunnus / company names
+#   2) Clipboard (Ctrl+A+C any site -> Ctrl+V app)
+#        -> extracts: emails / y-tunnus / company names (heuristic)
 #        -> if email missing: fetch from YTJ by y-tunnus, or by name -> y-tunnus -> email
 #        -> clicks YTJ “Näytä” automatically
 #
@@ -41,7 +41,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.common.exceptions import TimeoutException
 from webdriver_manager.chrome import ChromeDriverManager
 
 # Optional Drag & Drop (PDF)
@@ -92,7 +92,6 @@ def exe_dir() -> str:
 
 
 def base_output_dir() -> str:
-    # Prefer exe directory if writable, else Documents
     base = exe_dir()
     try:
         p = os.path.join(base, "_write_test.tmp")
@@ -116,21 +115,20 @@ def create_run_dir() -> str:
 
 
 # =========================
-#   LOGGING
+#   RUN CONTEXT / LOG
 # =========================
 class RunContext:
     def __init__(self):
         self.run_dir = create_run_dir()
         self.log_path = os.path.join(self.run_dir, "log.txt")
-        self.partial_xlsx_path = os.path.join(self.run_dir, "results_partial.xlsx")
-        self._log_lock = threading.Lock()
-        self._write_log("=== RUN START ===")
-        self._write_log(f"RunDir: {self.run_dir}")
+        self._lock = threading.Lock()
+        self.log("=== RUN START ===")
+        self.log(f"RunDir: {self.run_dir}")
 
-    def _write_log(self, msg: str):
+    def log(self, msg: str):
         ts = time.strftime("%H:%M:%S")
         line = f"[{ts}] {msg}"
-        with self._log_lock:
+        with self._lock:
             try:
                 with open(self.log_path, "a", encoding="utf-8") as f:
                     f.write(line + "\n")
@@ -229,7 +227,7 @@ def extract_names_from_text(text: str, strict: bool, max_names: int):
 
 
 # =========================
-#   FILE OUTPUT (DOCX/XLSX)
+#   OUTPUT
 # =========================
 def save_emails_docx(run: RunContext, emails: list[str]):
     path = os.path.join(run.run_dir, "emails.docx")
@@ -250,7 +248,7 @@ def save_results_xlsx(run: RunContext, rows: list[dict], filename="results.xlsx"
     headers = ["Name", "Y-tunnus", "Email", "Source", "Notes"]
     ws.append(headers)
     header_font = Font(bold=True)
-    for col, _h in enumerate(headers, start=1):
+    for col in range(1, len(headers) + 1):
         cell = ws.cell(row=1, column=col)
         cell.font = header_font
         cell.alignment = Alignment(horizontal="left")
@@ -294,7 +292,7 @@ def extract_ytunnukset_from_pdf(pdf_path: str):
 
 
 # =========================
-#   SELENIUM START / HELPERS
+#   SELENIUM
 # =========================
 def start_new_driver():
     options = webdriver.ChromeOptions()
@@ -420,6 +418,7 @@ def fetch_email_by_yt(driver, yt: str, stop_flag: threading.Event):
 
     try_accept_cookies(driver)
 
+    # fast try before “Näytä”
     email = ""
     for _ in range(max(1, YTJ_RETRY_READS - 1)):
         if stop_flag.is_set():
@@ -429,6 +428,7 @@ def fetch_email_by_yt(driver, yt: str, stop_flag: threading.Event):
             return email
         time.sleep(YTJ_RETRY_SLEEP)
 
+    # click “Näytä” then retry
     click_all_nayta_ytj(driver)
     for _ in range(YTJ_RETRY_READS):
         if stop_flag.is_set():
@@ -617,13 +617,7 @@ def pipeline_pdf(run: RunContext, pdf_path: str, status_cb, progress_cb, stop_fl
                 email = fetch_email_by_yt(driver, yt, stop_flag)
                 yt_email_cache[yt] = email
 
-            rows.append({
-                "name": "",
-                "yt": yt,
-                "email": email,
-                "source": "pdf->ytj",
-                "notes": "",
-            })
+            rows.append({"name": "", "yt": yt, "email": email, "source": "pdf->ytj", "notes": ""})
 
             if i % PARTIAL_SAVE_EVERY == 0:
                 try:
@@ -659,7 +653,6 @@ def pipeline_clipboard(run: RunContext, text: str, strict: bool, max_names: int,
     for nm in names:
         rows.append({"name": nm, "yt": "", "email": "", "source": "clipboard->ytj", "notes": "name found in pasted text"})
 
-    # de-dup
     seen = set()
     dedup = []
     for r in rows:
@@ -739,7 +732,6 @@ def pipeline_clipboard(run: RunContext, text: str, strict: bool, max_names: int,
             time.sleep(YTJ_PER_COMPANY_SLEEP)
 
         progress_cb(len(todo), max(1, len(todo)))
-
     finally:
         try:
             driver.quit()
@@ -761,7 +753,7 @@ class App(BaseTk):
         super().__init__()
         self.stop_flag = threading.Event()
 
-        # clean blue/white UI
+        # clean blue/white
         self.BG = "#ffffff"
         self.CARD = "#f6f8ff"
         self.BORDER = "#d7def7"
@@ -816,7 +808,7 @@ class App(BaseTk):
         except Exception:
             pass
         if self.run:
-            self.run._write_log(msg)
+            self.run.log(msg)
 
     def _set_status(self, s):
         self.status.config(text=s)
