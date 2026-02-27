@@ -1,16 +1,34 @@
 # app.py
 # Finnish Business Email Finder
 # - PDF -> YTJ (emails)
-# - Clipboard -> (emails / y-tunnus / names) -> YTJ (emails)
-# UI: scrollable + "Tyhjennä" button
-# Selenium: uses webdriver.ChromeOptions() (no Options import)
-# YTJ name search: selects correct company-search input (not Y-tunnus-only)
+# - Clipboard -> (names / yt / emails) -> YTJ (emails)
+#
+# OUTPUT:
+#   Creates output folder ONLY WHEN RESULTS ARE SAVED (no empty "log folders")
+#   Folder: FinnishBusinessEmailFinder/YYYY-MM-DD/run_HH-MM-SS/
+#   Files (ONLY):
+#     - emails.docx
+#     - results.xlsx  (Results + Found Only)
+#     - results.csv
+#
+# UI:
+#   - Scroll whole window
+#   - Clipboard "Tyhjennä" + "Pysäytä"
+#   - "Avaa tuloskansio" + "Kopioi sähköpostit"
+#
+# Selenium:
+#   - webdriver.ChromeOptions() (no Options import)
+#   - YTJ name search selects correct company search field (not y-tunnus-only)
+#
+# NOTE: No log.txt is written.
 
 import os
 import re
 import sys
 import time
+import csv
 import threading
+import subprocess
 from difflib import SequenceMatcher
 
 import tkinter as tk
@@ -37,7 +55,7 @@ except Exception:
     HAS_DND = False
 
 
-APP_BUILD = "2026-02-27_scroll_and_clear"
+APP_BUILD = "2026-02-28_no_logfile_csv_foundonly_lazy_output"
 
 # --- tuning ---
 YTJ_PAGE_LOAD_TIMEOUT = 18
@@ -86,7 +104,7 @@ class ScrollableFrame(ttk.Frame):
 
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)  # Windows
 
-    def _on_inner_configure(self, event):
+    def _on_inner_configure(self, _event):
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
     def _on_canvas_configure(self, event):
@@ -131,25 +149,18 @@ def create_run_dir() -> str:
     return out
 
 
-class RunContext:
-    def __init__(self):
-        self.run_dir = create_run_dir()
-        self.log_path = os.path.join(self.run_dir, "log.txt")
-        self._lock = threading.Lock()
-        self.log("=== RUN START ===")
-        self.log(f"Build: {APP_BUILD}")
-        self.log(f"RunDir: {self.run_dir}")
-
-    def log(self, msg: str):
-        ts = time.strftime("%H:%M:%S")
-        line = f"[{ts}] {msg}"
-        with self._lock:
-            try:
-                with open(self.log_path, "a", encoding="utf-8") as f:
-                    f.write(line + "\n")
-            except Exception:
-                pass
-        return line
+def open_path_in_os(path: str):
+    if not path:
+        return
+    try:
+        if os.name == "nt":
+            os.startfile(path)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.run(["open", path], check=False)
+        else:
+            subprocess.run(["xdg-open", path], check=False)
+    except Exception:
+        pass
 
 
 # =========================
@@ -199,7 +210,9 @@ def extract_names_from_text(text: str, strict: bool, max_names: int):
     bad_contains = [
         "näytä lisää", "kirjaudu", "tilaa", "tilaajille",
         "€", "y-tunnus", "ytunnus", "sähköposti", "puhelin",
-        "www.", "http"
+        "www.", "http", "kauppalehti", "protestilista",
+        "viimeisimmät protestit", "häiriöpäivä", "velkomustuomiot",
+        "sijainti", "summa", "lähde"
     ]
 
     for ln in lines:
@@ -229,11 +242,21 @@ def extract_names_from_text(text: str, strict: bool, max_names: int):
     return out
 
 
+def extract_yt_from_text_anywhere(txt: str) -> str:
+    if not txt:
+        return ""
+    for m in YT_RE.findall(txt):
+        n = normalize_yt(m)
+        if n:
+            return n
+    return ""
+
+
 # =========================
-#   OUTPUT
+#   OUTPUT (ONLY at the end)
 # =========================
-def save_emails_docx(run: RunContext, emails: list[str]):
-    path = os.path.join(run.run_dir, "emails.docx")
+def save_emails_docx(out_dir: str, emails: list[str]):
+    path = os.path.join(out_dir, "emails.docx")
     doc = Document()
     for e in emails:
         if e:
@@ -242,13 +265,26 @@ def save_emails_docx(run: RunContext, emails: list[str]):
     return path
 
 
-def save_results_xlsx(run: RunContext, rows: list[dict], filename="results.xlsx"):
-    path = os.path.join(run.run_dir, filename)
+def _autosize_columns(ws):
+    for col in range(1, ws.max_column + 1):
+        max_len = 0
+        for row in range(1, min(ws.max_row, 500) + 1):
+            v = ws.cell(row=row, column=col).value
+            if v is None:
+                continue
+            max_len = max(max_len, len(str(v)))
+        ws.column_dimensions[get_column_letter(col)].width = min(60, max(12, max_len + 2))
+
+
+def save_results_xlsx(out_dir: str, rows: list[dict], filename="results.xlsx"):
+    path = os.path.join(out_dir, filename)
     wb = Workbook()
-    ws = wb.active
-    ws.title = "Results"
 
     headers = ["Name", "Y-tunnus", "Email", "Source", "Notes"]
+
+    # Sheet 1: All
+    ws = wb.active
+    ws.title = "Results"
     ws.append(headers)
     header_font = Font(bold=True)
     for col in range(1, len(headers) + 1):
@@ -259,16 +295,34 @@ def save_results_xlsx(run: RunContext, rows: list[dict], filename="results.xlsx"
     for r in rows:
         ws.append([r.get("name", ""), r.get("yt", ""), r.get("email", ""), r.get("source", ""), r.get("notes", "")])
 
+    _autosize_columns(ws)
+
+    # Sheet 2: Found Only
+    ws2 = wb.create_sheet("Found Only")
+    ws2.append(headers)
     for col in range(1, len(headers) + 1):
-        max_len = 0
-        for row in range(1, min(ws.max_row, 500) + 1):
-            v = ws.cell(row=row, column=col).value
-            if v is None:
-                continue
-            max_len = max(max_len, len(str(v)))
-        ws.column_dimensions[get_column_letter(col)].width = min(60, max(12, max_len + 2))
+        c = ws2.cell(row=1, column=col)
+        c.font = header_font
+        c.alignment = Alignment(horizontal="left")
+
+    for r in rows:
+        if (r.get("email") or "").strip():
+            ws2.append([r.get("name", ""), r.get("yt", ""), r.get("email", ""), r.get("source", ""), r.get("notes", "")])
+
+    _autosize_columns(ws2)
 
     wb.save(path)
+    return path
+
+
+def save_results_csv(out_dir: str, rows: list[dict], filename="results.csv"):
+    path = os.path.join(out_dir, filename)
+    headers = ["Name", "Y-tunnus", "Email", "Source", "Notes"]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f, delimiter=";")
+        w.writerow(headers)
+        for r in rows:
+            w.writerow([r.get("name", ""), r.get("yt", ""), r.get("email", ""), r.get("source", ""), r.get("notes", "")])
     return path
 
 
@@ -500,19 +554,10 @@ def ytj_open_search_home(driver):
             wait_ytj_loaded(driver)
             try_accept_cookies(driver)
             if find_ytj_company_search_input(driver):
-                return
+                return True
         except Exception:
             continue
-
-
-def extract_yt_from_text_anywhere(txt: str) -> str:
-    if not txt:
-        return ""
-    for m in YT_RE.findall(txt):
-        n = normalize_yt(m)
-        if n:
-            return n
-    return ""
+    return False
 
 
 def score_result(name_query: str, card_text: str) -> float:
@@ -525,7 +570,8 @@ def score_result(name_query: str, card_text: str) -> float:
 
 
 def ytj_name_to_yt(driver, name: str, stop_flag: threading.Event):
-    ytj_open_search_home(driver)
+    if not ytj_open_search_home(driver):
+        return ""
     if stop_flag.is_set():
         return ""
 
@@ -610,7 +656,7 @@ def ytj_name_to_yt(driver, name: str, stop_flag: threading.Event):
 # =========================
 #   PIPELINES
 # =========================
-def pipeline_pdf(run: RunContext, pdf_path: str, status_cb, progress_cb, stop_flag: threading.Event):
+def pipeline_pdf(pdf_path: str, status_cb, progress_cb, stop_flag: threading.Event):
     status_cb("Luetaan PDF ja kerätään Y-tunnukset…")
     yts = extract_ytunnukset_from_pdf(pdf_path)
     if not yts:
@@ -649,33 +695,50 @@ def pipeline_pdf(run: RunContext, pdf_path: str, status_cb, progress_cb, stop_fl
     return rows, emails
 
 
-def pipeline_clipboard(run: RunContext, text: str, strict: bool, max_names: int, status_cb, progress_cb, stop_flag: threading.Event):
+def pipeline_clipboard(
+    text: str,
+    strict: bool,
+    max_names: int,
+    force_name_flow: bool,
+    status_cb,
+    progress_cb,
+    stop_flag: threading.Event
+):
     status_cb("Clipboard: poimitaan sähköpostit, Y-tunnukset ja yritysnimet…")
 
-    direct_emails = set(e.strip().lower() for e in EMAIL_RE.findall(text or "") if e.strip())
+    direct_emails = sorted({e.strip().lower() for e in EMAIL_RE.findall(text or "") if e.strip()})
     yts = extract_yts_from_text(text)
     names = extract_names_from_text(text, strict=strict, max_names=max_names)
 
-    rows = []
-    for em in sorted(direct_emails):
-        rows.append({"name": "", "yt": "", "email": em, "source": "clipboard", "notes": "email found in pasted text"})
-    for yt in yts:
-        rows.append({"name": "", "yt": yt, "email": "", "source": "clipboard->ytj", "notes": "yt found in pasted text"})
-    for nm in names:
-        rows.append({"name": nm, "yt": "", "email": "", "source": "clipboard->ytj", "notes": "name found in pasted text"})
+    rows: list[dict] = []
 
-    # dedup
+    # Keep direct emails as convenience rows (doesn't affect name flow)
+    for em in direct_emails:
+        rows.append({"name": "", "yt": "", "email": em, "source": "clipboard", "notes": "email found in pasted text"})
+
+    # Main items
+    main_items: list[dict] = []
+    if force_name_flow and names:
+        for nm in names:
+            main_items.append({"name": nm, "yt": "", "email": "", "source": "clipboard->ytj", "notes": "name->yt->email"})
+    else:
+        for yt in yts:
+            main_items.append({"name": "", "yt": yt, "email": "", "source": "clipboard->ytj", "notes": "yt found in pasted text"})
+        for nm in names:
+            main_items.append({"name": nm, "yt": "", "email": "", "source": "clipboard->ytj", "notes": "name found in pasted text"})
+
+    # Dedup main items
     seen = set()
     dedup = []
-    for r in rows:
-        key = (r.get("name", "").lower(), r.get("yt", ""), r.get("email", "").lower())
+    for r in main_items:
+        key = (r.get("name", "").lower(), r.get("yt", ""))
         if key in seen:
             continue
         seen.add(key)
         dedup.append(r)
-    rows = dedup
+    main_items = dedup
 
-    if not direct_emails and not yts and not names:
+    if not rows and not main_items:
         status_cb("Clipboard: en löytänyt mitään (email / Y-tunnus / nimi).")
         return [], []
 
@@ -686,31 +749,29 @@ def pipeline_clipboard(run: RunContext, text: str, strict: bool, max_names: int,
     name_cache: dict[str, str] = {}
 
     try:
-        todo = [r for r in rows if not r.get("email")]
-        progress_cb(0, max(1, len(todo)))
+        progress_cb(0, max(1, len(main_items)))
 
-        for idx, r in enumerate(todo, start=1):
+        for idx, r in enumerate(main_items, start=1):
             if stop_flag.is_set():
                 status_cb("Pysäytetty.")
                 break
 
-            progress_cb(idx - 1, len(todo))
+            progress_cb(idx - 1, len(main_items))
             name = (r.get("name") or "").strip()
             yt = (r.get("yt") or "").strip()
 
             if yt:
-                status_cb(f"YTJ email: {idx}/{len(todo)} {yt}")
+                status_cb(f"YTJ email: {idx}/{len(main_items)} {yt}")
                 email = yt_cache.get(yt)
                 if email is None:
                     email = fetch_email_by_yt(driver, yt, stop_flag)
                     yt_cache[yt] = email
-                if email:
-                    r["email"] = email
+                r["email"] = email or ""
             else:
                 if not name:
                     continue
 
-                status_cb(f"YTJ yrityshaku: {idx}/{len(todo)} {name}")
+                status_cb(f"YTJ yrityshaku: {idx}/{len(main_items)} {name}")
                 yt2 = name_cache.get(name)
                 if yt2 is None:
                     yt2 = ytj_name_to_yt(driver, name, stop_flag)
@@ -718,23 +779,27 @@ def pipeline_clipboard(run: RunContext, text: str, strict: bool, max_names: int,
 
                 if yt2:
                     r["yt"] = yt2
+                    status_cb(f"YTJ email: {idx}/{len(main_items)} {yt2}")
                     email2 = yt_cache.get(yt2)
                     if email2 is None:
                         email2 = fetch_email_by_yt(driver, yt2, stop_flag)
                         yt_cache[yt2] = email2
-                    if email2:
-                        r["email"] = email2
+                    r["email"] = email2 or ""
+                else:
+                    r["notes"] = (r.get("notes") or "") + " | yt not found"
 
             time.sleep(YTJ_PER_COMPANY_SLEEP)
 
-        progress_cb(len(todo), max(1, len(todo)))
+        progress_cb(len(main_items), max(1, len(main_items)))
     finally:
         try:
             driver.quit()
         except Exception:
             pass
 
-    emails = sorted({(r.get("email") or "").lower(): (r.get("email") or "") for r in rows if r.get("email")}.values())
+    rows.extend(main_items)
+
+    emails = sorted({(r.get("email") or "").lower(): (r.get("email") or "") for r in rows if (r.get("email") or "").strip()}.values())
     return rows, emails
 
 
@@ -745,7 +810,8 @@ class App(BaseTk):
     def __init__(self):
         super().__init__()
         self.stop_flag = threading.Event()
-        self.run: RunContext | None = None
+        self.last_emails: list[str] = []
+        self.last_out_dir: str = ""
 
         # theme
         self.BG = "#ffffff"
@@ -761,7 +827,7 @@ class App(BaseTk):
         self.GREY_BTN_H = "#475569"
 
         self.title("Finnish Business Email Finder")
-        self.geometry("980x860")
+        self.geometry("980x920")
         self.configure(bg=self.BG)
 
         self._build_ui()
@@ -796,8 +862,6 @@ class App(BaseTk):
             self.listbox.yview_moveto(1.0)
         except Exception:
             pass
-        if self.run:
-            self.run.log(msg)
 
     def _set_status(self, s):
         self.status.config(text=s)
@@ -820,6 +884,32 @@ class App(BaseTk):
         self.clip_text.delete("1.0", tk.END)
         self._ui_log("Clipboard tyhjennetty.")
 
+    def open_out_folder(self):
+        if not self.last_out_dir or not os.path.isdir(self.last_out_dir):
+            messagebox.showinfo("Ei kansiota", "Aja ensin haku. Kansio luodaan vasta lopuksi, kun tulokset tallennetaan.")
+            return
+        open_path_in_os(self.last_out_dir)
+
+    def copy_emails_to_clipboard(self):
+        if not self.last_emails:
+            messagebox.showinfo("Ei sähköposteja", "Sähköposteja ei ole vielä listalla. Aja haku ensin.")
+            return
+        txt = "\n".join(self.last_emails)
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(txt)
+            self._ui_log(f"Kopioitu {len(self.last_emails)} sähköpostia leikepöydälle.")
+        except Exception:
+            messagebox.showwarning("Kopiointi epäonnistui", "En saanut kopioitua leikepöydälle.")
+
+    def _finalize_and_save(self, rows: list[dict], emails: list[str]) -> str:
+        # create output folder ONLY at the end
+        out_dir = create_run_dir()
+        save_results_xlsx(out_dir, rows)
+        save_results_csv(out_dir, rows)
+        save_emails_docx(out_dir, emails)
+        return out_dir
+
     def _build_ui(self):
         outer = ScrollableFrame(self)
         outer.pack(fill="both", expand=True)
@@ -840,6 +930,11 @@ class App(BaseTk):
         self._btn(row, "PDF → YTJ", self.start_pdf_mode).pack(side="left", padx=6)
         self._btn(row, "Clipboard → Finder", self.start_clipboard_mode).pack(side="left", padx=6)
         self._btn(row, "Pysäytä", self.request_stop, kind="danger").pack(side="right", padx=6)
+
+        util_row = tk.Frame(actions, bg=self.CARD)
+        util_row.pack(fill="x", padx=12, pady=(0, 12))
+        self._btn(util_row, "Avaa tuloskansio", self.open_out_folder, kind="grey").pack(side="left", padx=6)
+        self._btn(util_row, "Kopioi sähköpostit", self.copy_emails_to_clipboard, kind="grey").pack(side="right", padx=6)
 
         status_card = self._card(root)
         status_card.pack(fill="x", padx=16, pady=(0, 12))
@@ -879,6 +974,15 @@ class App(BaseTk):
             activebackground=self.CARD, activeforeground=self.TEXT
         ).pack(side="left")
 
+        self.force_name_flow_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            top, text="Pakota: Nimi → Y-tunnus → Email (suositus KL-listoille)",
+            variable=self.force_name_flow_var,
+            bg=self.CARD, fg=self.TEXT,
+            selectcolor="#ffffff",
+            activebackground=self.CARD, activeforeground=self.TEXT
+        ).pack(side="left", padx=(16, 0))
+
         tk.Label(top, text="Max nimeä:", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 10)).pack(side="left", padx=(16, 6))
         self.max_names_var = tk.IntVar(value=400)
         tk.Spinbox(top, from_=10, to=5000, textvariable=self.max_names_var, width=7,
@@ -898,7 +1002,7 @@ class App(BaseTk):
         log_card = self._card(root)
         log_card.pack(fill="both", expand=True, padx=16, pady=(0, 16))
 
-        tk.Label(log_card, text="Logi:", bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=(12, 6))
+        tk.Label(log_card, text="Logi (vain tässä näkymässä):", bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=(12, 6))
 
         body = tk.Frame(log_card, bg=self.CARD)
         body.pack(fill="both", expand=True, padx=12, pady=(0, 12))
@@ -933,10 +1037,11 @@ class App(BaseTk):
             threading.Thread(target=self._run_pdf, args=(path,), daemon=True).start()
 
     def _run_pdf(self, pdf_path):
-        self.run = RunContext()
+        self.last_emails = []
+        self.last_out_dir = ""
         try:
             self._set_status("Aloitetaan PDF ajo…")
-            rows, emails = pipeline_pdf(self.run, pdf_path, self._set_status, self._set_progress, self.stop_flag)
+            rows, emails = pipeline_pdf(pdf_path, self._set_status, self._set_progress, self.stop_flag)
             if self.stop_flag.is_set():
                 self._set_status("Pysäytetty.")
                 return
@@ -944,17 +1049,19 @@ class App(BaseTk):
                 self._set_status("Ei löytynyt tuloksia.")
                 return
 
-            save_results_xlsx(self.run, rows)
-            save_emails_docx(self.run, emails)
+            self._set_status("Tallennetaan tulokset…")
+            out_dir = self._finalize_and_save(rows, emails)
+            self.last_out_dir = out_dir
+            self.last_emails = emails
 
             messagebox.showinfo(
                 "Valmis",
-                f"Valmis!\n\nKansio:\n{self.run.run_dir}\n\nRivejä: {len(rows)}\nSähköposteja: {len(emails)}"
+                f"Valmis!\n\nKansio:\n{out_dir}\n\nRivejä: {len(rows)}\nSähköposteja: {len(emails)}"
             )
             self._set_status("Valmis!")
         except Exception as e:
             self._ui_log(f"VIRHE: {e}")
-            messagebox.showerror("Virhe", f"Tuli virhe:\n\n{e}\n\nKatso log:\n{self.run.log_path}")
+            messagebox.showerror("Virhe", f"Tuli virhe:\n\n{e}")
 
     def start_clipboard_mode(self):
         self._clear_stop()
@@ -965,14 +1072,16 @@ class App(BaseTk):
         threading.Thread(target=self._run_clipboard, args=(text,), daemon=True).start()
 
     def _run_clipboard(self, text: str):
-        self.run = RunContext()
+        self.last_emails = []
+        self.last_out_dir = ""
         try:
             self._set_status("Aloitetaan Clipboard ajo…")
             strict = bool(self.strict_var.get())
             max_names = int(self.max_names_var.get() or 400)
+            force_name_flow = bool(self.force_name_flow_var.get())
 
             rows, emails = pipeline_clipboard(
-                self.run, text, strict, max_names,
+                text, strict, max_names, force_name_flow,
                 self._set_status, self._set_progress, self.stop_flag
             )
 
@@ -983,17 +1092,19 @@ class App(BaseTk):
                 self._set_status("Ei löytynyt tuloksia.")
                 return
 
-            save_results_xlsx(self.run, rows)
-            save_emails_docx(self.run, emails)
+            self._set_status("Tallennetaan tulokset…")
+            out_dir = self._finalize_and_save(rows, emails)
+            self.last_out_dir = out_dir
+            self.last_emails = emails
 
             messagebox.showinfo(
                 "Valmis",
-                f"Valmis!\n\nKansio:\n{self.run.run_dir}\n\nRivejä: {len(rows)}\nSähköposteja: {len(emails)}"
+                f"Valmis!\n\nKansio:\n{out_dir}\n\nRivejä: {len(rows)}\nSähköposteja: {len(emails)}"
             )
             self._set_status("Valmis!")
         except Exception as e:
             self._ui_log(f"VIRHE: {e}")
-            messagebox.showerror("Virhe", f"Tuli virhe:\n\n{e}\n\nKatso log:\n{self.run.log_path}")
+            messagebox.showerror("Virhe", f"Tuli virhe:\n\n{e}")
 
 
 if __name__ == "__main__":
