@@ -1,25 +1,5 @@
-# protestibotti.py
-# Finnish Business Email Finder (clean commercial build)
-#
-# Modes:
-#   1) PDF -> Y-tunnukset -> YTJ -> sähköpostit
-#   2) Clipboard (Ctrl+A+C any site -> Ctrl+V app)
-#        -> extracts: emails / y-tunnus / company names (heuristic)
-#        -> if email missing: fetch from YTJ by y-tunnus, or by name -> y-tunnus -> email
-#        -> clicks YTJ “Näytä” automatically
-#
-# Output (new folder per run):
-#   Documents\FinnishBusinessEmailFinder\YYYY-MM-DD\run_HH-MM-SS\
-#     - emails.docx
-#     - results.xlsx   (Name, Y-tunnus, Email, Source, Notes)
-#     - log.txt
-#
-# Dependencies:
-#   pip install -r requirements.txt
-#
-# Build:
-#   pyinstaller --noconfirm --clean --onefile --windowed --name FinnishBusinessEmailFinder protestibotti.py
-
+# Finnish Business Email Finder (fix: avoid selenium.webdriver.chrome.options import)
+# Modes: PDF->YTJ, Clipboard->(emails/yt/names)->YTJ
 import os
 import re
 import sys
@@ -44,7 +24,6 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 from webdriver_manager.chrome import ChromeDriverManager
 
-# Optional Drag & Drop (PDF)
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD  # type: ignore
     HAS_DND = True
@@ -52,39 +31,25 @@ except Exception:
     HAS_DND = False
 
 
-# =========================
-#   SPEED / TUNING
-# =========================
-YTJ_PAGE_LOAD_TIMEOUT = 16
-YTJ_RETRY_READS = 4
-YTJ_RETRY_SLEEP = 0.10
+APP_BUILD = "2026-02-27_fix_selenium_options"
+
+YTJ_PAGE_LOAD_TIMEOUT = 18
+YTJ_RETRY_READS = 5
+YTJ_RETRY_SLEEP = 0.12
 YTJ_NAYTA_PASSES = 2
 YTJ_PER_COMPANY_SLEEP = 0.02
 
-NAME_SEARCH_TIMEOUT = 8.0
-NAME_SEARCH_SLEEP = 0.15
+NAME_SEARCH_TIMEOUT = 10.0
+NAME_SEARCH_SLEEP = 0.18
 
-PARTIAL_SAVE_EVERY = 60  # rows
-
-
-# =========================
-#   REGEX
-# =========================
 YT_RE = re.compile(r"\b\d{7}-\d\b|\b\d{8}\b")
 EMAIL_RE = re.compile(r"[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9-.]+")
 EMAIL_A_RE = re.compile(r"[A-Za-z0-9_.+-]+\s*\(a\)\s*[A-Za-z0-9-]+\.[A-Za-z0-9-.]+", re.I)
 
 YTJ_COMPANY_URL = "https://tietopalvelu.ytj.fi/yritys/{}"
-
-STRICT_FORMS_RE = re.compile(
-    r"\b(oy|ab|ky|tmi|oyj|osakeyhtiö|kommandiittiyhtiö|toiminimi|as\.|ltd|llc|inc|gmbh)\b",
-    re.IGNORECASE,
-)
+STRICT_FORMS_RE = re.compile(r"\b(oy|ab|ky|tmi|oyj|osakeyhtiö|kommandiittiyhtiö|toiminimi|as\.|ltd|llc|inc|gmbh)\b", re.I)
 
 
-# =========================
-#   PATHS / RUN FOLDERS
-# =========================
 def exe_dir() -> str:
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
@@ -114,15 +79,13 @@ def create_run_dir() -> str:
     return out
 
 
-# =========================
-#   RUN CONTEXT / LOG
-# =========================
 class RunContext:
     def __init__(self):
         self.run_dir = create_run_dir()
         self.log_path = os.path.join(self.run_dir, "log.txt")
         self._lock = threading.Lock()
         self.log("=== RUN START ===")
+        self.log(f"Build: {APP_BUILD}")
         self.log(f"RunDir: {self.run_dir}")
 
     def log(self, msg: str):
@@ -137,9 +100,6 @@ class RunContext:
         return line
 
 
-# =========================
-#   UTIL
-# =========================
 def normalize_yt(yt: str):
     yt = (yt or "").strip().replace(" ", "")
     if re.fullmatch(r"\d{7}-\d", yt):
@@ -181,54 +141,35 @@ def extract_names_from_text(text: str, strict: bool, max_names: int):
     lines = split_lines(text)
     out = []
     seen = set()
-
-    bad_contains = [
-        "näytä lisää", "kirjaudu", "tilaa", "tilaajille",
-        "€", "eur", "summa", "viiväst", "päivä", "päivää",
-        "y-tunnus", "y tunnus", "ytunnus",
-        "sähköposti", "puhelin", "www.", "http",
-    ]
+    bad_contains = ["näytä lisää", "kirjaudu", "tilaa", "tilaajille", "€", "y-tunnus", "ytunnus", "sähköposti", "puhelin", "www.", "http"]
 
     for ln in lines:
         if len(out) >= max_names:
             break
-
         if YT_RE.search(ln):
             continue
-
         low = ln.lower()
         if any(b in low for b in bad_contains):
             continue
-
         if len(ln) < 3:
             continue
-
-        digits = sum(ch.isdigit() for ch in ln)
-        if digits >= 3:
+        if sum(ch.isdigit() for ch in ln) >= 3:
             continue
-
         if not any(ch.isalpha() for ch in ln):
             continue
-
         name = re.sub(r"\s{2,}", " ", ln).strip()
         if len(name) > 90:
             continue
-
         if strict and not STRICT_FORMS_RE.search(name):
             continue
-
         key = name.lower()
         if key in seen:
             continue
         seen.add(key)
         out.append(name)
-
     return out
 
 
-# =========================
-#   OUTPUT
-# =========================
 def save_emails_docx(run: RunContext, emails: list[str]):
     path = os.path.join(run.run_dir, "emails.docx")
     doc = Document()
@@ -244,23 +185,16 @@ def save_results_xlsx(run: RunContext, rows: list[dict], filename="results.xlsx"
     wb = Workbook()
     ws = wb.active
     ws.title = "Results"
-
     headers = ["Name", "Y-tunnus", "Email", "Source", "Notes"]
     ws.append(headers)
     header_font = Font(bold=True)
     for col in range(1, len(headers) + 1):
-        cell = ws.cell(row=1, column=col)
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="left")
+        c = ws.cell(row=1, column=col)
+        c.font = header_font
+        c.alignment = Alignment(horizontal="left")
 
     for r in rows:
-        ws.append([
-            r.get("name", ""),
-            r.get("yt", ""),
-            r.get("email", ""),
-            r.get("source", ""),
-            r.get("notes", ""),
-        ])
+        ws.append([r.get("name", ""), r.get("yt", ""), r.get("email", ""), r.get("source", ""), r.get("notes", "")])
 
     for col in range(1, len(headers) + 1):
         max_len = 0
@@ -275,9 +209,6 @@ def save_results_xlsx(run: RunContext, rows: list[dict], filename="results.xlsx"
     return path
 
 
-# =========================
-#   PDF -> YTs
-# =========================
 def extract_ytunnukset_from_pdf(pdf_path: str):
     yt_set = set()
     with open(pdf_path, "rb") as f:
@@ -291,14 +222,13 @@ def extract_ytunnukset_from_pdf(pdf_path: str):
     return sorted(yt_set)
 
 
-# =========================
-#   SELENIUM
-# =========================
 def start_new_driver():
+    # IMPORTANT: do NOT import selenium.webdriver.chrome.options.Options
     options = webdriver.ChromeOptions()
     options.add_argument("--start-maximized")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-dev-shm-usage")
+
     driver_path = ChromeDriverManager().install()
     drv = webdriver.Chrome(service=Service(driver_path), options=options)
     drv.set_page_load_timeout(YTJ_PAGE_LOAD_TIMEOUT)
@@ -321,33 +251,24 @@ def safe_click(driver, elem) -> bool:
 def try_accept_cookies(driver):
     texts = ["Hyväksy", "Hyväksy kaikki", "Salli kaikki", "Accept", "Accept all", "I agree", "OK", "Selvä"]
     for _ in range(2):
-        found = False
         for e in driver.find_elements(By.XPATH, "//button|//a|//*[@role='button']"):
             try:
                 t = (e.text or "").strip()
                 if not t:
                     continue
-                low = t.lower()
-                if any(x.lower() in low for x in texts):
+                if any(x.lower() in t.lower() for x in texts):
                     if e.is_displayed() and e.is_enabled():
                         safe_click(driver, e)
                         time.sleep(0.15)
-                        found = True
                         break
             except Exception:
                 continue
-        if not found:
-            break
 
 
 def wait_ytj_loaded(driver):
-    wait = WebDriverWait(driver, YTJ_PAGE_LOAD_TIMEOUT)
-    wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    WebDriverWait(driver, YTJ_PAGE_LOAD_TIMEOUT).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
 
-# =========================
-#   YTJ EMAIL
-# =========================
 def extract_email_from_ytj(driver):
     try:
         for a in driver.find_elements(By.TAG_NAME, "a"):
@@ -379,7 +300,6 @@ def extract_email_from_ytj(driver):
 def click_all_nayta_ytj(driver):
     for _ in range(YTJ_NAYTA_PASSES):
         clicked = False
-
         for b in driver.find_elements(By.TAG_NAME, "button"):
             try:
                 if (b.text or "").strip().lower() == "näytä" and b.is_displayed() and b.is_enabled():
@@ -388,7 +308,6 @@ def click_all_nayta_ytj(driver):
                     time.sleep(0.06)
             except Exception:
                 continue
-
         for a in driver.find_elements(By.TAG_NAME, "a"):
             try:
                 if (a.text or "").strip().lower() == "näytä" and a.is_displayed():
@@ -397,7 +316,6 @@ def click_all_nayta_ytj(driver):
                     time.sleep(0.06)
             except Exception:
                 continue
-
         if not clicked:
             break
 
@@ -405,22 +323,18 @@ def click_all_nayta_ytj(driver):
 def fetch_email_by_yt(driver, yt: str, stop_flag: threading.Event):
     if stop_flag.is_set():
         return ""
-
     try:
         driver.get(YTJ_COMPANY_URL.format(yt))
     except TimeoutException:
         pass
-
     try:
         wait_ytj_loaded(driver)
     except Exception:
         pass
-
     try_accept_cookies(driver)
 
-    # fast try before “Näytä”
     email = ""
-    for _ in range(max(1, YTJ_RETRY_READS - 1)):
+    for _ in range(2):
         if stop_flag.is_set():
             return ""
         email = extract_email_from_ytj(driver)
@@ -428,7 +342,6 @@ def fetch_email_by_yt(driver, yt: str, stop_flag: threading.Event):
             return email
         time.sleep(YTJ_RETRY_SLEEP)
 
-    # click “Näytä” then retry
     click_all_nayta_ytj(driver)
     for _ in range(YTJ_RETRY_READS):
         if stop_flag.is_set():
@@ -437,13 +350,9 @@ def fetch_email_by_yt(driver, yt: str, stop_flag: threading.Event):
         if email:
             return email
         time.sleep(YTJ_RETRY_SLEEP)
-
     return ""
 
 
-# =========================
-#   YTJ NAME -> YT
-# =========================
 def ytj_open_search_home(driver):
     driver.get("https://tietopalvelu.ytj.fi/")
     try:
@@ -458,7 +367,6 @@ def find_ytj_search_input(driver):
         "//input[@type='search']",
         "//input[contains(translate(@placeholder,'HAE','hae'),'hae')]",
         "//input[contains(translate(@aria-label,'HAE','hae'),'hae')]",
-        "//input[contains(translate(@name,'HAE','hae'),'hae')]",
         "//form//input",
         "//input",
     ]
@@ -483,8 +391,7 @@ def find_ytj_search_input(driver):
 def extract_yt_from_text_anywhere(txt: str) -> str:
     if not txt:
         return ""
-    found = YT_RE.findall(txt)
-    for m in found:
+    for m in YT_RE.findall(txt):
         n = normalize_yt(m)
         if n:
             return n
@@ -504,7 +411,6 @@ def ytj_name_to_yt(driver, name: str, stop_flag: threading.Event):
     ytj_open_search_home(driver)
     if stop_flag.is_set():
         return ""
-
     inp = find_ytj_search_input(driver)
     if not inp:
         return ""
@@ -515,23 +421,16 @@ def ytj_name_to_yt(driver, name: str, stop_flag: threading.Event):
         except Exception:
             pass
         inp.send_keys(name)
-        inp.send_keys(u"\ue007")  # ENTER
+        inp.send_keys(u"\ue007")
     except Exception:
         return ""
 
     best_link = None
     best_score = -1.0
     t0 = time.time()
-
     while time.time() - t0 < NAME_SEARCH_TIMEOUT:
         if stop_flag.is_set():
             return ""
-
-        try:
-            try_accept_cookies(driver)
-        except Exception:
-            pass
-
         candidate_links = []
         for xp in ("//a[contains(@href,'/yritys/')]", "//a[contains(@href,'yritys')]"):
             try:
@@ -549,13 +448,11 @@ def ytj_name_to_yt(driver, name: str, stop_flag: threading.Event):
                 href = (a.get_attribute("href") or "")
                 if not href or "tietopalvelu.ytj.fi" not in href:
                     continue
-
                 try:
                     card = a.find_element(By.XPATH, "ancestor::*[self::li or self::div or self::article][1]")
                     card_text = (card.text or "")
                 except Exception:
                     card_text = (a.text or "")
-
                 s = score_result(name, card_text)
                 checked += 1
                 if s > best_score:
@@ -566,7 +463,6 @@ def ytj_name_to_yt(driver, name: str, stop_flag: threading.Event):
 
         if best_link:
             break
-
         time.sleep(NAME_SEARCH_SLEEP)
 
     if not best_link:
@@ -588,9 +484,6 @@ def ytj_name_to_yt(driver, name: str, stop_flag: threading.Event):
         return ""
 
 
-# =========================
-#   PIPELINES
-# =========================
 def pipeline_pdf(run: RunContext, pdf_path: str, status_cb, progress_cb, stop_flag: threading.Event):
     status_cb("Luetaan PDF ja kerätään Y-tunnukset…")
     yts = extract_ytunnukset_from_pdf(pdf_path)
@@ -603,30 +496,19 @@ def pipeline_pdf(run: RunContext, pdf_path: str, status_cb, progress_cb, stop_fl
     rows = []
     try:
         progress_cb(0, max(1, len(yts)))
-        yt_email_cache = {}
+        cache = {}
         for i, yt in enumerate(yts, start=1):
             if stop_flag.is_set():
                 status_cb("Pysäytetty.")
                 break
             progress_cb(i - 1, len(yts))
             status_cb(f"YTJ: {i}/{len(yts)} {yt}")
-
-            if yt in yt_email_cache:
-                email = yt_email_cache[yt]
-            else:
+            email = cache.get(yt)
+            if email is None:
                 email = fetch_email_by_yt(driver, yt, stop_flag)
-                yt_email_cache[yt] = email
-
+                cache[yt] = email
             rows.append({"name": "", "yt": yt, "email": email, "source": "pdf->ytj", "notes": ""})
-
-            if i % PARTIAL_SAVE_EVERY == 0:
-                try:
-                    save_results_xlsx(run, rows, filename="results_partial.xlsx")
-                except Exception:
-                    pass
-
             time.sleep(YTJ_PER_COMPANY_SLEEP)
-
         progress_cb(len(yts), max(1, len(yts)))
     finally:
         try:
@@ -640,7 +522,6 @@ def pipeline_pdf(run: RunContext, pdf_path: str, status_cb, progress_cb, stop_fl
 
 def pipeline_clipboard(run: RunContext, text: str, strict: bool, max_names: int, status_cb, progress_cb, stop_flag: threading.Event):
     status_cb("Clipboard: poimitaan sähköpostit, Y-tunnukset ja yritysnimet…")
-
     direct_emails = set(e.strip().lower() for e in EMAIL_RE.findall(text or "") if e.strip())
     yts = extract_yts_from_text(text)
     names = extract_names_from_text(text, strict=strict, max_names=max_names)
@@ -669,19 +550,15 @@ def pipeline_clipboard(run: RunContext, text: str, strict: bool, max_names: int,
 
     status_cb("Käynnistetään YTJ-haku…")
     driver = start_new_driver()
-
-    yt_email_cache: dict[str, str] = {}
-    name_yt_cache: dict[str, str] = {}
-
+    yt_cache: dict[str, str] = {}
+    name_cache: dict[str, str] = {}
     try:
         todo = [r for r in rows if not r.get("email")]
         progress_cb(0, max(1, len(todo)))
-
         for idx, r in enumerate(todo, start=1):
             if stop_flag.is_set():
                 status_cb("Pysäytetty.")
                 break
-
             progress_cb(idx - 1, len(todo))
 
             name = (r.get("name") or "").strip()
@@ -689,48 +566,29 @@ def pipeline_clipboard(run: RunContext, text: str, strict: bool, max_names: int,
 
             if yt:
                 status_cb(f"YTJ email: {idx}/{len(todo)} {yt}")
-                if yt in yt_email_cache:
-                    email = yt_email_cache[yt]
-                else:
+                email = yt_cache.get(yt)
+                if email is None:
                     email = fetch_email_by_yt(driver, yt, stop_flag)
-                    yt_email_cache[yt] = email
+                    yt_cache[yt] = email
                 if email:
                     r["email"] = email
-                    r["notes"] = (r.get("notes", "") + " | email fetched by yt").strip(" |")
             else:
                 if not name:
                     continue
                 status_cb(f"YTJ haku: {idx}/{len(todo)} {name}")
-
-                if name in name_yt_cache:
-                    yt2 = name_yt_cache[name]
-                else:
+                yt2 = name_cache.get(name)
+                if yt2 is None:
                     yt2 = ytj_name_to_yt(driver, name, stop_flag)
-                    name_yt_cache[name] = yt2
-
+                    name_cache[name] = yt2
                 if yt2:
                     r["yt"] = yt2
-                    if yt2 in yt_email_cache:
-                        email2 = yt_email_cache[yt2]
-                    else:
+                    email2 = yt_cache.get(yt2)
+                    if email2 is None:
                         email2 = fetch_email_by_yt(driver, yt2, stop_flag)
-                        yt_email_cache[yt2] = email2
+                        yt_cache[yt2] = email2
                     if email2:
                         r["email"] = email2
-                        r["notes"] = (r.get("notes", "") + " | yt+email fetched by name").strip(" |")
-                    else:
-                        r["notes"] = (r.get("notes", "") + " | yt found, email not found").strip(" |")
-                else:
-                    r["notes"] = (r.get("notes", "") + " | yt not found").strip(" |")
-
-            if idx % PARTIAL_SAVE_EVERY == 0:
-                try:
-                    save_results_xlsx(run, rows, filename="results_partial.xlsx")
-                except Exception:
-                    pass
-
             time.sleep(YTJ_PER_COMPANY_SLEEP)
-
         progress_cb(len(todo), max(1, len(todo)))
     finally:
         try:
@@ -742,9 +600,6 @@ def pipeline_clipboard(run: RunContext, text: str, strict: bool, max_names: int,
     return rows, emails
 
 
-# =========================
-#   UI
-# =========================
 BaseTk = TkinterDnD.Tk if HAS_DND else tk.Tk
 
 
@@ -753,7 +608,6 @@ class App(BaseTk):
         super().__init__()
         self.stop_flag = threading.Event()
 
-        # clean blue/white
         self.BG = "#ffffff"
         self.CARD = "#f6f8ff"
         self.BORDER = "#d7def7"
@@ -769,7 +623,7 @@ class App(BaseTk):
         self.geometry("980x860")
         self.configure(bg=self.BG)
 
-        self.run: RunContext | None = None
+        self.run = None
         self._build_ui()
 
     def _card(self, parent):
@@ -788,16 +642,6 @@ class App(BaseTk):
         b.bind("<Enter>", lambda e: b.configure(bg=hover))
         b.bind("<Leave>", lambda e: b.configure(bg=bg))
         return b
-
-    def _set_pill(self, text, kind="idle"):
-        if kind == "ok":
-            self.pill.configure(text=text, bg="#dcfce7", fg=self.OK)
-        elif kind == "run":
-            self.pill.configure(text=text, bg="#eaf2ff", fg=self.BLUE)
-        elif kind == "err":
-            self.pill.configure(text=text, bg="#fee2e2", fg=self.DANGER)
-        else:
-            self.pill.configure(text=text, bg="#f1f5f9", fg=self.MUTED)
 
     def _ui_log(self, msg):
         ts = time.strftime("%H:%M:%S")
@@ -822,7 +666,6 @@ class App(BaseTk):
 
     def request_stop(self):
         self.stop_flag.set()
-        self._set_pill("PYSÄYTETÄÄN", "run")
         self._set_status("Pysäytetään…")
 
     def _clear_stop(self):
@@ -834,6 +677,8 @@ class App(BaseTk):
 
         tk.Label(header, text="Finnish Business Email Finder", bg=self.BG, fg=self.TEXT,
                  font=("Segoe UI", 20, "bold")).pack(anchor="w")
+
+        tk.Label(header, text=f"Build: {APP_BUILD}", bg=self.BG, fg=self.MUTED, font=("Segoe UI", 9)).pack(anchor="w")
 
         tk.Label(
             header,
@@ -856,15 +701,8 @@ class App(BaseTk):
         status_card = self._card(container)
         status_card.pack(fill="x", pady=(0, 12))
 
-        status_row = tk.Frame(status_card, bg=self.CARD)
-        status_row.pack(fill="x", padx=12, pady=(12, 6))
-
-        self.pill = tk.Label(status_row, text="VALMIINA", bg="#eaf2ff", fg=self.BLUE,
-                             font=("Segoe UI", 10, "bold"), padx=10, pady=6)
-        self.pill.pack(side="right")
-
-        self.status = tk.Label(status_row, text="Valmiina.", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 11))
-        self.status.pack(side="left")
+        self.status = tk.Label(status_card, text="Valmiina.", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 11))
+        self.status.pack(anchor="w", padx=12, pady=(12, 6))
 
         self.progress = ttk.Progressbar(status_card, orient="horizontal", mode="determinate", length=920)
         self.progress.pack(fill="x", padx=12, pady=(0, 12))
@@ -915,15 +753,12 @@ class App(BaseTk):
         log_card = self._card(container)
         log_card.pack(fill="both", expand=True)
 
-        tk.Label(log_card, text="Logi:", bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 10)).pack(
-            anchor="w", padx=12, pady=(12, 6)
-        )
+        tk.Label(log_card, text="Logi:", bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=(12, 6))
 
         body = tk.Frame(log_card, bg=self.CARD)
         body.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
-        self.listbox = tk.Listbox(body, height=14,
-                                  bg="#ffffff", fg=self.TEXT,
+        self.listbox = tk.Listbox(body, height=14, bg="#ffffff", fg=self.TEXT,
                                   highlightthickness=1, highlightbackground=self.BORDER,
                                   selectbackground="#dbeafe")
         self.listbox.pack(side="left", fill="both", expand=True)
@@ -955,36 +790,21 @@ class App(BaseTk):
     def _run_pdf(self, pdf_path):
         self.run = RunContext()
         try:
-            self._set_pill("AJOSSA", "run")
             self._set_status("Aloitetaan PDF ajo…")
-
-            rows, emails = pipeline_pdf(
-                self.run, pdf_path,
-                status_cb=self._set_status,
-                progress_cb=self._set_progress,
-                stop_flag=self.stop_flag
-            )
-
+            rows, emails = pipeline_pdf(self.run, pdf_path, self._set_status, self._set_progress, self.stop_flag)
             if self.stop_flag.is_set():
-                self._set_pill("PYSÄYTETTY", "err")
                 self._set_status("Pysäytetty.")
                 return
-
             if not rows:
-                self._set_pill("EI TULOKSIA", "err")
                 self._set_status("Ei löytynyt tuloksia.")
                 return
-
-            xlsx = save_results_xlsx(self.run, rows, filename="results.xlsx")
-            docx = save_emails_docx(self.run, emails)
-
-            self._set_pill("VALMIS", "ok")
-            self._set_status(f"Valmis! Tallennettu: {os.path.basename(docx)}, {os.path.basename(xlsx)}")
+            save_results_xlsx(self.run, rows)
+            save_emails_docx(self.run, emails)
             messagebox.showinfo("Valmis", f"Valmis!\n\nKansio:\n{self.run.run_dir}\n\nRivejä: {len(rows)}\nSähköposteja: {len(emails)}")
+            self._set_status("Valmis!")
         except Exception as e:
-            self._set_pill("VIRHE", "err")
             self._ui_log(f"VIRHE: {e}")
-            messagebox.showerror("Virhe", f"Tuli virhe:\n\n{e}\n\nKatso log:\n{self.run.log_path if self.run else ''}")
+            messagebox.showerror("Virhe", f"Tuli virhe:\n\n{e}\n\nKatso log:\n{self.run.log_path}")
 
     def start_clipboard_mode(self):
         self._clear_stop()
@@ -997,40 +817,23 @@ class App(BaseTk):
     def _run_clipboard(self, text: str):
         self.run = RunContext()
         try:
-            self._set_pill("AJOSSA", "run")
             self._set_status("Aloitetaan Clipboard ajo…")
-
             strict = bool(self.strict_var.get())
             max_names = int(self.max_names_var.get() or 400)
-
-            rows, emails = pipeline_clipboard(
-                self.run, text,
-                strict=strict, max_names=max_names,
-                status_cb=self._set_status,
-                progress_cb=self._set_progress,
-                stop_flag=self.stop_flag
-            )
-
+            rows, emails = pipeline_clipboard(self.run, text, strict, max_names, self._set_status, self._set_progress, self.stop_flag)
             if self.stop_flag.is_set():
-                self._set_pill("PYSÄYTETTY", "err")
                 self._set_status("Pysäytetty.")
                 return
-
             if not rows:
-                self._set_pill("EI TULOKSIA", "err")
                 self._set_status("Ei löytynyt tuloksia.")
                 return
-
-            xlsx = save_results_xlsx(self.run, rows, filename="results.xlsx")
-            docx = save_emails_docx(self.run, emails)
-
-            self._set_pill("VALMIS", "ok")
-            self._set_status(f"Valmis! Tallennettu: {os.path.basename(docx)}, {os.path.basename(xlsx)}")
+            save_results_xlsx(self.run, rows)
+            save_emails_docx(self.run, emails)
             messagebox.showinfo("Valmis", f"Valmis!\n\nKansio:\n{self.run.run_dir}\n\nRivejä: {len(rows)}\nSähköposteja: {len(emails)}")
+            self._set_status("Valmis!")
         except Exception as e:
-            self._set_pill("VIRHE", "err")
             self._ui_log(f"VIRHE: {e}")
-            messagebox.showerror("Virhe", f"Tuli virhe:\n\n{e}\n\nKatso log:\n{self.run.log_path if self.run else ''}")
+            messagebox.showerror("Virhe", f"Tuli virhe:\n\n{e}\n\nKatso log:\n{self.run.log_path}")
 
 
 if __name__ == "__main__":
