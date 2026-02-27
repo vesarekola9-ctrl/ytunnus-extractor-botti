@@ -1,5 +1,5 @@
 # Finnish Business Email Finder (fix: avoid selenium.webdriver.chrome.options import)
-# Modes: PDF->YTJ, Clipboard->(emails/yt/names)->YTJ
+# FIX 2026-02-27: YTJ name search must use correct "company search" field (not Y-tunnus field)
 import os
 import re
 import sys
@@ -31,7 +31,7 @@ except Exception:
     HAS_DND = False
 
 
-APP_BUILD = "2026-02-27_fix_selenium_options"
+APP_BUILD = "2026-02-27_fix_search_field"
 
 YTJ_PAGE_LOAD_TIMEOUT = 18
 YTJ_RETRY_READS = 5
@@ -47,6 +47,11 @@ EMAIL_RE = re.compile(r"[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9-.]+")
 EMAIL_A_RE = re.compile(r"[A-Za-z0-9_.+-]+\s*\(a\)\s*[A-Za-z0-9-]+\.[A-Za-z0-9-.]+", re.I)
 
 YTJ_COMPANY_URL = "https://tietopalvelu.ytj.fi/yritys/{}"
+YTJ_SEARCH_URLS = [
+    "https://tietopalvelu.ytj.fi/haku",
+    "https://tietopalvelu.ytj.fi/",
+]
+
 STRICT_FORMS_RE = re.compile(r"\b(oy|ab|ky|tmi|oyj|osakeyhtiö|kommandiittiyhtiö|toiminimi|as\.|ltd|llc|inc|gmbh)\b", re.I)
 
 
@@ -223,7 +228,6 @@ def extract_ytunnukset_from_pdf(pdf_path: str):
 
 
 def start_new_driver():
-    # IMPORTANT: do NOT import selenium.webdriver.chrome.options.Options
     options = webdriver.ChromeOptions()
     options.add_argument("--start-maximized")
     options.add_argument("--disable-gpu")
@@ -353,39 +357,102 @@ def fetch_email_by_yt(driver, yt: str, stop_flag: threading.Event):
     return ""
 
 
+# -------------------------
+#   YTJ NAME SEARCH FIX
+# -------------------------
 def ytj_open_search_home(driver):
-    driver.get("https://tietopalvelu.ytj.fi/")
-    try:
-        wait_ytj_loaded(driver)
-    except Exception:
-        pass
-    try_accept_cookies(driver)
-
-
-def find_ytj_search_input(driver):
-    xpaths = [
-        "//input[@type='search']",
-        "//input[contains(translate(@placeholder,'HAE','hae'),'hae')]",
-        "//input[contains(translate(@aria-label,'HAE','hae'),'hae')]",
-        "//form//input",
-        "//input",
-    ]
-    for xp in xpaths:
+    """
+    Force to search page so we don't accidentally type into a Y-tunnus-only box on /yritys/ pages.
+    """
+    for url in YTJ_SEARCH_URLS:
         try:
-            cands = driver.find_elements(By.XPATH, xp)
+            driver.get(url)
+            wait_ytj_loaded(driver)
+            try_accept_cookies(driver)
+            # if we see any search-like input, good
+            if find_ytj_company_search_input(driver):
+                return
         except Exception:
-            cands = []
-        for inp in cands:
-            try:
-                if not inp.is_displayed() or not inp.is_enabled():
-                    continue
-                t = (inp.get_attribute("type") or "").lower()
-                if t in ("hidden", "password", "checkbox", "radio", "submit", "button"):
-                    continue
-                return inp
-            except Exception:
+            continue
+
+
+def _attr(el, name: str) -> str:
+    try:
+        return (el.get_attribute(name) or "").strip()
+    except Exception:
+        return ""
+
+
+def find_ytj_company_search_input(driver):
+    """
+    Pick the correct company search input.
+    Reject inputs that look like 'Y-tunnus' only.
+    Prefer placeholders/labels that mention company search.
+    """
+    candidates = []
+    try:
+        inputs = driver.find_elements(By.XPATH, "//input")
+    except Exception:
+        inputs = []
+
+    for inp in inputs:
+        try:
+            if not inp.is_displayed() or not inp.is_enabled():
                 continue
-    return None
+
+            itype = (_attr(inp, "type") or "").lower()
+            if itype in ("hidden", "password", "checkbox", "radio", "submit", "button", "file"):
+                continue
+
+            ph = _attr(inp, "placeholder").lower()
+            al = _attr(inp, "aria-label").lower()
+            nm = _attr(inp, "name").lower()
+            iid = _attr(inp, "id").lower()
+
+            text = " ".join([ph, al, nm, iid]).strip()
+
+            # hard reject: clearly Y-tunnus only
+            if "y-tunnus" in text and ("yritys" not in text and "toiminimi" not in text and "nimi" not in text):
+                continue
+
+            score = 0
+
+            # Prefer typical company search hints
+            if "yritys" in text:
+                score += 50
+            if "toiminimi" in text:
+                score += 35
+            if "nimi" in text:
+                score += 25
+            if itype == "search":
+                score += 15
+            if "hae" in text:
+                score += 10
+
+            # Slight penalty if mentions y-tunnus (combined search is ok, but don't pick yt-only)
+            if "y-tunnus" in text:
+                score -= 5
+
+            # Keep only reasonable
+            if score <= 0:
+                continue
+
+            candidates.append((score, inp))
+        except Exception:
+            continue
+
+    if not candidates:
+        # fallback: try type=search
+        try:
+            for inp in driver.find_elements(By.XPATH, "//input[@type='search']"):
+                if inp.is_displayed() and inp.is_enabled():
+                    return inp
+        except Exception:
+            pass
+        return None
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
 
 
 def extract_yt_from_text_anywhere(txt: str) -> str:
@@ -411,7 +478,8 @@ def ytj_name_to_yt(driver, name: str, stop_flag: threading.Event):
     ytj_open_search_home(driver)
     if stop_flag.is_set():
         return ""
-    inp = find_ytj_search_input(driver)
+
+    inp = find_ytj_company_search_input(driver)
     if not inp:
         return ""
 
@@ -421,16 +489,18 @@ def ytj_name_to_yt(driver, name: str, stop_flag: threading.Event):
         except Exception:
             pass
         inp.send_keys(name)
-        inp.send_keys(u"\ue007")
+        inp.send_keys(u"\ue007")  # ENTER
     except Exception:
         return ""
 
     best_link = None
     best_score = -1.0
     t0 = time.time()
+
     while time.time() - t0 < NAME_SEARCH_TIMEOUT:
         if stop_flag.is_set():
             return ""
+
         candidate_links = []
         for xp in ("//a[contains(@href,'/yritys/')]", "//a[contains(@href,'yritys')]"):
             try:
@@ -448,11 +518,13 @@ def ytj_name_to_yt(driver, name: str, stop_flag: threading.Event):
                 href = (a.get_attribute("href") or "")
                 if not href or "tietopalvelu.ytj.fi" not in href:
                     continue
+
                 try:
                     card = a.find_element(By.XPATH, "ancestor::*[self::li or self::div or self::article][1]")
                     card_text = (card.text or "")
                 except Exception:
                     card_text = (a.text or "")
+
                 s = score_result(name, card_text)
                 checked += 1
                 if s > best_score:
@@ -463,6 +535,7 @@ def ytj_name_to_yt(driver, name: str, stop_flag: threading.Event):
 
         if best_link:
             break
+
         time.sleep(NAME_SEARCH_SLEEP)
 
     if not best_link:
@@ -575,7 +648,7 @@ def pipeline_clipboard(run: RunContext, text: str, strict: bool, max_names: int,
             else:
                 if not name:
                     continue
-                status_cb(f"YTJ haku: {idx}/{len(todo)} {name}")
+                status_cb(f"YTJ yrityshaku: {idx}/{len(todo)} {name}")
                 yt2 = name_cache.get(name)
                 if yt2 is None:
                     yt2 = ytj_name_to_yt(driver, name, stop_flag)
@@ -617,7 +690,6 @@ class App(BaseTk):
         self.BLUE_H = "#1e40af"
         self.DANGER = "#b91c1c"
         self.DANGER_H = "#991b1b"
-        self.OK = "#16a34a"
 
         self.title("Finnish Business Email Finder")
         self.geometry("980x860")
@@ -679,12 +751,6 @@ class App(BaseTk):
                  font=("Segoe UI", 20, "bold")).pack(anchor="w")
 
         tk.Label(header, text=f"Build: {APP_BUILD}", bg=self.BG, fg=self.MUTED, font=("Segoe UI", 9)).pack(anchor="w")
-
-        tk.Label(
-            header,
-            text="Liitä teksti (Ctrl+V) mistä tahansa sivusta tai valitse PDF — botti poimii emailit ja täydentää YTJ:stä.",
-            bg=self.BG, fg=self.MUTED, font=("Segoe UI", 10)
-        ).pack(anchor="w", pady=(4, 0))
 
         container = tk.Frame(self, bg=self.BG)
         container.pack(fill="both", expand=True, padx=16, pady=(0, 16))
