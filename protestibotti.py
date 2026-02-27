@@ -1,5 +1,10 @@
-# Finnish Business Email Finder (fix: avoid selenium.webdriver.chrome.options import)
-# FIX 2026-02-27: YTJ name search must use correct "company search" field (not Y-tunnus field)
+# protestibotti.py
+# Finnish Business Email Finder
+# FIXES:
+# - Avoid selenium.webdriver.chrome.options import
+# - YTJ name search uses correct company-search field (not Y-tunnus-only box)
+# - UI: scrollable layout + "Tyhjennä" button for clipboard
+
 import os
 import re
 import sys
@@ -31,7 +36,7 @@ except Exception:
     HAS_DND = False
 
 
-APP_BUILD = "2026-02-27_fix_search_field"
+APP_BUILD = "2026-02-27_scroll_and_clear"
 
 YTJ_PAGE_LOAD_TIMEOUT = 18
 YTJ_RETRY_READS = 5
@@ -47,14 +52,60 @@ EMAIL_RE = re.compile(r"[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9-.]+")
 EMAIL_A_RE = re.compile(r"[A-Za-z0-9_.+-]+\s*\(a\)\s*[A-Za-z0-9-]+\.[A-Za-z0-9-.]+", re.I)
 
 YTJ_COMPANY_URL = "https://tietopalvelu.ytj.fi/yritys/{}"
-YTJ_SEARCH_URLS = [
-    "https://tietopalvelu.ytj.fi/haku",
-    "https://tietopalvelu.ytj.fi/",
-]
+YTJ_SEARCH_URLS = ["https://tietopalvelu.ytj.fi/haku", "https://tietopalvelu.ytj.fi/"]
 
-STRICT_FORMS_RE = re.compile(r"\b(oy|ab|ky|tmi|oyj|osakeyhtiö|kommandiittiyhtiö|toiminimi|as\.|ltd|llc|inc|gmbh)\b", re.I)
+STRICT_FORMS_RE = re.compile(
+    r"\b(oy|ab|ky|tmi|oyj|osakeyhtiö|kommandiittiyhtiö|toiminimi|as\.|ltd|llc|inc|gmbh)\b", re.I
+)
 
 
+# =========================
+#   SCROLLABLE UI WRAPPER
+# =========================
+class ScrollableFrame(ttk.Frame):
+    """A scrollable frame using a canvas. Mouse wheel scrolls the content."""
+    def __init__(self, container, *args, **kwargs):
+        super().__init__(container, *args, **kwargs)
+
+        self.canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0)
+        self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.vsb.set)
+
+        self.inner = ttk.Frame(self.canvas)
+        self._win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+
+        self.vsb.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        self.inner.bind("<Configure>", self._on_inner_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+
+        # mouse wheel
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)  # Windows
+        self.canvas.bind_all("<Shift-MouseWheel>", self._on_shift_mousewheel)
+
+    def _on_inner_configure(self, event):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event):
+        # make inner frame width match canvas
+        self.canvas.itemconfigure(self._win, width=event.width)
+
+    def _on_mousewheel(self, event):
+        # delta is 120 multiples on Windows
+        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _on_shift_mousewheel(self, event):
+        # optional: horizontal not used now
+        pass
+
+
+BaseTk = TkinterDnD.Tk if HAS_DND else tk.Tk
+
+
+# =========================
+#   PATHS / RUN FOLDERS
+# =========================
 def exe_dir() -> str:
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
@@ -105,6 +156,9 @@ class RunContext:
         return line
 
 
+# =========================
+#   UTIL
+# =========================
 def normalize_yt(yt: str):
     yt = (yt or "").strip().replace(" ", "")
     if re.fullmatch(r"\d{7}-\d", yt):
@@ -146,7 +200,11 @@ def extract_names_from_text(text: str, strict: bool, max_names: int):
     lines = split_lines(text)
     out = []
     seen = set()
-    bad_contains = ["näytä lisää", "kirjaudu", "tilaa", "tilaajille", "€", "y-tunnus", "ytunnus", "sähköposti", "puhelin", "www.", "http"]
+    bad_contains = [
+        "näytä lisää", "kirjaudu", "tilaa", "tilaajille",
+        "€", "y-tunnus", "ytunnus", "sähköposti", "puhelin",
+        "www.", "http"
+    ]
 
     for ln in lines:
         if len(out) >= max_names:
@@ -175,6 +233,9 @@ def extract_names_from_text(text: str, strict: bool, max_names: int):
     return out
 
 
+# =========================
+#   OUTPUT
+# =========================
 def save_emails_docx(run: RunContext, emails: list[str]):
     path = os.path.join(run.run_dir, "emails.docx")
     doc = Document()
@@ -190,6 +251,7 @@ def save_results_xlsx(run: RunContext, rows: list[dict], filename="results.xlsx"
     wb = Workbook()
     ws = wb.active
     ws.title = "Results"
+
     headers = ["Name", "Y-tunnus", "Email", "Source", "Notes"]
     ws.append(headers)
     header_font = Font(bold=True)
@@ -214,6 +276,9 @@ def save_results_xlsx(run: RunContext, rows: list[dict], filename="results.xlsx"
     return path
 
 
+# =========================
+#   PDF -> YTs
+# =========================
 def extract_ytunnukset_from_pdf(pdf_path: str):
     yt_set = set()
     with open(pdf_path, "rb") as f:
@@ -227,6 +292,9 @@ def extract_ytunnukset_from_pdf(pdf_path: str):
     return sorted(yt_set)
 
 
+# =========================
+#   SELENIUM
+# =========================
 def start_new_driver():
     options = webdriver.ChromeOptions()
     options.add_argument("--start-maximized")
@@ -270,7 +338,9 @@ def try_accept_cookies(driver):
 
 
 def wait_ytj_loaded(driver):
-    WebDriverWait(driver, YTJ_PAGE_LOAD_TIMEOUT).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    WebDriverWait(driver, YTJ_PAGE_LOAD_TIMEOUT).until(
+        EC.presence_of_element_located((By.TAG_NAME, "body"))
+    )
 
 
 def extract_email_from_ytj(driver):
@@ -357,25 +427,9 @@ def fetch_email_by_yt(driver, yt: str, stop_flag: threading.Event):
     return ""
 
 
-# -------------------------
-#   YTJ NAME SEARCH FIX
-# -------------------------
-def ytj_open_search_home(driver):
-    """
-    Force to search page so we don't accidentally type into a Y-tunnus-only box on /yritys/ pages.
-    """
-    for url in YTJ_SEARCH_URLS:
-        try:
-            driver.get(url)
-            wait_ytj_loaded(driver)
-            try_accept_cookies(driver)
-            # if we see any search-like input, good
-            if find_ytj_company_search_input(driver):
-                return
-        except Exception:
-            continue
-
-
+# =========================
+#   YTJ NAME SEARCH (correct field)
+# =========================
 def _attr(el, name: str) -> str:
     try:
         return (el.get_attribute(name) or "").strip()
@@ -384,11 +438,6 @@ def _attr(el, name: str) -> str:
 
 
 def find_ytj_company_search_input(driver):
-    """
-    Pick the correct company search input.
-    Reject inputs that look like 'Y-tunnus' only.
-    Prefer placeholders/labels that mention company search.
-    """
     candidates = []
     try:
         inputs = driver.find_elements(By.XPATH, "//input")
@@ -408,16 +457,13 @@ def find_ytj_company_search_input(driver):
             al = _attr(inp, "aria-label").lower()
             nm = _attr(inp, "name").lower()
             iid = _attr(inp, "id").lower()
-
             text = " ".join([ph, al, nm, iid]).strip()
 
-            # hard reject: clearly Y-tunnus only
+            # reject yt-only
             if "y-tunnus" in text and ("yritys" not in text and "toiminimi" not in text and "nimi" not in text):
                 continue
 
             score = 0
-
-            # Prefer typical company search hints
             if "yritys" in text:
                 score += 50
             if "toiminimi" in text:
@@ -428,21 +474,16 @@ def find_ytj_company_search_input(driver):
                 score += 15
             if "hae" in text:
                 score += 10
-
-            # Slight penalty if mentions y-tunnus (combined search is ok, but don't pick yt-only)
             if "y-tunnus" in text:
                 score -= 5
 
-            # Keep only reasonable
             if score <= 0:
                 continue
-
             candidates.append((score, inp))
         except Exception:
             continue
 
     if not candidates:
-        # fallback: try type=search
         try:
             for inp in driver.find_elements(By.XPATH, "//input[@type='search']"):
                 if inp.is_displayed() and inp.is_enabled():
@@ -453,6 +494,18 @@ def find_ytj_company_search_input(driver):
 
     candidates.sort(key=lambda x: x[0], reverse=True)
     return candidates[0][1]
+
+
+def ytj_open_search_home(driver):
+    for url in YTJ_SEARCH_URLS:
+        try:
+            driver.get(url)
+            wait_ytj_loaded(driver)
+            try_accept_cookies(driver)
+            if find_ytj_company_search_input(driver):
+                return
+        except Exception:
+            continue
 
 
 def extract_yt_from_text_anywhere(txt: str) -> str:
@@ -496,7 +549,6 @@ def ytj_name_to_yt(driver, name: str, stop_flag: threading.Event):
     best_link = None
     best_score = -1.0
     t0 = time.time()
-
     while time.time() - t0 < NAME_SEARCH_TIMEOUT:
         if stop_flag.is_set():
             return ""
@@ -518,13 +570,11 @@ def ytj_name_to_yt(driver, name: str, stop_flag: threading.Event):
                 href = (a.get_attribute("href") or "")
                 if not href or "tietopalvelu.ytj.fi" not in href:
                     continue
-
                 try:
                     card = a.find_element(By.XPATH, "ancestor::*[self::li or self::div or self::article][1]")
                     card_text = (card.text or "")
                 except Exception:
                     card_text = (a.text or "")
-
                 s = score_result(name, card_text)
                 checked += 1
                 if s > best_score:
@@ -535,7 +585,6 @@ def ytj_name_to_yt(driver, name: str, stop_flag: threading.Event):
 
         if best_link:
             break
-
         time.sleep(NAME_SEARCH_SLEEP)
 
     if not best_link:
@@ -557,6 +606,9 @@ def ytj_name_to_yt(driver, name: str, stop_flag: threading.Event):
         return ""
 
 
+# =========================
+#   PIPELINES
+# =========================
 def pipeline_pdf(run: RunContext, pdf_path: str, status_cb, progress_cb, stop_flag: threading.Event):
     status_cb("Luetaan PDF ja kerätään Y-tunnukset…")
     yts = extract_ytunnukset_from_pdf(pdf_path)
@@ -576,12 +628,15 @@ def pipeline_pdf(run: RunContext, pdf_path: str, status_cb, progress_cb, stop_fl
                 break
             progress_cb(i - 1, len(yts))
             status_cb(f"YTJ: {i}/{len(yts)} {yt}")
+
             email = cache.get(yt)
             if email is None:
                 email = fetch_email_by_yt(driver, yt, stop_flag)
                 cache[yt] = email
+
             rows.append({"name": "", "yt": yt, "email": email, "source": "pdf->ytj", "notes": ""})
             time.sleep(YTJ_PER_COMPANY_SLEEP)
+
         progress_cb(len(yts), max(1, len(yts)))
     finally:
         try:
@@ -595,6 +650,7 @@ def pipeline_pdf(run: RunContext, pdf_path: str, status_cb, progress_cb, stop_fl
 
 def pipeline_clipboard(run: RunContext, text: str, strict: bool, max_names: int, status_cb, progress_cb, stop_flag: threading.Event):
     status_cb("Clipboard: poimitaan sähköpostit, Y-tunnukset ja yritysnimet…")
+
     direct_emails = set(e.strip().lower() for e in EMAIL_RE.findall(text or "") if e.strip())
     yts = extract_yts_from_text(text)
     names = extract_names_from_text(text, strict=strict, max_names=max_names)
@@ -623,17 +679,20 @@ def pipeline_clipboard(run: RunContext, text: str, strict: bool, max_names: int,
 
     status_cb("Käynnistetään YTJ-haku…")
     driver = start_new_driver()
+
     yt_cache: dict[str, str] = {}
     name_cache: dict[str, str] = {}
+
     try:
         todo = [r for r in rows if not r.get("email")]
         progress_cb(0, max(1, len(todo)))
+
         for idx, r in enumerate(todo, start=1):
             if stop_flag.is_set():
                 status_cb("Pysäytetty.")
                 break
-            progress_cb(idx - 1, len(todo))
 
+            progress_cb(idx - 1, len(todo))
             name = (r.get("name") or "").strip()
             yt = (r.get("yt") or "").strip()
 
@@ -649,10 +708,12 @@ def pipeline_clipboard(run: RunContext, text: str, strict: bool, max_names: int,
                 if not name:
                     continue
                 status_cb(f"YTJ yrityshaku: {idx}/{len(todo)} {name}")
+
                 yt2 = name_cache.get(name)
                 if yt2 is None:
                     yt2 = ytj_name_to_yt(driver, name, stop_flag)
                     name_cache[name] = yt2
+
                 if yt2:
                     r["yt"] = yt2
                     email2 = yt_cache.get(yt2)
@@ -661,7 +722,9 @@ def pipeline_clipboard(run: RunContext, text: str, strict: bool, max_names: int,
                         yt_cache[yt2] = email2
                     if email2:
                         r["email"] = email2
+
             time.sleep(YTJ_PER_COMPANY_SLEEP)
+
         progress_cb(len(todo), max(1, len(todo)))
     finally:
         try:
@@ -673,14 +736,16 @@ def pipeline_clipboard(run: RunContext, text: str, strict: bool, max_names: int,
     return rows, emails
 
 
-BaseTk = TkinterDnD.Tk if HAS_DND else tk.Tk
-
-
+# =========================
+#   APP UI
+# =========================
 class App(BaseTk):
     def __init__(self):
         super().__init__()
         self.stop_flag = threading.Event()
+        self.run: RunContext | None = None
 
+        # theme
         self.BG = "#ffffff"
         self.CARD = "#f6f8ff"
         self.BORDER = "#d7def7"
@@ -690,20 +755,26 @@ class App(BaseTk):
         self.BLUE_H = "#1e40af"
         self.DANGER = "#b91c1c"
         self.DANGER_H = "#991b1b"
+        self.GREY_BTN = "#64748b"
+        self.GREY_BTN_H = "#475569"
 
         self.title("Finnish Business Email Finder")
         self.geometry("980x860")
         self.configure(bg=self.BG)
 
-        self.run = None
         self._build_ui()
 
     def _card(self, parent):
         return tk.Frame(parent, bg=self.CARD, highlightthickness=1, highlightbackground=self.BORDER)
 
-    def _btn(self, parent, text, cmd, danger=False):
-        bg = self.DANGER if danger else self.BLUE
-        hover = self.DANGER_H if danger else self.BLUE_H
+    def _btn(self, parent, text, cmd, kind="blue"):
+        if kind == "danger":
+            bg, hover = self.DANGER, self.DANGER_H
+        elif kind == "grey":
+            bg, hover = self.GREY_BTN, self.GREY_BTN_H
+        else:
+            bg, hover = self.BLUE, self.BLUE_H
+
         b = tk.Button(
             parent, text=text, command=cmd,
             bg=bg, fg="#ffffff",
@@ -743,29 +814,34 @@ class App(BaseTk):
     def _clear_stop(self):
         self.stop_flag.clear()
 
+    def clear_clipboard_text(self):
+        self.clip_text.delete("1.0", tk.END)
+        self._ui_log("Clipboard tyhjennetty.")
+
     def _build_ui(self):
-        header = tk.Frame(self, bg=self.BG)
+        # Scrollable root
+        outer = ScrollableFrame(self)
+        outer.pack(fill="both", expand=True)
+        root = outer.inner
+
+        header = tk.Frame(root, bg=self.BG)
         header.pack(fill="x", padx=16, pady=(16, 10))
 
         tk.Label(header, text="Finnish Business Email Finder", bg=self.BG, fg=self.TEXT,
                  font=("Segoe UI", 20, "bold")).pack(anchor="w")
-
         tk.Label(header, text=f"Build: {APP_BUILD}", bg=self.BG, fg=self.MUTED, font=("Segoe UI", 9)).pack(anchor="w")
 
-        container = tk.Frame(self, bg=self.BG)
-        container.pack(fill="both", expand=True, padx=16, pady=(0, 16))
-
-        actions = self._card(container)
-        actions.pack(fill="x", pady=(0, 12))
+        actions = self._card(root)
+        actions.pack(fill="x", padx=16, pady=(0, 12))
         row = tk.Frame(actions, bg=self.CARD)
         row.pack(fill="x", padx=12, pady=12)
 
         self._btn(row, "PDF → YTJ", self.start_pdf_mode).pack(side="left", padx=6)
         self._btn(row, "Clipboard → Finder", self.start_clipboard_mode).pack(side="left", padx=6)
-        self._btn(row, "Pysäytä", self.request_stop, danger=True).pack(side="right", padx=6)
+        self._btn(row, "Pysäytä", self.request_stop, kind="danger").pack(side="right", padx=6)
 
-        status_card = self._card(container)
-        status_card.pack(fill="x", pady=(0, 12))
+        status_card = self._card(root)
+        status_card.pack(fill="x", padx=16, pady=(0, 12))
 
         self.status = tk.Label(status_card, text="Valmiina.", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 11))
         self.status.pack(anchor="w", padx=12, pady=(12, 6))
@@ -773,8 +849,8 @@ class App(BaseTk):
         self.progress = ttk.Progressbar(status_card, orient="horizontal", mode="determinate", length=920)
         self.progress.pack(fill="x", padx=12, pady=(0, 12))
 
-        pdf_card = self._card(container)
-        pdf_card.pack(fill="x", pady=(0, 12))
+        pdf_card = self._card(root)
+        pdf_card.pack(fill="x", padx=16, pady=(0, 12))
 
         self.drop_var = tk.StringVar(value="PDF: Pudota tähän (tai paina PDF → YTJ ja valitse tiedosto)")
         drop = tk.Label(pdf_card, textvariable=self.drop_var,
@@ -787,8 +863,8 @@ class App(BaseTk):
             drop.drop_target_register(DND_FILES)
             drop.dnd_bind("<<Drop>>", self._on_drop_pdf)
 
-        clip_card = self._card(container)
-        clip_card.pack(fill="x", pady=(0, 12))
+        clip_card = self._card(root)
+        clip_card.pack(fill="x", padx=16, pady=(0, 12))
 
         top = tk.Frame(clip_card, bg=self.CARD)
         top.pack(fill="x", padx=12, pady=(12, 6))
@@ -808,6 +884,9 @@ class App(BaseTk):
                    bg="#ffffff", fg=self.TEXT, insertbackground=self.TEXT,
                    highlightthickness=1, highlightbackground=self.BORDER).pack(side="left")
 
+        # NEW: clear button
+        self._btn(top, "Tyhjennä", self.clear_clipboard_text, kind="grey").pack(side="right", padx=6)
+
         tk.Label(clip_card, text="Liitä tähän (Ctrl+V):", bg=self.CARD, fg=self.MUTED,
                  font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=(6, 6))
 
@@ -816,8 +895,8 @@ class App(BaseTk):
                                  highlightthickness=1, highlightbackground=self.BORDER)
         self.clip_text.pack(fill="x", padx=12, pady=(0, 12))
 
-        log_card = self._card(container)
-        log_card.pack(fill="both", expand=True)
+        log_card = self._card(root)
+        log_card.pack(fill="both", expand=True, padx=16, pady=(0, 16))
 
         tk.Label(log_card, text="Logi:", bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=(12, 6))
 
