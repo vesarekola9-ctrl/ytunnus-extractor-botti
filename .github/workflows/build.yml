@@ -2,13 +2,16 @@ name: Build Windows EXE
 
 on:
   push:
-    branches:
-      - main
+    branches: ["main"]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: windows-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,16 +26,32 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller
 
-      - name: Build exe
+      - name: Build EXE with PyInstaller
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --clean --onefile --windowed --name FinnishBusinessEmailFinder `
-            protestibotti.py
+          $ENTRYPOINT = "app.py"
+          if (!(Test-Path $ENTRYPOINT)) {
+            Write-Host "ERROR: Entry point not found: $ENTRYPOINT"
+            Write-Host "Repo root files:"
+            Get-ChildItem -Name
+            exit 1
+          }
+
+          pyinstaller `
+            --noconfirm `
+            --clean `
+            --onefile `
+            --windowed `
+            --name "FinnishBusinessEmailFinder" `
+            --collect-all selenium `
+            --collect-all webdriver_manager `
+            --collect-all tkinterdnd2 `
+            --collect-all openpyxl `
+            $ENTRYPOINT
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: FinnishBusinessEmailFinder-Windows
+          name: FinnishBusinessEmailFinder-win64
           path: dist/FinnishBusinessEmailFinder.exe
