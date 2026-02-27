@@ -26,7 +26,7 @@ jobs:
         run: |
           Write-Host "=== Repo root ==="
           Get-ChildItem -Name
-          Write-Host "=== Tree (depth 3) ==="
+          Write-Host "=== Tree (first 200 items) ==="
           Get-ChildItem -Recurse | Select-Object -First 200
 
       - name: Install dependencies
@@ -53,7 +53,9 @@ jobs:
           }
 
           if (-not $ENTRYPOINT) {
-            $candidates = Get-ChildItem -File -Filter *.py | Where-Object { $_.Name -notmatch '^test' } | Select-Object -First 1
+            $candidates = Get-ChildItem -File -Filter *.py |
+              Where-Object { $_.Name -notmatch '^test' } |
+              Select-Object -First 1
             if ($candidates) { $ENTRYPOINT = $candidates.Name }
           }
 
