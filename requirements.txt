@@ -1,6 +1,6 @@
+selenium==4.23.1
+webdriver-manager==4.0.2
 PyPDF2
 python-docx
-selenium
-webdriver-manager
 openpyxl
 tkinterdnd2
