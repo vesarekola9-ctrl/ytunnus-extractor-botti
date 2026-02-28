@@ -18,12 +18,11 @@ import re
 import sys
 import time
 import csv
-import shutil
 import threading
 import subprocess
 from dataclasses import dataclass
 from difflib import SequenceMatcher
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -51,9 +50,8 @@ except Exception:
     HAS_DND = False
 
 
-APP_BUILD = "2026-02-28_sellable_MVP_protest_TEST_SPEED_STARTCHROME"
+APP_BUILD = "2026-02-28_mvp_kl_overlay_timerange"
 
-# --- regex ---
 YT_RE = re.compile(r"\b\d{7}-\d\b|\b\d{8}\b")
 EMAIL_RE = re.compile(r"[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9-.]+")
 EMAIL_A_RE = re.compile(r"[A-Za-z0-9_.+-]+\s*\(a\)\s*[A-Za-z0-9-]+\.[A-Za-z0-9-.]+", re.I)
@@ -87,6 +85,7 @@ class SpeedProfile:
     # timeouts
     page_load_timeout: int
     ytj_page_load_timeout: int
+
 
 SPEEDS = {
     "Safe": SpeedProfile(
@@ -134,6 +133,7 @@ SPEEDS = {
 class ScrollableFrame(ttk.Frame):
     def __init__(self, container, *args, **kwargs):
         super().__init__(container, *args, **kwargs)
+
         self.canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0)
         self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=self.vsb.set)
@@ -169,6 +169,7 @@ def exe_dir() -> str:
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
+
 def base_output_dir() -> str:
     base = exe_dir()
     try:
@@ -182,6 +183,7 @@ def base_output_dir() -> str:
         docs = os.path.join(home, "Documents")
         return os.path.join(docs, "FinnishBusinessEmailFinder")
 
+
 def create_final_run_dir() -> str:
     root = base_output_dir()
     date_folder = time.strftime("%Y-%m-%d")
@@ -189,6 +191,7 @@ def create_final_run_dir() -> str:
     out = os.path.join(root, date_folder, run_folder)
     os.makedirs(out, exist_ok=True)
     return out
+
 
 def open_folder(path: str):
     try:
@@ -217,13 +220,14 @@ class Row:
 # =========================
 #   UTIL
 # =========================
-def normalize_yt(yt: str):
+def normalize_yt(yt: str) -> Optional[str]:
     yt = (yt or "").strip().replace(" ", "")
     if re.fullmatch(r"\d{7}-\d", yt):
         return yt
     if re.fullmatch(r"\d{8}", yt):
         return yt[:7] + "-" + yt[7]
     return None
+
 
 def extract_yts_from_text(text: str):
     yts = set()
@@ -232,6 +236,7 @@ def extract_yts_from_text(text: str):
         if n:
             yts.add(n)
     return sorted(yts)
+
 
 def pick_email_from_text(text: str) -> str:
     if not text:
@@ -244,20 +249,30 @@ def pick_email_from_text(text: str) -> str:
         return m2.group(0).replace(" ", "").replace("(a)", "@")
     return ""
 
+
 def split_lines(text: str):
     if not text:
         return []
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     return [ln.strip() for ln in text.split("\n") if ln.strip()]
 
+
 def extract_names_from_text(text: str, strict: bool, max_names: int):
     lines = split_lines(text)
     out = []
     seen = set()
     bad_contains = [
-        "näytä lisää", "kirjaudu", "tilaa", "tilaajille",
-        "€", "y-tunnus", "ytunnus", "sähköposti", "puhelin",
-        "www.", "http"
+        "näytä lisää",
+        "kirjaudu",
+        "tilaa",
+        "tilaajille",
+        "€",
+        "y-tunnus",
+        "ytunnus",
+        "sähköposti",
+        "puhelin",
+        "www.",
+        "http",
     ]
     for ln in lines:
         if len(out) >= max_names:
@@ -298,6 +313,7 @@ def save_emails_docx(out_dir: str, emails: list[str]):
     doc.save(path)
     return path
 
+
 def save_results_csv(out_dir: str, rows: list[Row]):
     path = os.path.join(out_dir, "results.csv")
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -306,6 +322,7 @@ def save_results_csv(out_dir: str, rows: list[Row]):
         for r in rows:
             w.writerow([r.name, r.yt, r.email, r.source, r.notes])
     return path
+
 
 def _autosize_columns(ws, max_rows=800):
     for col in range(1, ws.max_column + 1):
@@ -316,6 +333,7 @@ def _autosize_columns(ws, max_rows=800):
                 continue
             max_len = max(max_len, len(str(v)))
         ws.column_dimensions[get_column_letter(col)].width = min(70, max(12, max_len + 2))
+
 
 def save_results_xlsx(out_dir: str, rows: list[Row], source_label: str, source_url: str = "", speed_name: str = ""):
     path = os.path.join(out_dir, "results.xlsx")
@@ -396,6 +414,7 @@ def start_new_driver(speed: SpeedProfile):
     drv.set_page_load_timeout(speed.page_load_timeout)
     return drv
 
+
 def start_driver_attach_debug(port: int, speed: SpeedProfile):
     """
     Attach Selenium to an existing Chrome started with:
@@ -409,6 +428,7 @@ def start_driver_attach_debug(port: int, speed: SpeedProfile):
     drv.set_page_load_timeout(speed.page_load_timeout)
     return drv
 
+
 def safe_click(driver, elem) -> bool:
     try:
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", elem)
@@ -420,6 +440,7 @@ def safe_click(driver, elem) -> bool:
         return True
     except Exception:
         return False
+
 
 def try_accept_cookies(driver):
     texts = ["Hyväksy", "Hyväksy kaikki", "Salli kaikki", "Accept", "Accept all", "I agree", "OK", "Selvä"]
@@ -436,6 +457,7 @@ def try_accept_cookies(driver):
                         break
             except Exception:
                 continue
+
 
 def wait_loaded(driver, timeout=18):
     WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
@@ -471,6 +493,7 @@ def extract_email_from_ytj(driver):
     except Exception:
         return ""
 
+
 def click_all_nayta_ytj(driver, speed: SpeedProfile):
     for _ in range(speed.ytj_nayta_passes):
         clicked = False
@@ -493,6 +516,7 @@ def click_all_nayta_ytj(driver, speed: SpeedProfile):
         if not clicked:
             break
 
+
 def fetch_email_by_yt(driver, yt: str, stop_flag: threading.Event, speed: SpeedProfile):
     if stop_flag.is_set():
         return ""
@@ -505,6 +529,7 @@ def fetch_email_by_yt(driver, yt: str, stop_flag: threading.Event, speed: SpeedP
         wait_loaded(driver, timeout=speed.ytj_page_load_timeout)
     except Exception:
         pass
+
     try_accept_cookies(driver)
 
     for _ in range(2):
@@ -535,6 +560,7 @@ def _attr(el, name: str) -> str:
     except Exception:
         return ""
 
+
 def find_ytj_company_search_input(driver):
     candidates = []
     try:
@@ -559,12 +585,18 @@ def find_ytj_company_search_input(driver):
                 continue
 
             score = 0
-            if "yritys" in text: score += 50
-            if "toiminimi" in text: score += 35
-            if "nimi" in text: score += 25
-            if itype == "search": score += 15
-            if "hae" in text: score += 10
-            if "y-tunnus" in text: score -= 5
+            if "yritys" in text:
+                score += 50
+            if "toiminimi" in text:
+                score += 35
+            if "nimi" in text:
+                score += 25
+            if itype == "search":
+                score += 15
+            if "hae" in text:
+                score += 10
+            if "y-tunnus" in text:
+                score -= 5
 
             if score <= 0:
                 continue
@@ -584,6 +616,7 @@ def find_ytj_company_search_input(driver):
     candidates.sort(key=lambda x: x[0], reverse=True)
     return candidates[0][1]
 
+
 def ytj_open_search_home(driver, speed: SpeedProfile):
     for url in YTJ_SEARCH_URLS:
         try:
@@ -595,6 +628,7 @@ def ytj_open_search_home(driver, speed: SpeedProfile):
         except Exception:
             continue
 
+
 def extract_yt_from_text_anywhere(txt: str) -> str:
     if not txt:
         return ""
@@ -604,6 +638,7 @@ def extract_yt_from_text_anywhere(txt: str) -> str:
             return n
     return ""
 
+
 def score_result(name_query: str, card_text: str) -> float:
     txt = (card_text or "").strip()
     ratio = SequenceMatcher(None, (name_query or "").lower(), txt.lower()).ratio()
@@ -611,6 +646,7 @@ def score_result(name_query: str, card_text: str) -> float:
     if extract_yt_from_text_anywhere(txt):
         score += 20.0
     return score
+
 
 def ytj_name_to_yt(driver, name: str, stop_flag: threading.Event, speed: SpeedProfile):
     ytj_open_search_home(driver, speed)
@@ -719,15 +755,15 @@ def pipeline_pdf(pdf_path: str, status_cb, progress_cb, stop_flag: threading.Eve
             rows.append(Row(name="", yt=yt, email=email, source="pdf->ytj", notes=""))
             time.sleep(speed.ytj_per_company_sleep)
         progress_cb(len(yts), max(1, len(yts)))
-      finally:
-        # IMPORTANT: attach-driver -> älä sulje käyttäjän Chromea!
+    finally:
         try:
-            driver.close()
+            driver.quit()
         except Exception:
             pass
 
     emails = sorted({r.email.lower(): r.email for r in rows if r.email}.values())
     return rows, emails
+
 
 def pipeline_paste(
     text: str,
@@ -823,6 +859,7 @@ def pipeline_paste(
     emails = sorted({r.email.lower(): r.email for r in rows if r.email}.values())
     return rows, emails
 
+
 def pipeline_protest_attach(
     url: str,
     port: int,
@@ -832,13 +869,6 @@ def pipeline_protest_attach(
     stop_flag: threading.Event,
     speed: SpeedProfile,
 ):
-    """
-    Attach to logged-in Chrome -> open protest list -> click 'Näytä lisää' -> extract YTs via JS
-    Then fetch emails from YTJ using a separate driver.
-    test_limit:
-      0 = full run
-      N = only first N Y-tunnus (test run)
-    """
     status_cb("KL: Yhdistetään Chromeen (debug attach)…")
     driver = start_driver_attach_debug(port, speed)
 
@@ -862,10 +892,10 @@ def pipeline_protest_attach(
         if not yts:
             status_cb("KL: Ei löytynyt Y-tunnuksia. Oletko kirjautunut ja protestilista auki?")
             return [], []
-
     finally:
+        # IMPORTANT: älä sulje käyttäjän debug-Chromea
         try:
-            driver.quit()
+            driver.close()
         except Exception:
             pass
 
@@ -910,12 +940,12 @@ def find_chrome_exe() -> Optional[str]:
     for p in candidates:
         if p and os.path.exists(p):
             return p
-    # fallback: hope it's on PATH
     return "chrome.exe"
 
+
 def default_debug_user_data_dir() -> str:
-    base = os.path.join(os.path.expanduser("~"), "Documents", "ChromeDebugProfile")
-    return base
+    return os.path.join(os.path.expanduser("~"), "Documents", "ChromeDebugProfile")
+
 
 def start_chrome_debug(port: int, user_data_dir: str) -> Tuple[bool, str]:
     chrome = find_chrome_exe()
@@ -948,7 +978,6 @@ class App(BaseTk):
         self.stop_flag = threading.Event()
         self.last_output_dir: Optional[str] = None
 
-        # theme
         self.BG = "#ffffff"
         self.CARD = "#f6f8ff"
         self.BORDER = "#d7def7"
@@ -979,11 +1008,17 @@ class App(BaseTk):
             bg, hover = self.BLUE, self.BLUE_H
 
         b = tk.Button(
-            parent, text=text, command=cmd,
-            bg=bg, fg="#ffffff",
-            activebackground=hover, activeforeground="#ffffff",
-            relief="flat", padx=14, pady=10,
-            font=("Segoe UI", 10, "bold")
+            parent,
+            text=text,
+            command=cmd,
+            bg=bg,
+            fg="#ffffff",
+            activebackground=hover,
+            activeforeground="#ffffff",
+            relief="flat",
+            padx=14,
+            pady=10,
+            font=("Segoe UI", 10, "bold"),
         )
         b.bind("<Enter>", lambda e: b.configure(bg=hover))
         b.bind("<Leave>", lambda e: b.configure(bg=bg))
@@ -1037,11 +1072,9 @@ class App(BaseTk):
         header = tk.Frame(root, bg=self.BG)
         header.pack(fill="x", padx=16, pady=(16, 10))
 
-        tk.Label(header, text="Finnish Business Email Finder", bg=self.BG, fg=self.TEXT,
-                 font=("Segoe UI", 20, "bold")).pack(anchor="w")
+        tk.Label(header, text="Finnish Business Email Finder", bg=self.BG, fg=self.TEXT, font=("Segoe UI", 20, "bold")).pack(anchor="w")
         tk.Label(header, text=f"Build: {APP_BUILD}", bg=self.BG, fg=self.MUTED, font=("Segoe UI", 9)).pack(anchor="w")
 
-        # Top bar
         actions = self._card(root)
         actions.pack(fill="x", padx=16, pady=(0, 12))
         row = tk.Frame(actions, bg=self.CARD)
@@ -1054,7 +1087,6 @@ class App(BaseTk):
         self._btn(row, "Avaa tuloskansio", self.open_last_output, kind="grey").pack(side="right", padx=6)
         self._btn(row, "Pysäytä", self.request_stop, kind="danger").pack(side="right", padx=6)
 
-        # Status
         status_card = self._card(root)
         status_card.pack(fill="x", padx=16, pady=(0, 12))
         self.status = tk.Label(status_card, text="Valmiina.", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 11))
@@ -1062,7 +1094,6 @@ class App(BaseTk):
         self.progress = ttk.Progressbar(status_card, orient="horizontal", mode="determinate", length=920)
         self.progress.pack(fill="x", padx=12, pady=(0, 12))
 
-        # PROTEST PLAY CARD
         play_card = self._card(root)
         play_card.pack(fill="x", padx=16, pady=(0, 12))
 
@@ -1071,14 +1102,24 @@ class App(BaseTk):
 
         tk.Label(top, text="Protestilista URL:", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 10, "bold")).pack(side="left")
         self.protest_url_var = tk.StringVar(value=KL_PROTEST_DEFAULT_URL)
-        tk.Entry(top, textvariable=self.protest_url_var, width=62, bg="#ffffff", fg=self.TEXT,
-                 highlightthickness=1, highlightbackground=self.BORDER).pack(side="left", padx=10)
+        tk.Entry(top, textvariable=self.protest_url_var, width=62, bg="#ffffff", fg=self.TEXT, highlightthickness=1, highlightbackground=self.BORDER).pack(
+            side="left", padx=10
+        )
 
         tk.Label(top, text="Portti:", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 10)).pack(side="left", padx=(8, 6))
         self.debug_port_var = tk.IntVar(value=9222)
-        tk.Spinbox(top, from_=1024, to=65535, textvariable=self.debug_port_var, width=7,
-                   bg="#ffffff", fg=self.TEXT, insertbackground=self.TEXT,
-                   highlightthickness=1, highlightbackground=self.BORDER).pack(side="left")
+        tk.Spinbox(
+            top,
+            from_=1024,
+            to=65535,
+            textvariable=self.debug_port_var,
+            width=7,
+            bg="#ffffff",
+            fg=self.TEXT,
+            insertbackground=self.TEXT,
+            highlightthickness=1,
+            highlightbackground=self.BORDER,
+        ).pack(side="left")
 
         top2 = tk.Frame(play_card, bg=self.CARD)
         top2.pack(fill="x", padx=12, pady=(0, 12))
@@ -1096,79 +1137,113 @@ class App(BaseTk):
         tk.Label(
             play_card,
             text="Ohje: 1) Käynnistä Chrome debug-tilaan  2) Kirjaudu Kauppalehteen  3) Avaa protestilista  4) Paina PLAY.",
-            bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 9)
+            bg=self.CARD,
+            fg=self.MUTED,
+            font=("Segoe UI", 9),
         ).pack(anchor="w", padx=12, pady=(0, 12))
 
-        # PASTE CARD
         paste_card = self._card(root)
         paste_card.pack(fill="x", padx=16, pady=(0, 12))
 
         top = tk.Frame(paste_card, bg=self.CARD)
         top.pack(fill="x", padx=12, pady=(12, 6))
         tk.Label(top, text="Ohje:", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 10, "bold")).pack(side="left")
-        tk.Label(top, text="Avaa sivu → Ctrl+A → Ctrl+C → liitä tähän → Start.",
-                 bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 9)).pack(side="left", padx=10)
+        tk.Label(top, text="Avaa sivu → Ctrl+A → Ctrl+C → liitä tähän → Start.", bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 9)).pack(
+            side="left", padx=10
+        )
 
         top2 = tk.Frame(paste_card, bg=self.CARD)
         top2.pack(fill="x", padx=12, pady=(0, 6))
 
         self.strict_var = tk.BooleanVar(value=True)
         tk.Checkbutton(
-            top2, text="Tiukka nimifallback (vain Oy/Ab/Ky/Tmi/...)",
+            top2,
+            text="Tiukka nimifallback (vain Oy/Ab/Ky/Tmi/...)",
             variable=self.strict_var,
-            bg=self.CARD, fg=self.TEXT,
+            bg=self.CARD,
+            fg=self.TEXT,
             selectcolor="#ffffff",
-            activebackground=self.CARD, activeforeground=self.TEXT
+            activebackground=self.CARD,
+            activeforeground=self.TEXT,
         ).pack(side="left")
 
         self.enable_name_fallback_var = tk.BooleanVar(value=False)
         tk.Checkbutton(
-            top2, text="Käytä nimihakua jos EI löydy Y-tunnuksia (fallback)",
+            top2,
+            text="Käytä nimihakua jos EI löydy Y-tunnuksia (fallback)",
             variable=self.enable_name_fallback_var,
-            bg=self.CARD, fg=self.TEXT,
+            bg=self.CARD,
+            fg=self.TEXT,
             selectcolor="#ffffff",
-            activebackground=self.CARD, activeforeground=self.TEXT
+            activebackground=self.CARD,
+            activeforeground=self.TEXT,
         ).pack(side="left", padx=(16, 0))
 
         tk.Label(top2, text="Max nimeä:", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 10)).pack(side="left", padx=(16, 6))
         self.max_names_var = tk.IntVar(value=400)
-        tk.Spinbox(top2, from_=10, to=5000, textvariable=self.max_names_var, width=7,
-                   bg="#ffffff", fg=self.TEXT, insertbackground=self.TEXT,
-                   highlightthickness=1, highlightbackground=self.BORDER).pack(side="left")
+        tk.Spinbox(
+            top2,
+            from_=10,
+            to=5000,
+            textvariable=self.max_names_var,
+            width=7,
+            bg="#ffffff",
+            fg=self.TEXT,
+            insertbackground=self.TEXT,
+            highlightthickness=1,
+            highlightbackground=self.BORDER,
+        ).pack(side="left")
 
         self._btn(top2, "Tyhjennä", self.clear_paste_text, kind="grey").pack(side="right", padx=6)
 
-        tk.Label(paste_card, text="Liitä teksti tähän (Ctrl+V):", bg=self.CARD, fg=self.MUTED,
-                 font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=(6, 6))
+        tk.Label(paste_card, text="Liitä teksti tähän (Ctrl+V):", bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=(6, 6))
 
-        self.paste_text = tk.Text(paste_card, height=10, wrap="word",
-                                  bg="#ffffff", fg=self.TEXT, insertbackground=self.TEXT,
-                                  highlightthickness=1, highlightbackground=self.BORDER)
+        self.paste_text = tk.Text(
+            paste_card,
+            height=10,
+            wrap="word",
+            bg="#ffffff",
+            fg=self.TEXT,
+            insertbackground=self.TEXT,
+            highlightthickness=1,
+            highlightbackground=self.BORDER,
+        )
         self.paste_text.pack(fill="x", padx=12, pady=(0, 12))
 
-        # PDF CARD
         pdf_card = self._card(root)
         pdf_card.pack(fill="x", padx=16, pady=(0, 12))
         self.drop_var = tk.StringVar(value="PDF: Pudota tähän (tai paina PDF → YTJ ja valitse tiedosto)")
-        drop = tk.Label(pdf_card, textvariable=self.drop_var,
-                        bg="#ffffff", fg=self.MUTED, font=("Segoe UI", 10),
-                        padx=12, pady=10,
-                        highlightthickness=1, highlightbackground=self.BORDER)
+        drop = tk.Label(
+            pdf_card,
+            textvariable=self.drop_var,
+            bg="#ffffff",
+            fg=self.MUTED,
+            font=("Segoe UI", 10),
+            padx=12,
+            pady=10,
+            highlightthickness=1,
+            highlightbackground=self.BORDER,
+        )
         drop.pack(fill="x", padx=12, pady=12)
         if HAS_DND:
             drop.drop_target_register(DND_FILES)
             drop.dnd_bind("<<Drop>>", self._on_drop_pdf)
 
-        # LOG
         log_card = self._card(root)
         log_card.pack(fill="both", expand=True, padx=16, pady=(0, 16))
         tk.Label(log_card, text="Logi:", bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=(12, 6))
 
         body = tk.Frame(log_card, bg=self.CARD)
         body.pack(fill="both", expand=True, padx=12, pady=(0, 12))
-        self.listbox = tk.Listbox(body, height=14, bg="#ffffff", fg=self.TEXT,
-                                  highlightthickness=1, highlightbackground=self.BORDER,
-                                  selectbackground="#dbeafe")
+        self.listbox = tk.Listbox(
+            body,
+            height=14,
+            bg="#ffffff",
+            fg=self.TEXT,
+            highlightthickness=1,
+            highlightbackground=self.BORDER,
+            selectbackground="#dbeafe",
+        )
         self.listbox.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(body, orient="vertical", command=self.listbox.yview)
         sb.pack(side="right", fill="y")
@@ -1176,7 +1251,6 @@ class App(BaseTk):
 
         self._ui_log("Ready.")
 
-    # ===== Chrome debug launcher =====
     def launch_chrome_debug(self):
         port = int(self.debug_port_var.get() or 9222)
         user_data = default_debug_user_data_dir()
@@ -1187,7 +1261,6 @@ class App(BaseTk):
         else:
             messagebox.showerror("Chrome Debug", msg)
 
-    # ===== Protest PLAY =====
     def start_protest_mode(self):
         self._clear_stop()
         url = (self.protest_url_var.get() or "").strip()
@@ -1220,13 +1293,15 @@ class App(BaseTk):
             save_results_csv(out_dir, rows)
             save_emails_docx(out_dir, emails)
 
-            messagebox.showinfo("Valmis", f"Valmis!\n\nKansio:\n{out_dir}\n\nRivejä: {len(rows)}\nSähköposteja: {len(emails)}")
+            messagebox.showinfo(
+                "Valmis",
+                f"Valmis!\n\nKansio:\n{out_dir}\n\nRivejä: {len(rows)}\nSähköposteja: {len(emails)}",
+            )
             self._set_status("Valmis!")
         except Exception as e:
             self._ui_log(f"VIRHE: {e}")
             messagebox.showerror("Virhe", f"Tuli virhe:\n\n{e}")
 
-    # ===== Paste =====
     def start_paste_mode(self):
         self._clear_stop()
         text = self.paste_text.get("1.0", tk.END).strip()
@@ -1244,8 +1319,14 @@ class App(BaseTk):
             enable_name_fallback = bool(self.enable_name_fallback_var.get())
 
             rows, emails = pipeline_paste(
-                text, strict, max_names, enable_name_fallback,
-                self._set_status, self._set_progress, self.stop_flag, speed
+                text,
+                strict,
+                max_names,
+                enable_name_fallback,
+                self._set_status,
+                self._set_progress,
+                self.stop_flag,
+                speed,
             )
 
             if self.stop_flag.is_set():
@@ -1261,13 +1342,15 @@ class App(BaseTk):
             save_results_csv(out_dir, rows)
             save_emails_docx(out_dir, emails)
 
-            messagebox.showinfo("Valmis", f"Valmis!\n\nKansio:\n{out_dir}\n\nRivejä: {len(rows)}\nSähköposteja: {len(emails)}")
+            messagebox.showinfo(
+                "Valmis",
+                f"Valmis!\n\nKansio:\n{out_dir}\n\nRivejä: {len(rows)}\nSähköposteja: {len(emails)}",
+            )
             self._set_status("Valmis!")
         except Exception as e:
             self._ui_log(f"VIRHE: {e}")
             messagebox.showerror("Virhe", f"Tuli virhe:\n\n{e}")
 
-    # ===== PDF =====
     def _on_drop_pdf(self, event):
         path = (event.data or "").strip()
         if path.startswith("{") and path.endswith("}"):
@@ -1306,7 +1389,10 @@ class App(BaseTk):
             save_results_csv(out_dir, rows)
             save_emails_docx(out_dir, emails)
 
-            messagebox.showinfo("Valmis", f"Valmis!\n\nKansio:\n{out_dir}\n\nRivejä: {len(rows)}\nSähköposteja: {len(emails)}")
+            messagebox.showinfo(
+                "Valmis",
+                f"Valmis!\n\nKansio:\n{out_dir}\n\nRivejä: {len(rows)}\nSähköposteja: {len(emails)}",
+            )
             self._set_status("Valmis!")
         except Exception as e:
             self._ui_log(f"VIRHE: {e}")
