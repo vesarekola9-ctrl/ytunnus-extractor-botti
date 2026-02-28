@@ -1,20 +1,13 @@
-# LeadForge FI (LeadForgeFI.exe)
+# Finnish Business Email Finder
 
-## What it does
+## Modes
 - PDF -> extract Y-tunnus -> fetch email from YTJ
-- Clipboard -> extract company names (+location) -> YTJ -> Y-tunnus -> email
-- If YTJ has no email, optional website fallback
+- Clipboard -> extract emails + Y-tunnus + company names -> YTJ -> email
 
-## Output
-Created only when saving results:
-- results.xlsx (Results, Found Only, Not Found)
+## Output (created only when run completes)
+- results.xlsx
 - results.csv
 - emails.docx
 
-## License
-- DEMO: max 20 companies per run
-- PRO: unlimited
-Save a PRO key in the app (LF-XXXX-XXXX-XXXX-CC)
-
-## Build
-GitHub Actions builds a Windows EXE artifact: LeadForgeFI.exe
+## Build (GitHub Actions)
+Actions builds `FinnishBusinessEmailFinder.exe` and uploads it as an Artifact.
