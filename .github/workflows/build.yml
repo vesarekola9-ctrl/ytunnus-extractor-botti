@@ -21,14 +21,6 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Debug - list repo files
-        shell: pwsh
-        run: |
-          Write-Host "=== Repo root ==="
-          Get-ChildItem -Name
-          Write-Host "=== Tree (first 200 items) ==="
-          Get-ChildItem -Recurse | Select-Object -First 200
-
       - name: Install dependencies
         shell: pwsh
         run: |
@@ -39,56 +31,23 @@ jobs:
           python -c "import PyPDF2, docx, openpyxl; print('core libs ok')"
           python -c "import selenium, webdriver_manager; print('selenium ok')"
 
-      - name: Pick entrypoint automatically
-        id: pick
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $preferred = @("app.py","protestibotti.py","ytunnus_dragdrop_bot.py","ytunnus_dragdrop_bot_v2.py")
-          $ENTRYPOINT = $null
-
-          foreach ($p in $preferred) {
-            if (Test-Path $p) { $ENTRYPOINT = $p; break }
-          }
-
-          if (-not $ENTRYPOINT) {
-            $candidates = Get-ChildItem -File -Filter *.py |
-              Where-Object { $_.Name -notmatch '^test' } |
-              Select-Object -First 1
-            if ($candidates) { $ENTRYPOINT = $candidates.Name }
-          }
-
-          if (-not $ENTRYPOINT) {
-            Write-Host "ERROR: No python entrypoint found in repo root."
-            Get-ChildItem -Name
-            exit 1
-          }
-
-          Write-Host "ENTRYPOINT=$ENTRYPOINT"
-          "ENTRYPOINT=$ENTRYPOINT" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-
       - name: Build EXE with PyInstaller
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $ENTRYPOINT = "${{ steps.pick.outputs.ENTRYPOINT }}"
-          Write-Host "Building from: $ENTRYPOINT"
-
           pyinstaller `
             --noconfirm `
             --clean `
             --onefile `
             --windowed `
-            --name "FinnishBusinessEmailFinder" `
+            --name "LeadForgeFI" `
             --collect-all selenium `
             --collect-all webdriver_manager `
             --collect-all openpyxl `
-            $ENTRYPOINT
+            app.py
 
-          if (!(Test-Path "dist/FinnishBusinessEmailFinder.exe")) {
+          if (!(Test-Path "dist/LeadForgeFI.exe")) {
             Write-Host "ERROR: EXE was not produced."
-            Write-Host "Dist contents:"
             Get-ChildItem dist -Recurse -ErrorAction SilentlyContinue
             exit 1
           }
@@ -96,8 +55,8 @@ jobs:
       - name: Upload artifact (EXE)
         uses: actions/upload-artifact@v4
         with:
-          name: FinnishBusinessEmailFinder-win64
-          path: dist/FinnishBusinessEmailFinder.exe
+          name: LeadForgeFI-win64
+          path: dist/LeadForgeFI.exe
 
       - name: Upload artifact (build logs)
         if: always()
