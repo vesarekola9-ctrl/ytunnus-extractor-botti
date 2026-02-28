@@ -719,9 +719,10 @@ def pipeline_pdf(pdf_path: str, status_cb, progress_cb, stop_flag: threading.Eve
             rows.append(Row(name="", yt=yt, email=email, source="pdf->ytj", notes=""))
             time.sleep(speed.ytj_per_company_sleep)
         progress_cb(len(yts), max(1, len(yts)))
-    finally:
+      finally:
+        # IMPORTANT: attach-driver -> älä sulje käyttäjän Chromea!
         try:
-            driver.quit()
+            driver.close()
         except Exception:
             pass
 
