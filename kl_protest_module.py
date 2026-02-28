@@ -1,5 +1,4 @@
 # kl_protest_module.py (HARDENED)
-# Kauppalehti Protestilista: robust "Näytä lisää" + robust YT extraction
 # - ensure_on_page(driver, url, status_cb)
 # - click_show_more_until_end(driver, stop_flag, status_cb, ...)
 # - extract_ytunnukset_via_js(driver)
@@ -13,14 +12,12 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
 
 from selenium.common.exceptions import (
-    NoSuchElementException,
     WebDriverException,
     StaleElementReferenceException,
     ElementClickInterceptedException,
 )
 
 DEFAULT_URL = "https://www.kauppalehti.fi/yritykset/protestilista"
-
 YT_RE = re.compile(r"\b\d{7}-\d\b|\b\d{8}\b")
 
 
@@ -50,21 +47,18 @@ def _safe_click(driver, el) -> bool:
     except Exception:
         pass
 
-    # 1) normal click
     try:
         el.click()
         return True
     except Exception:
         pass
 
-    # 2) JS click
     try:
         driver.execute_script("arguments[0].click();", el)
         return True
     except Exception:
         pass
 
-    # 3) ActionChains click
     try:
         ActionChains(driver).move_to_element(el).pause(0.05).click(el).perform()
         return True
@@ -83,18 +77,21 @@ def _try_press_esc(driver, n=2):
 
 
 def close_overlays(driver, status_cb=None):
-    """
-    Best-effort:
-    - ESC
-    - click buttons/links matching close/sulje/accept/hyväksy
-    - hide common overlays via JS
-    """
     _try_press_esc(driver, n=2)
 
     keywords = [
-        "sulje", "close", "hyväksy", "accept", "accept all", "hyväksy kaikki",
-        "ok", "selvä", "agree", "i agree",
-        "×", "✕"
+        "sulje",
+        "close",
+        "hyväksy",
+        "accept",
+        "accept all",
+        "hyväksy kaikki",
+        "ok",
+        "selvä",
+        "agree",
+        "i agree",
+        "×",
+        "✕",
     ]
 
     try:
@@ -107,13 +104,10 @@ def close_overlays(driver, status_cb=None):
         try:
             if not el.is_displayed():
                 continue
-            txt = (el.text or "").strip()
-            if not txt:
-                txt = (el.get_attribute("aria-label") or "").strip()
+            txt = (el.text or "").strip() or (el.get_attribute("aria-label") or "").strip()
             if not txt:
                 continue
-            low = txt.lower()
-            if any(k in low for k in keywords):
+            if any(k in txt.lower() for k in keywords):
                 if _safe_click(driver, el):
                     clicked += 1
                     time.sleep(0.08)
@@ -123,7 +117,6 @@ def close_overlays(driver, status_cb=None):
     if clicked:
         _log(status_cb, f"KL: overlay/consent click: {clicked}")
 
-    # Hide fixed overlays
     try:
         driver.execute_script(
             """
@@ -160,21 +153,16 @@ def _scroll_to_bottom(driver):
 
 
 def _find_show_more(driver):
-    """
-    Try multiple xpaths + text variations.
-    """
     xps = [
         # FI
         "//button[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ','abcdefghijklmnopqrstuvwxyzåäö'),'näytä lisää')]",
         "//a[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ','abcdefghijklmnopqrstuvwxyzåäö'),'näytä lisää')]",
         "//*[self::button or self::a][.//*[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ','abcdefghijklmnopqrstuvwxyzåäö'),'näytä lisää')]]",
-
         # EN
         "//button[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'show more')]",
         "//a[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'show more')]",
         "//*[self::button or self::a][.//*[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'show more')]]",
-
-        # generic: data-testid etc
+        # generic
         "//*[@data-testid='show-more' or @data-testid='load-more']",
         "//*[contains(@class,'show-more') or contains(@class,'load-more')]",
     ]
@@ -197,13 +185,6 @@ def click_show_more_until_end(
     post_click_sleep: float = 0.35,
     stuck_rounds_limit: int = 8,
 ):
-    """
-    Loop:
-    - close overlays
-    - scroll bottom
-    - find + click "Näytä lisää"
-    - detect stuck: if page_source length / yt_count doesn't grow for N rounds => stop
-    """
     clicks = 0
     stuck = 0
 
@@ -219,11 +200,10 @@ def click_show_more_until_end(
         _scroll_to_bottom(driver)
         time.sleep(max(0.05, scroll_sleep))
 
-        # measurements (before click)
         try:
             src = driver.page_source or ""
             cur_len = len(src)
-            cur_yt = len(set(_normalize_yt(x) for x in YT_RE.findall(src) if _normalize_yt(x)))
+            cur_yt = len({y for y in (_normalize_yt(x) for x in YT_RE.findall(src)) if y})
         except Exception:
             cur_len = prev_len
             cur_yt = prev_yt
@@ -252,11 +232,10 @@ def click_show_more_until_end(
 
         time.sleep(max(0.05, post_click_sleep))
 
-        # measurements (after click)
         try:
             src2 = driver.page_source or ""
             new_len = len(src2)
-            new_yt = len(set(_normalize_yt(x) for x in YT_RE.findall(src2) if _normalize_yt(x)))
+            new_yt = len({y for y in (_normalize_yt(x) for x in YT_RE.findall(src2)) if y})
         except Exception:
             new_len = cur_len
             new_yt = cur_yt
@@ -277,24 +256,18 @@ def click_show_more_until_end(
 
 
 def extract_ytunnukset_via_js(driver) -> List[str]:
-    """
-    Robust extraction: innerText + outerHTML + hrefs + dataset strings.
-    """
     parts = []
 
-    # 1) innerText
     try:
         parts.append(driver.execute_script("return document.body ? document.body.innerText : ''") or "")
     except Exception:
         pass
 
-    # 2) outerHTML
     try:
         parts.append(driver.execute_script("return document.documentElement ? document.documentElement.outerHTML : ''") or "")
     except Exception:
         pass
 
-    # 3) hrefs + data attrs (often contains ids)
     try:
         parts.append(
             driver.execute_script(
@@ -309,7 +282,8 @@ def extract_ytunnukset_via_js(driver) -> List[str]:
                 }
                 return out.join('\\n');
                 """
-            ) or ""
+            )
+            or ""
         )
     except Exception:
         pass
