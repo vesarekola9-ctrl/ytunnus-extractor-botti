@@ -36,9 +36,6 @@ jobs:
           $ErrorActionPreference = "Stop"
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          python -c "import sys; print(sys.version)"
-          python -c "import PyPDF2, docx, openpyxl; print('core libs ok')"
-          python -c "import selenium, webdriver_manager; print('selenium ok')"
 
       - name: Build EXE with PyInstaller
         shell: pwsh
@@ -55,11 +52,10 @@ jobs:
             --collect-all openpyxl `
             app.py
 
-          Write-Host "=== dist contents ==="
-          if (Test-Path "dist") { Get-ChildItem dist -Recurse } else { Write-Host "dist/ not found" }
-
           if (!(Test-Path "dist/FinnishBusinessEmailFinder.exe")) {
             Write-Host "ERROR: EXE was not produced."
+            Write-Host "Dist contents:"
+            Get-ChildItem dist -Recurse -ErrorAction SilentlyContinue
             exit 1
           }
 
