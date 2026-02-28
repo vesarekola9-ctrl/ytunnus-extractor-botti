@@ -16,6 +16,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Debug - list repo files (always)
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "=== Repo root ==="
+          Get-ChildItem -Name
+          Write-Host "=== Tree (first 200 items) ==="
+          Get-ChildItem -Recurse | Select-Object -First 200
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -46,9 +55,11 @@ jobs:
             --collect-all openpyxl `
             app.py
 
+          Write-Host "=== dist contents ==="
+          if (Test-Path "dist") { Get-ChildItem dist -Recurse } else { Write-Host "dist/ not found" }
+
           if (!(Test-Path "dist/LeadForgeFI.exe")) {
             Write-Host "ERROR: EXE was not produced."
-            Get-ChildItem dist -Recurse -ErrorAction SilentlyContinue
             exit 1
           }
 
@@ -57,8 +68,9 @@ jobs:
         with:
           name: LeadForgeFI-win64
           path: dist/LeadForgeFI.exe
+          if-no-files-found: error
 
-      - name: Upload artifact (build logs)
+      - name: Upload artifact (build logs + dist) (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -66,3 +78,4 @@ jobs:
           path: |
             build/**
             dist/**
+          if-no-files-found: ignore
