@@ -36,6 +36,9 @@ jobs:
           $ErrorActionPreference = "Stop"
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          python -c "import sys; print(sys.version)"
+          python -c "import PyPDF2, docx, openpyxl; print('core libs ok')"
+          python -c "import selenium, webdriver_manager; print('selenium ok')"
 
       - name: Build EXE with PyInstaller
         shell: pwsh
@@ -46,7 +49,7 @@ jobs:
             --clean `
             --onefile `
             --windowed `
-            --name "LeadForgeFI" `
+            --name "FinnishBusinessEmailFinder" `
             --collect-all selenium `
             --collect-all webdriver_manager `
             --collect-all openpyxl `
@@ -55,7 +58,7 @@ jobs:
           Write-Host "=== dist contents ==="
           if (Test-Path "dist") { Get-ChildItem dist -Recurse } else { Write-Host "dist/ not found" }
 
-          if (!(Test-Path "dist/LeadForgeFI.exe")) {
+          if (!(Test-Path "dist/FinnishBusinessEmailFinder.exe")) {
             Write-Host "ERROR: EXE was not produced."
             exit 1
           }
@@ -63,11 +66,11 @@ jobs:
       - name: Upload artifact (EXE)
         uses: actions/upload-artifact@v4
         with:
-          name: LeadForgeFI-win64
-          path: dist/LeadForgeFI.exe
+          name: FinnishBusinessEmailFinder-win64
+          path: dist/FinnishBusinessEmailFinder.exe
           if-no-files-found: error
 
-      - name: Upload artifact (build logs + dist) (always)
+      - name: Upload artifact (build logs)
         if: always()
         uses: actions/upload-artifact@v4
         with:
