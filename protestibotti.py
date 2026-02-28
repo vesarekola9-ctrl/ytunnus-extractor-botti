@@ -1,26 +1,27 @@
 # app.py
 # Finnish Business Email Finder
-# - PDF -> YTJ (emails)
-# - Clipboard -> (names / yt / emails) -> YTJ (emails)
+#
+# Modes:
+#  - PDF -> YTJ (emails)
+#  - Clipboard -> Finder -> YTJ (emails)
+#
+# Clipboard strategy:
+#  - Extract direct emails (optional convenience rows)
+#  - Extract company names (strict: Oy/Ab/Ky/Tmi/...), optionally allow "Asunto Oy"
+#  - FORCE flow: Name -> Y-tunnus -> Email (recommended)
+#  - Optional location-boost: infer "Sijainti" near company name and boost YTJ result ranking
 #
 # OUTPUT:
-#   Creates output folder ONLY WHEN RESULTS ARE SAVED (no empty "log folders")
-#   Folder: FinnishBusinessEmailFinder/YYYY-MM-DD/run_HH-MM-SS/
-#   Files (ONLY):
-#     - emails.docx
-#     - results.xlsx  (Results + Found Only)
-#     - results.csv
+#  - Create output folder ONLY when saving results (no empty log folders)
+#  - Folder: FinnishBusinessEmailFinder/YYYY-MM-DD/run_HH-MM-SS/
+#  - Files ONLY:
+#      - emails.docx
+#      - results.xlsx (Results + Found Only)
+#      - results.csv
 #
-# UI:
-#   - Scroll whole window
-#   - Clipboard "Tyhjennä" + "Pysäytä"
-#   - "Avaa tuloskansio" + "Kopioi sähköpostit"
-#
-# Selenium:
-#   - webdriver.ChromeOptions() (no Options import)
-#   - YTJ name search selects correct company search field (not y-tunnus-only)
-#
-# NOTE: No log.txt is written.
+# NEW in this version:
+#  - YTJ session optimization (#3):
+#      Keep search page open; open company result in a NEW TAB to read YT; close tab; return to search page.
 
 import os
 import re
@@ -55,7 +56,7 @@ except Exception:
     HAS_DND = False
 
 
-APP_BUILD = "2026-02-28_no_logfile_csv_foundonly_lazy_output"
+APP_BUILD = "2026-02-28_ytj_search_tab_optimization"
 
 # --- tuning ---
 YTJ_PAGE_LOAD_TIMEOUT = 18
@@ -79,6 +80,8 @@ STRICT_FORMS_RE = re.compile(
     r"\b(oy|ab|ky|tmi|oyj|osakeyhtiö|kommandiittiyhtiö|toiminimi|as\.|ltd|llc|inc|gmbh)\b",
     re.I,
 )
+ASUNTO_OY_RE = re.compile(r"\basunto\s+oy\b", re.I)
+DATE_RE = re.compile(r"\b\d{1,2}\.\d{1,2}\.\d{4}\b")  # 27.02.2026
 
 
 # =========================
@@ -203,42 +206,87 @@ def split_lines(text: str):
     return [ln.strip() for ln in text.split("\n") if ln.strip()]
 
 
-def extract_names_from_text(text: str, strict: bool, max_names: int):
+def _looks_like_location(line: str) -> bool:
+    if not line:
+        return False
+    s = re.sub(r"\s{2,}", " ", line).strip()
+    if len(s) < 2 or len(s) > 32:
+        return False
+    low = s.lower()
+    if "€" in s:
+        return False
+    if DATE_RE.search(s):
+        return False
+    if YT_RE.search(s):
+        return False
+    if STRICT_FORMS_RE.search(s) or ASUNTO_OY_RE.search(s):
+        return False
+    if any(ch.isdigit() for ch in s):
+        return False
+    bad = ["yritys", "sijainti", "summa", "häiriöpäivä", "tyyppi", "lähde", "velkoja", "alue", "julkaisupäivä"]
+    if any(b in low for b in bad):
+        return False
+    if not any(ch.isalpha() for ch in s):
+        return False
+    return True
+
+
+def extract_names_with_locations(text: str, strict: bool, allow_asunto: bool, max_names: int):
     lines = split_lines(text)
     out = []
     seen = set()
+
     bad_contains = [
         "näytä lisää", "kirjaudu", "tilaa", "tilaajille",
         "€", "y-tunnus", "ytunnus", "sähköposti", "puhelin",
         "www.", "http", "kauppalehti", "protestilista",
         "viimeisimmät protestit", "häiriöpäivä", "velkomustuomiot",
-        "sijainti", "summa", "lähde"
+        "sijainti", "summa", "lähde", "tyyppi",
     ]
 
-    for ln in lines:
-        if len(out) >= max_names:
-            break
+    def _is_name_candidate(ln: str) -> bool:
+        if not ln or len(ln) < 3:
+            return False
         if YT_RE.search(ln):
-            continue
+            return False
         low = ln.lower()
         if any(b in low for b in bad_contains):
-            continue
-        if len(ln) < 3:
-            continue
+            return False
         if sum(ch.isdigit() for ch in ln) >= 3:
-            continue
+            return False
         if not any(ch.isalpha() for ch in ln):
-            continue
+            return False
         name = re.sub(r"\s{2,}", " ", ln).strip()
         if len(name) > 90:
+            return False
+        if strict:
+            if STRICT_FORMS_RE.search(name):
+                return True
+            if allow_asunto and ASUNTO_OY_RE.search(name):
+                return True
+            return False
+        return True
+
+    for i, ln in enumerate(lines):
+        if len(out) >= max_names:
+            break
+        if not _is_name_candidate(ln):
             continue
-        if strict and not STRICT_FORMS_RE.search(name):
-            continue
+
+        name = re.sub(r"\s{2,}", " ", ln).strip()
         key = name.lower()
         if key in seen:
             continue
         seen.add(key)
-        out.append(name)
+
+        loc = ""
+        for j in range(i + 1, min(i + 5, len(lines))):
+            cand = lines[j]
+            if _looks_like_location(cand):
+                loc = re.sub(r"\s{2,}", " ", cand).strip()
+                break
+
+        out.append({"name": name, "location_hint": loc})
     return out
 
 
@@ -280,24 +328,28 @@ def save_results_xlsx(out_dir: str, rows: list[dict], filename="results.xlsx"):
     path = os.path.join(out_dir, filename)
     wb = Workbook()
 
-    headers = ["Name", "Y-tunnus", "Email", "Source", "Notes"]
+    headers = ["Name", "Y-tunnus", "Email", "Source", "Notes", "LocationHint"]
+    header_font = Font(bold=True)
 
-    # Sheet 1: All
     ws = wb.active
     ws.title = "Results"
     ws.append(headers)
-    header_font = Font(bold=True)
     for col in range(1, len(headers) + 1):
         c = ws.cell(row=1, column=col)
         c.font = header_font
         c.alignment = Alignment(horizontal="left")
 
     for r in rows:
-        ws.append([r.get("name", ""), r.get("yt", ""), r.get("email", ""), r.get("source", ""), r.get("notes", "")])
-
+        ws.append([
+            r.get("name", ""),
+            r.get("yt", ""),
+            r.get("email", ""),
+            r.get("source", ""),
+            r.get("notes", ""),
+            r.get("location_hint", ""),
+        ])
     _autosize_columns(ws)
 
-    # Sheet 2: Found Only
     ws2 = wb.create_sheet("Found Only")
     ws2.append(headers)
     for col in range(1, len(headers) + 1):
@@ -307,8 +359,14 @@ def save_results_xlsx(out_dir: str, rows: list[dict], filename="results.xlsx"):
 
     for r in rows:
         if (r.get("email") or "").strip():
-            ws2.append([r.get("name", ""), r.get("yt", ""), r.get("email", ""), r.get("source", ""), r.get("notes", "")])
-
+            ws2.append([
+                r.get("name", ""),
+                r.get("yt", ""),
+                r.get("email", ""),
+                r.get("source", ""),
+                r.get("notes", ""),
+                r.get("location_hint", ""),
+            ])
     _autosize_columns(ws2)
 
     wb.save(path)
@@ -317,12 +375,19 @@ def save_results_xlsx(out_dir: str, rows: list[dict], filename="results.xlsx"):
 
 def save_results_csv(out_dir: str, rows: list[dict], filename="results.csv"):
     path = os.path.join(out_dir, filename)
-    headers = ["Name", "Y-tunnus", "Email", "Source", "Notes"]
+    headers = ["Name", "Y-tunnus", "Email", "Source", "Notes", "LocationHint"]
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f, delimiter=";")
         w.writerow(headers)
         for r in rows:
-            w.writerow([r.get("name", ""), r.get("yt", ""), r.get("email", ""), r.get("source", ""), r.get("notes", "")])
+            w.writerow([
+                r.get("name", ""),
+                r.get("yt", ""),
+                r.get("email", ""),
+                r.get("source", ""),
+                r.get("notes", ""),
+                r.get("location_hint", ""),
+            ])
     return path
 
 
@@ -478,7 +543,7 @@ def fetch_email_by_yt(driver, yt: str, stop_flag: threading.Event):
 
 
 # =========================
-#   YTJ NAME SEARCH (correct field)
+#   YTJ NAME SEARCH (optimized session)
 # =========================
 def _attr(el, name: str) -> str:
     try:
@@ -509,7 +574,6 @@ def find_ytj_company_search_input(driver):
             iid = _attr(inp, "id").lower()
             text = " ".join([ph, al, nm, iid]).strip()
 
-            # reject y-tunnus-only inputs
             if "y-tunnus" in text and ("yritys" not in text and "toiminimi" not in text and "nimi" not in text):
                 continue
 
@@ -547,30 +611,118 @@ def find_ytj_company_search_input(driver):
     return candidates[0][1]
 
 
-def ytj_open_search_home(driver):
+def ensure_ytj_search_ready(driver) -> bool:
+    """Ensure we're on a page that has the company search input. Minimizes reloads."""
+    inp = find_ytj_company_search_input(driver)
+    if inp:
+        return True
+
     for url in YTJ_SEARCH_URLS:
         try:
             driver.get(url)
             wait_ytj_loaded(driver)
             try_accept_cookies(driver)
-            if find_ytj_company_search_input(driver):
+            inp = find_ytj_company_search_input(driver)
+            if inp:
                 return True
         except Exception:
             continue
     return False
 
 
-def score_result(name_query: str, card_text: str) -> float:
+def score_result(name_query: str, card_text: str, location_hint: str = "", use_location_boost: bool = True) -> float:
     txt = (card_text or "").strip()
     ratio = SequenceMatcher(None, (name_query or "").lower(), txt.lower()).ratio()
     score = ratio * 100.0
     if extract_yt_from_text_anywhere(txt):
         score += 20.0
+    if use_location_boost and location_hint:
+        if location_hint.lower() in txt.lower():
+            score += 35.0
     return score
 
 
-def ytj_name_to_yt(driver, name: str, stop_flag: threading.Event):
-    if not ytj_open_search_home(driver):
+def open_href_in_new_tab_and_extract_yt(driver, href: str) -> str:
+    """Open href in new tab, extract YT from body, close tab, return to previous."""
+    if not href:
+        return ""
+    base_handle = driver.current_window_handle
+    before_handles = set(driver.window_handles)
+
+    try:
+        driver.execute_script("window.open(arguments[0], '_blank');", href)
+        # wait new handle
+        t0 = time.time()
+        new_handle = None
+        while time.time() - t0 < 5.0:
+            handles = driver.window_handles
+            diff = [h for h in handles if h not in before_handles]
+            if diff:
+                new_handle = diff[0]
+                break
+            time.sleep(0.05)
+        if not new_handle:
+            return ""
+
+        driver.switch_to.window(new_handle)
+        try:
+            wait_ytj_loaded(driver)
+        except Exception:
+            pass
+        try_accept_cookies(driver)
+
+        try:
+            body = driver.find_element(By.TAG_NAME, "body").text or ""
+        except Exception:
+            body = ""
+        yt = extract_yt_from_text_anywhere(body)
+
+        # close tab
+        try:
+            driver.close()
+        except Exception:
+            pass
+
+        # back to base
+        try:
+            driver.switch_to.window(base_handle)
+        except Exception:
+            # fallback: pick any existing handle
+            for h in driver.window_handles:
+                try:
+                    driver.switch_to.window(h)
+                    break
+                except Exception:
+                    continue
+
+        return yt
+    except Exception:
+        # best effort close stray tab
+        try:
+            for h in driver.window_handles:
+                if h != base_handle:
+                    driver.switch_to.window(h)
+                    driver.close()
+        except Exception:
+            pass
+        try:
+            driver.switch_to.window(base_handle)
+        except Exception:
+            pass
+        return ""
+
+
+def ytj_name_to_yt_optimized(driver, name: str, stop_flag: threading.Event, location_hint: str = "", use_location_boost: bool = True) -> str:
+    """
+    Optimized:
+      - Keep search page open
+      - Search
+      - Find best result link href
+      - Open href in NEW TAB -> extract yt -> close -> return to search tab
+    """
+    if stop_flag.is_set():
+        return ""
+    if not ensure_ytj_search_ready(driver):
         return ""
     if stop_flag.is_set():
         return ""
@@ -589,7 +741,7 @@ def ytj_name_to_yt(driver, name: str, stop_flag: threading.Event):
     except Exception:
         return ""
 
-    best_link = None
+    best_href = ""
     best_score = -1.0
     t0 = time.time()
 
@@ -621,36 +773,23 @@ def ytj_name_to_yt(driver, name: str, stop_flag: threading.Event):
                 except Exception:
                     card_text = (a.text or "")
 
-                s = score_result(name, card_text)
+                s = score_result(name, card_text, location_hint=location_hint, use_location_boost=use_location_boost)
                 checked += 1
                 if s > best_score:
                     best_score = s
-                    best_link = a
+                    best_href = href
             except Exception:
                 continue
 
-        if best_link:
+        if best_href:
             break
 
         time.sleep(NAME_SEARCH_SLEEP)
 
-    if not best_link:
+    if not best_href:
         return ""
 
-    try:
-        safe_click(driver, best_link)
-        try:
-            wait_ytj_loaded(driver)
-        except Exception:
-            pass
-        try_accept_cookies(driver)
-        try:
-            body = driver.find_element(By.TAG_NAME, "body").text or ""
-        except Exception:
-            body = ""
-        return extract_yt_from_text_anywhere(body)
-    except Exception:
-        return ""
+    return open_href_in_new_tab_and_extract_yt(driver, best_href)
 
 
 # =========================
@@ -681,7 +820,7 @@ def pipeline_pdf(pdf_path: str, status_cb, progress_cb, stop_flag: threading.Eve
                 email = fetch_email_by_yt(driver, yt, stop_flag)
                 cache[yt] = email
 
-            rows.append({"name": "", "yt": yt, "email": email, "source": "pdf->ytj", "notes": ""})
+            rows.append({"name": "", "yt": yt, "email": email, "source": "pdf->ytj", "notes": "", "location_hint": ""})
             time.sleep(YTJ_PER_COMPANY_SLEEP)
 
         progress_cb(len(yts), max(1, len(yts)))
@@ -698,48 +837,25 @@ def pipeline_pdf(pdf_path: str, status_cb, progress_cb, stop_flag: threading.Eve
 def pipeline_clipboard(
     text: str,
     strict: bool,
+    allow_asunto: bool,
     max_names: int,
     force_name_flow: bool,
+    use_location_boost: bool,
     status_cb,
     progress_cb,
     stop_flag: threading.Event
 ):
-    status_cb("Clipboard: poimitaan sähköpostit, Y-tunnukset ja yritysnimet…")
+    status_cb("Clipboard: poimitaan sähköpostit ja yritysnimet…")
 
     direct_emails = sorted({e.strip().lower() for e in EMAIL_RE.findall(text or "") if e.strip()})
-    yts = extract_yts_from_text(text)
-    names = extract_names_from_text(text, strict=strict, max_names=max_names)
+    name_items = extract_names_with_locations(text, strict=strict, allow_asunto=allow_asunto, max_names=max_names)
 
     rows: list[dict] = []
-
-    # Keep direct emails as convenience rows (doesn't affect name flow)
     for em in direct_emails:
-        rows.append({"name": "", "yt": "", "email": em, "source": "clipboard", "notes": "email found in pasted text"})
+        rows.append({"name": "", "yt": "", "email": em, "source": "clipboard", "notes": "email found in pasted text", "location_hint": ""})
 
-    # Main items
-    main_items: list[dict] = []
-    if force_name_flow and names:
-        for nm in names:
-            main_items.append({"name": nm, "yt": "", "email": "", "source": "clipboard->ytj", "notes": "name->yt->email"})
-    else:
-        for yt in yts:
-            main_items.append({"name": "", "yt": yt, "email": "", "source": "clipboard->ytj", "notes": "yt found in pasted text"})
-        for nm in names:
-            main_items.append({"name": nm, "yt": "", "email": "", "source": "clipboard->ytj", "notes": "name found in pasted text"})
-
-    # Dedup main items
-    seen = set()
-    dedup = []
-    for r in main_items:
-        key = (r.get("name", "").lower(), r.get("yt", ""))
-        if key in seen:
-            continue
-        seen.add(key)
-        dedup.append(r)
-    main_items = dedup
-
-    if not rows and not main_items:
-        status_cb("Clipboard: en löytänyt mitään (email / Y-tunnus / nimi).")
+    if not name_items and not rows:
+        status_cb("Clipboard: en löytänyt mitään (email / nimi).")
         return [], []
 
     status_cb("Käynnistetään YTJ-haku…")
@@ -748,7 +864,43 @@ def pipeline_clipboard(
     yt_cache: dict[str, str] = {}
     name_cache: dict[str, str] = {}
 
+    main_items: list[dict] = []
+    if force_name_flow and name_items:
+        for it in name_items:
+            main_items.append({
+                "name": it["name"],
+                "yt": "",
+                "email": "",
+                "source": "clipboard->ytj",
+                "notes": "name->yt->email",
+                "location_hint": it.get("location_hint", "") or ""
+            })
+    else:
+        for it in name_items:
+            main_items.append({
+                "name": it["name"],
+                "yt": "",
+                "email": "",
+                "source": "clipboard->ytj",
+                "notes": "name found in pasted text",
+                "location_hint": it.get("location_hint", "") or ""
+            })
+
+    # Dedup by name
+    seen = set()
+    dedup = []
+    for r in main_items:
+        key = r.get("name", "").lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(r)
+    main_items = dedup
+
     try:
+        # ensure search ready once (session optimization)
+        ensure_ytj_search_ready(driver)
+
         progress_cb(0, max(1, len(main_items)))
 
         for idx, r in enumerate(main_items, start=1):
@@ -758,35 +910,29 @@ def pipeline_clipboard(
 
             progress_cb(idx - 1, len(main_items))
             name = (r.get("name") or "").strip()
-            yt = (r.get("yt") or "").strip()
+            loc = (r.get("location_hint") or "").strip()
 
-            if yt:
-                status_cb(f"YTJ email: {idx}/{len(main_items)} {yt}")
-                email = yt_cache.get(yt)
-                if email is None:
-                    email = fetch_email_by_yt(driver, yt, stop_flag)
-                    yt_cache[yt] = email
-                r["email"] = email or ""
+            if not name:
+                continue
+
+            status_cb(f"YTJ yrityshaku: {idx}/{len(main_items)} {name}" + (f" ({loc})" if loc else ""))
+
+            cache_key = (name.lower() + "||" + loc.lower()) if (use_location_boost and loc) else name.lower()
+            yt2 = name_cache.get(cache_key)
+            if yt2 is None:
+                yt2 = ytj_name_to_yt_optimized(driver, name, stop_flag, location_hint=loc, use_location_boost=use_location_boost)
+                name_cache[cache_key] = yt2
+
+            if yt2:
+                r["yt"] = yt2
+                status_cb(f"YTJ email: {idx}/{len(main_items)} {yt2}")
+                email2 = yt_cache.get(yt2)
+                if email2 is None:
+                    email2 = fetch_email_by_yt(driver, yt2, stop_flag)
+                    yt_cache[yt2] = email2
+                r["email"] = email2 or ""
             else:
-                if not name:
-                    continue
-
-                status_cb(f"YTJ yrityshaku: {idx}/{len(main_items)} {name}")
-                yt2 = name_cache.get(name)
-                if yt2 is None:
-                    yt2 = ytj_name_to_yt(driver, name, stop_flag)
-                    name_cache[name] = yt2
-
-                if yt2:
-                    r["yt"] = yt2
-                    status_cb(f"YTJ email: {idx}/{len(main_items)} {yt2}")
-                    email2 = yt_cache.get(yt2)
-                    if email2 is None:
-                        email2 = fetch_email_by_yt(driver, yt2, stop_flag)
-                        yt_cache[yt2] = email2
-                    r["email"] = email2 or ""
-                else:
-                    r["notes"] = (r.get("notes") or "") + " | yt not found"
+                r["notes"] = (r.get("notes") or "") + " | yt not found"
 
             time.sleep(YTJ_PER_COMPANY_SLEEP)
 
@@ -799,7 +945,12 @@ def pipeline_clipboard(
 
     rows.extend(main_items)
 
-    emails = sorted({(r.get("email") or "").lower(): (r.get("email") or "") for r in rows if (r.get("email") or "").strip()}.values())
+    emails = sorted({
+        (rr.get("email") or "").lower(): (rr.get("email") or "")
+        for rr in rows
+        if (rr.get("email") or "").strip()
+    }.values())
+
     return rows, emails
 
 
@@ -827,7 +978,7 @@ class App(BaseTk):
         self.GREY_BTN_H = "#475569"
 
         self.title("Finnish Business Email Finder")
-        self.geometry("980x920")
+        self.geometry("980x980")
         self.configure(bg=self.BG)
 
         self._build_ui()
@@ -903,7 +1054,6 @@ class App(BaseTk):
             messagebox.showwarning("Kopiointi epäonnistui", "En saanut kopioitua leikepöydälle.")
 
     def _finalize_and_save(self, rows: list[dict], emails: list[str]) -> str:
-        # create output folder ONLY at the end
         out_dir = create_run_dir()
         save_results_xlsx(out_dir, rows)
         save_results_csv(out_dir, rows)
@@ -974,10 +1124,28 @@ class App(BaseTk):
             activebackground=self.CARD, activeforeground=self.TEXT
         ).pack(side="left")
 
+        self.allow_asunto_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            top, text="Salli Asunto Oy (vaikka tiukka päällä)",
+            variable=self.allow_asunto_var,
+            bg=self.CARD, fg=self.TEXT,
+            selectcolor="#ffffff",
+            activebackground=self.CARD, activeforeground=self.TEXT
+        ).pack(side="left", padx=(16, 0))
+
         self.force_name_flow_var = tk.BooleanVar(value=True)
         tk.Checkbutton(
-            top, text="Pakota: Nimi → Y-tunnus → Email (suositus KL-listoille)",
+            top, text="Pakota: Nimi → Y-tunnus → Email (suositus)",
             variable=self.force_name_flow_var,
+            bg=self.CARD, fg=self.TEXT,
+            selectcolor="#ffffff",
+            activebackground=self.CARD, activeforeground=self.TEXT
+        ).pack(side="left", padx=(16, 0))
+
+        self.location_boost_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            top, text="Käytä sijainti-boostia (parempi osuma)",
+            variable=self.location_boost_var,
             bg=self.CARD, fg=self.TEXT,
             selectcolor="#ffffff",
             activebackground=self.CARD, activeforeground=self.TEXT
@@ -1007,7 +1175,7 @@ class App(BaseTk):
         body = tk.Frame(log_card, bg=self.CARD)
         body.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
-        self.listbox = tk.Listbox(body, height=14, bg="#ffffff", fg=self.TEXT,
+        self.listbox = tk.Listbox(body, height=16, bg="#ffffff", fg=self.TEXT,
                                   highlightthickness=1, highlightbackground=self.BORDER,
                                   selectbackground="#dbeafe")
         self.listbox.pack(side="left", fill="both", expand=True)
@@ -1077,12 +1245,21 @@ class App(BaseTk):
         try:
             self._set_status("Aloitetaan Clipboard ajo…")
             strict = bool(self.strict_var.get())
+            allow_asunto = bool(self.allow_asunto_var.get())
             max_names = int(self.max_names_var.get() or 400)
             force_name_flow = bool(self.force_name_flow_var.get())
+            use_location_boost = bool(self.location_boost_var.get())
 
             rows, emails = pipeline_clipboard(
-                text, strict, max_names, force_name_flow,
-                self._set_status, self._set_progress, self.stop_flag
+                text=text,
+                strict=strict,
+                allow_asunto=allow_asunto,
+                max_names=max_names,
+                force_name_flow=force_name_flow,
+                use_location_boost=use_location_boost,
+                status_cb=self._set_status,
+                progress_cb=self._set_progress,
+                stop_flag=self.stop_flag
             )
 
             if self.stop_flag.is_set():
