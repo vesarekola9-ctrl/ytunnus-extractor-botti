@@ -1,14 +1,14 @@
 # app.py
-# Finnish Business Email Finder (MVP Sellable EXE)
+# Finnish Business Email Finder (MVP A)
 # Modes:
-# 1) KL Protesti (URL) -> Expand rows -> Extract Y-tunnus -> YTJ -> Email
-# 2) PDF -> extract Y-tunnus -> YTJ -> Email
-# 3) Clipboard -> extract emails + Y-tunnus + (strict names) -> YTJ -> Email
+# - Clipboard/Paste -> extract Y-tunnus (+ direct emails) -> YTJ -> emails
+# - PDF -> extract Y-tunnus -> YTJ -> emails
 #
-# IMPORTANT:
-# - User logs in manually for KL (paywall safe). Bot starts only after "Jatka".
-# - Output folder is created ONLY at the end, and only if there are results.
-# - Output files: results.xlsx, results.csv, emails.docx
+# Output: created ONLY at the end if there are results:
+# FinnishBusinessEmailFinder/YYYY-MM-DD/run_HH-MM-SS/
+#   - results.xlsx (Results + Missing + Summary)
+#   - results.csv
+#   - emails.docx
 
 import os
 import re
@@ -44,7 +44,7 @@ except Exception:
     HAS_DND = False
 
 
-APP_BUILD = "2026-02-28_MVP_KL_URL_login_output_end_only"
+APP_BUILD = "2026-02-28_MVP_A_clipboard_pdf_ytj_end_only"
 
 # --- tuning ---
 PAGE_LOAD_TIMEOUT = 18
@@ -56,10 +56,6 @@ YTJ_PER_COMPANY_SLEEP = 0.05
 
 NAME_SEARCH_TIMEOUT = 10.0
 NAME_SEARCH_SLEEP = 0.18
-
-KL_SHOW_MORE_MAX_PASSES = 300
-KL_AFTER_CLICK_SLEEP = 0.18
-KL_SCROLL_SLEEP = 0.12
 
 # --- regex ---
 YT_RE = re.compile(r"\b\d{7}-\d\b|\b\d{8}\b")
@@ -73,8 +69,6 @@ STRICT_FORMS_RE = re.compile(
     r"\b(oy|ab|ky|tmi|oyj|osakeyhtiö|kommandiittiyhtiö|toiminimi|as\.|ltd|llc|inc|gmbh)\b",
     re.I,
 )
-
-KL_PROTEST_DEFAULT_URL = "https://www.kauppalehti.fi/yritykset/protestilista"
 
 
 # =========================
@@ -145,20 +139,27 @@ def create_final_run_dir() -> str:
     return out
 
 
+def open_folder(path: str):
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(path)  # type: ignore
+        elif sys.platform == "darwin":
+            os.system(f'open "{path}"')
+        else:
+            os.system(f'xdg-open "{path}"')
+    except Exception:
+        pass
+
+
 # =========================
 #   DATA MODEL
 # =========================
 @dataclass
 class Row:
     name: str = ""
-    location: str = ""
-    amount: str = ""
-    date: str = ""
-    type: str = ""
-    source_name: str = ""  # e.g. "KL"
-    source_url: str = ""
     yt: str = ""
     email: str = ""
+    source: str = ""
     notes: str = ""
 
 
@@ -203,6 +204,7 @@ def split_lines(text: str):
 
 
 def extract_names_from_text(text: str, strict: bool, max_names: int):
+    """Optional fallback: parse company names from pasted text."""
     lines = split_lines(text)
     out = []
     seen = set()
@@ -252,6 +254,16 @@ def save_emails_docx(out_dir: str, emails: list[str]):
     return path
 
 
+def save_results_csv(out_dir: str, rows: list[Row]):
+    path = os.path.join(out_dir, "results.csv")
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f, delimiter=";")
+        w.writerow(["Name", "Y-tunnus", "Email", "Source", "Notes"])
+        for r in rows:
+            w.writerow([r.name, r.yt, r.email, r.source, r.notes])
+    return path
+
+
 def _autosize_columns(ws, max_rows=800):
     for col in range(1, ws.max_column + 1):
         max_len = 0
@@ -263,17 +275,17 @@ def _autosize_columns(ws, max_rows=800):
         ws.column_dimensions[get_column_letter(col)].width = min(70, max(12, max_len + 2))
 
 
-def save_results_xlsx(out_dir: str, rows: list[Row], source_label: str, source_url: str):
+def save_results_xlsx(out_dir: str, rows: list[Row], source_label: str):
     path = os.path.join(out_dir, "results.xlsx")
     wb = Workbook()
 
-    # Results
+    headers = ["Name", "Y-tunnus", "Email", "Source", "Notes"]
+    header_font = Font(bold=True)
+
+    # Results sheet
     ws = wb.active
     ws.title = "Results"
-
-    headers = ["Name", "Location", "Amount", "Date", "Type", "Y-tunnus", "Email", "Source", "Notes"]
     ws.append(headers)
-    header_font = Font(bold=True)
     for col in range(1, len(headers) + 1):
         c = ws.cell(row=1, column=col)
         c.font = header_font
@@ -283,9 +295,9 @@ def save_results_xlsx(out_dir: str, rows: list[Row], source_label: str, source_u
     missing = [r for r in rows if not (r.email or r.yt)]
 
     for r in ok:
-        ws.append([r.name, r.location, r.amount, r.date, r.type, r.yt, r.email, r.source_name, r.notes])
+        ws.append([r.name, r.yt, r.email, r.source, r.notes])
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:I{ws.max_row}"
+    ws.auto_filter.ref = f"A1:E{ws.max_row}"
     _autosize_columns(ws)
 
     # Missing sheet
@@ -296,16 +308,15 @@ def save_results_xlsx(out_dir: str, rows: list[Row], source_label: str, source_u
         c.font = header_font
         c.alignment = Alignment(horizontal="left")
     for r in missing:
-        ws2.append([r.name, r.location, r.amount, r.date, r.type, r.yt, r.email, r.source_name, r.notes])
+        ws2.append([r.name, r.yt, r.email, r.source, r.notes])
     ws2.freeze_panes = "A2"
-    ws2.auto_filter.ref = f"A1:I{ws2.max_row}"
+    ws2.auto_filter.ref = f"A1:E{ws2.max_row}"
     _autosize_columns(ws2)
 
-    # Summary
+    # Summary sheet
     ws3 = wb.create_sheet("Summary")
     ws3.append(["Build", APP_BUILD])
     ws3.append(["Source", source_label])
-    ws3.append(["Source URL", source_url])
     ws3.append(["Total rows", len(rows)])
     ws3.append(["Rows with Y-tunnus", sum(1 for r in rows if r.yt)])
     ws3.append(["Rows with Email", sum(1 for r in rows if r.email)])
@@ -315,28 +326,6 @@ def save_results_xlsx(out_dir: str, rows: list[Row], source_label: str, source_u
 
     wb.save(path)
     return path
-
-
-def save_results_csv(out_dir: str, rows: list[Row]):
-    path = os.path.join(out_dir, "results.csv")
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f, delimiter=";")
-        w.writerow(["Name", "Location", "Amount", "Date", "Type", "Y-tunnus", "Email", "Source", "Notes"])
-        for r in rows:
-            w.writerow([r.name, r.location, r.amount, r.date, r.type, r.yt, r.email, r.source_name, r.notes])
-    return path
-
-
-def open_folder(path: str):
-    try:
-        if sys.platform.startswith("win"):
-            os.startfile(path)  # type: ignore
-        elif sys.platform == "darwin":
-            os.system(f'open "{path}"')
-        else:
-            os.system(f'xdg-open "{path}"')
-    except Exception:
-        pass
 
 
 # =========================
@@ -363,7 +352,6 @@ def start_new_driver():
     options.add_argument("--start-maximized")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-dev-shm-usage")
-    # keep visible browser (paywall/login friendly)
     driver_path = ChromeDriverManager().install()
     drv = webdriver.Chrome(service=Service(driver_path), options=options)
     drv.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
@@ -496,7 +484,7 @@ def fetch_email_by_yt(driver, yt: str, stop_flag: threading.Event):
 
 
 # =========================
-#   YTJ NAME SEARCH (fallback)
+#   YTJ NAME SEARCH (OPTIONAL FALLBACK)
 # =========================
 def _attr(el, name: str) -> str:
     try:
@@ -679,256 +667,6 @@ def ytj_name_to_yt(driver, name: str, stop_flag: threading.Event):
 
 
 # =========================
-#   KL PROTESTI SCRAPE
-# =========================
-def _text(el) -> str:
-    try:
-        return (el.text or "").strip()
-    except Exception:
-        return ""
-
-
-def kl_click_show_more(driver, status_cb, stop_flag: threading.Event):
-    """Click 'Näytä lisää' until it's gone or max passes reached."""
-    passes = 0
-    last_height = 0
-    while passes < KL_SHOW_MORE_MAX_PASSES and not stop_flag.is_set():
-        passes += 1
-
-        # scroll a bit to make button appear
-        try:
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        except Exception:
-            pass
-        time.sleep(KL_SCROLL_SLEEP)
-
-        try_accept_cookies(driver)
-
-        btn = None
-        # Find by text
-        for xp in (
-            "//button[contains(translate(normalize-space(.),'ÄÖÅ','äöå'),'näytä lisää')]",
-            "//a[contains(translate(normalize-space(.),'ÄÖÅ','äöå'),'näytä lisää')]",
-        ):
-            try:
-                candidates = driver.find_elements(By.XPATH, xp)
-                for c in candidates:
-                    if c.is_displayed() and c.is_enabled():
-                        btn = c
-                        break
-                if btn:
-                    break
-            except Exception:
-                continue
-
-        if not btn:
-            # no more button
-            status_cb(f"KL: 'Näytä lisää' loppui ({passes-1} klikkausta).")
-            return
-
-        status_cb(f"KL: Klikataan 'Näytä lisää'... ({passes})")
-        safe_click(driver, btn)
-        time.sleep(KL_AFTER_CLICK_SLEEP)
-
-        # detect height change (optional)
-        try:
-            h = int(driver.execute_script("return document.body.scrollHeight;") or 0)
-            if h == last_height and passes > 3:
-                # still continue a bit; some pages don't change height visibly
-                pass
-            last_height = h
-        except Exception:
-            pass
-
-    status_cb("KL: Lopetettiin 'Näytä lisää' (max passes / stop).")
-
-
-def kl_extract_rows_from_visible_page(driver, status_cb, stop_flag: threading.Event, max_rows: int):
-    """
-    Extract company rows from the page after expanding.
-    Approach:
-    - Find table-like rows by scanning link texts + nearby container text.
-    - Expand details by clicking chevrons / aria-expanded.
-    - After expansions, parse all visible texts containing 'Y-TUNNUS'.
-    """
-    out: list[Row] = []
-    seen_yt = set()
-
-    # Step 1: try expanding anything that looks expandable
-    status_cb("KL: Avataan rivien lisätiedot (nuolet)...")
-    for _pass in range(6):
-        if stop_flag.is_set():
-            break
-
-        expanded_any = False
-        # Best guess: buttons with aria-expanded false
-        try:
-            exp_buttons = driver.find_elements(By.XPATH, "//button[@aria-expanded='false']")
-        except Exception:
-            exp_buttons = []
-
-        # Also try chevrons: buttons that contain svg and are in row end
-        try:
-            exp_buttons2 = driver.find_elements(By.XPATH, "//button[.//svg]")
-        except Exception:
-            exp_buttons2 = []
-
-        candidates = []
-        for b in exp_buttons + exp_buttons2:
-            try:
-                if not b.is_displayed() or not b.is_enabled():
-                    continue
-                candidates.append(b)
-            except Exception:
-                continue
-
-        # Click a limited number per pass
-        clicked = 0
-        for b in candidates:
-            if stop_flag.is_set():
-                break
-            if clicked >= 120:
-                break
-            try:
-                # avoid clicking irrelevant (header filters etc.)
-                aria = (b.get_attribute("aria-label") or "").lower()
-                # if aria-label hints expand/collapse or empty -> ok
-                # we still allow empties to catch icon-only buttons
-                if aria and not any(k in aria for k in ["avaa", "näytä", "lisätied", "expand", "open", "details", "toggle"]):
-                    # could still be ok, but skip to reduce risk
-                    pass
-
-                ok = safe_click(driver, b)
-                if ok:
-                    expanded_any = True
-                    clicked += 1
-                    time.sleep(0.04)
-            except Exception:
-                continue
-
-        if not expanded_any:
-            break
-        time.sleep(0.20)
-
-    # Step 2: parse all blocks that contain Y-TUNNUS
-    status_cb("KL: Poimitaan Y-tunnukset sivulta...")
-    blocks = []
-    for xp in (
-        "//*[contains(translate(normalize-space(.),'YÄÖÅ','yäöå'),'y-tunnus')]",
-        "//*[contains(translate(normalize-space(.),'YÄÖÅ','yäöå'),'ytunnus')]",
-    ):
-        try:
-            blocks.extend(driver.find_elements(By.XPATH, xp))
-        except Exception:
-            pass
-
-    # Prefer ancestor blocks that look like detail sections
-    candidate_containers = []
-    for el in blocks:
-        if stop_flag.is_set():
-            break
-        try:
-            cont = el.find_element(By.XPATH, "ancestor::*[self::div or self::li or self::tr][1]")
-            candidate_containers.append(cont)
-        except Exception:
-            candidate_containers.append(el)
-
-    # Dedup containers by id / object
-    uniq = []
-    seen_ids = set()
-    for c in candidate_containers:
-        try:
-            hid = c.id  # selenium internal id
-        except Exception:
-            hid = None
-        key = hid or str(c)
-        if key in seen_ids:
-            continue
-        seen_ids.add(key)
-        uniq.append(c)
-
-    # Extract row fields heuristically
-    for cont in uniq:
-        if stop_flag.is_set():
-            break
-        txt = _text(cont)
-        yt = extract_yts_from_text(txt)
-        if not yt:
-            continue
-        yt = yt[0]
-        if yt in seen_yt:
-            continue
-        seen_yt.add(yt)
-
-        # find name from nearest clickable link or previous row container
-        name = ""
-        location = ""
-        amount = ""
-        date = ""
-        typ = ""
-
-        try:
-            # Look for an <a> in nearby previous sibling blocks
-            try:
-                link = cont.find_element(By.XPATH, ".//a[normalize-space(string())!='']")
-                name = _text(link)
-            except Exception:
-                # fallback: try nearest preceding link
-                try:
-                    link2 = cont.find_element(By.XPATH, "preceding::a[normalize-space(string())!=''][1]")
-                    name = _text(link2)
-                except Exception:
-                    name = ""
-
-            # Try pulling summary row text from preceding container
-            try:
-                prev = cont.find_element(By.XPATH, "preceding::*[self::div or self::tr or self::li][1]")
-                ptxt = _text(prev)
-                # heuristics: first line = name, second = maybe location
-                lines = split_lines(ptxt)
-                if not name and lines:
-                    name = lines[0]
-                # Try guess location/amount/date/type from previous lines
-                if lines:
-                    for ln in lines:
-                        if not location and any(ch.isalpha() for ch in ln) and len(ln) <= 30 and "€" not in ln and "." not in ln and "-" not in ln:
-                            # location often short (e.g. Tampere)
-                            location = ln
-                        if not amount and "€" in ln:
-                            amount = ln.strip()
-                        if not date and re.search(r"\b\d{2}\.\d{2}\.\d{4}\b", ln):
-                            date = re.search(r"\b\d{2}\.\d{2}\.\d{4}\b", ln).group(0)  # type: ignore
-                        if not typ and any(k in ln.lower() for k in ["velkomus", "protest", "tuomio"]):
-                            typ = ln.strip()
-            except Exception:
-                pass
-
-            # Parse from detail block too (sometimes has area/velkoja etc.)
-            # We keep only key items.
-        except Exception:
-            pass
-
-        out.append(Row(
-            name=name.strip(),
-            location=location.strip(),
-            amount=amount.strip(),
-            date=date.strip(),
-            type=typ.strip(),
-            source_name="KL",
-            source_url=driver.current_url,
-            yt=yt,
-            email="",
-            notes="from KL (expanded row)"
-        ))
-
-        if max_rows and len(out) >= max_rows:
-            break
-
-    status_cb(f"KL: Löytyi {len(out)} uniikkia Y-tunnusta.")
-    return out
-
-
-# =========================
 #   PIPELINES
 # =========================
 def pipeline_pdf(pdf_path: str, status_cb, progress_cb, stop_flag: threading.Event):
@@ -940,16 +678,16 @@ def pipeline_pdf(pdf_path: str, status_cb, progress_cb, stop_flag: threading.Eve
 
     status_cb(f"PDF: löytyi {len(yts)} Y-tunnusta. Haetaan emailit YTJ:stä…")
     driver = start_new_driver()
+    rows: list[Row] = []
     try:
         progress_cb(0, max(1, len(yts)))
-        rows: list[Row] = []
         for i, yt in enumerate(yts, start=1):
             if stop_flag.is_set():
                 break
             progress_cb(i - 1, len(yts))
             status_cb(f"YTJ: {i}/{len(yts)} {yt}")
             email = fetch_email_by_yt(driver, yt, stop_flag)
-            rows.append(Row(source_name="PDF", source_url=pdf_path, yt=yt, email=email))
+            rows.append(Row(name="", yt=yt, email=email, source="pdf->ytj", notes=""))
             time.sleep(YTJ_PER_COMPANY_SLEEP)
         progress_cb(len(yts), max(1, len(yts)))
     finally:
@@ -962,22 +700,39 @@ def pipeline_pdf(pdf_path: str, status_cb, progress_cb, stop_flag: threading.Eve
     return rows, emails
 
 
-def pipeline_clipboard(text: str, strict: bool, max_names: int, status_cb, progress_cb, stop_flag: threading.Event):
-    status_cb("Clipboard: poimitaan sähköpostit, Y-tunnukset ja yritysnimet…")
+def pipeline_clipboard(
+    text: str,
+    strict: bool,
+    max_names: int,
+    enable_name_fallback: bool,
+    status_cb,
+    progress_cb,
+    stop_flag: threading.Event,
+):
+    status_cb("Paste: poimitaan sähköpostit ja Y-tunnukset…")
 
     direct_emails = set(e.strip().lower() for e in EMAIL_RE.findall(text or "") if e.strip())
     yts = extract_yts_from_text(text)
-    names = extract_names_from_text(text, strict=strict, max_names=max_names)
 
     rows: list[Row] = []
-    for em in sorted(direct_emails):
-        rows.append(Row(email=em, source_name="Clipboard", source_url="clipboard", notes="email found in pasted text"))
-    for yt in yts:
-        rows.append(Row(yt=yt, source_name="Clipboard->YTJ", source_url="clipboard", notes="yt found in pasted text"))
-    for nm in names:
-        rows.append(Row(name=nm, source_name="Clipboard->YTJ", source_url="clipboard", notes="name found in pasted text"))
 
-    # dedup (name, yt, email)
+    # direct emails (no YTJ needed)
+    for em in sorted(direct_emails):
+        rows.append(Row(name="", yt="", email=em, source="paste", notes="email found in pasted text"))
+
+    # YTs to fetch
+    for yt in yts:
+        rows.append(Row(name="", yt=yt, email="", source="paste->ytj", notes="yt found in pasted text"))
+
+    # Optional fallback: names -> YTJ -> yt -> email (only if no yts)
+    names = []
+    if enable_name_fallback and not yts:
+        status_cb("Paste: ei Y-tunnuksia – yritetään nimihaulla (fallback)…")
+        names = extract_names_from_text(text, strict=strict, max_names=max_names)
+        for nm in names:
+            rows.append(Row(name=nm, yt="", email="", source="paste->ytj", notes="name fallback (no yt in text)"))
+
+    # Dedup
     deduped = []
     seen = set()
     for r in rows:
@@ -988,34 +743,39 @@ def pipeline_clipboard(text: str, strict: bool, max_names: int, status_cb, progr
         deduped.append(r)
     rows = deduped
 
-    if not direct_emails and not yts and not names:
-        status_cb("Clipboard: en löytänyt mitään (email / Y-tunnus / nimi).")
+    if not rows:
+        status_cb("Paste: en löytänyt mitään (email / Y-tunnus).")
         return [], []
 
-    status_cb("Clipboard: Käynnistetään YTJ-haku…")
-    driver = start_new_driver()
+    # Fetch missing emails via YTJ
+    todo = [r for r in rows if (not r.email) and (r.yt or r.name)]
+    if not todo:
+        status_cb("Paste: valmista (ei YTJ-hakuja).")
+        emails = sorted({r.email.lower(): r.email for r in rows if r.email}.values())
+        return rows, emails
 
+    status_cb(f"YTJ: haetaan emailit ({len(todo)} kohdetta)…")
+    driver = start_new_driver()
     yt_cache: dict[str, str] = {}
     name_cache: dict[str, str] = {}
 
     try:
-        todo = [r for r in rows if not r.email]
         progress_cb(0, max(1, len(todo)))
-
-        for idx, r in enumerate(todo, start=1):
+        for i, r in enumerate(todo, start=1):
             if stop_flag.is_set():
                 break
-            progress_cb(idx - 1, len(todo))
+            progress_cb(i - 1, len(todo))
 
             if r.yt:
-                status_cb(f"YTJ email: {idx}/{len(todo)} {r.yt}")
+                status_cb(f"YTJ email: {i}/{len(todo)} {r.yt}")
                 if r.yt not in yt_cache:
                     yt_cache[r.yt] = fetch_email_by_yt(driver, r.yt, stop_flag)
                 r.email = yt_cache.get(r.yt, "") or ""
             else:
+                # name fallback
                 if not r.name:
                     continue
-                status_cb(f"YTJ yrityshaku: {idx}/{len(todo)} {r.name}")
+                status_cb(f"YTJ yrityshaku: {i}/{len(todo)} {r.name}")
                 if r.name not in name_cache:
                     name_cache[r.name] = ytj_name_to_yt(driver, r.name, stop_flag) or ""
                 yt2 = name_cache.get(r.name, "") or ""
@@ -1024,6 +784,8 @@ def pipeline_clipboard(text: str, strict: bool, max_names: int, status_cb, progr
                     if yt2 not in yt_cache:
                         yt_cache[yt2] = fetch_email_by_yt(driver, yt2, stop_flag)
                     r.email = yt_cache.get(yt2, "") or ""
+                else:
+                    r.notes = (r.notes + " | name->yt not found").strip(" |")
 
             time.sleep(YTJ_PER_COMPANY_SLEEP)
 
@@ -1031,69 +793,6 @@ def pipeline_clipboard(text: str, strict: bool, max_names: int, status_cb, progr
     finally:
         try:
             driver.quit()
-        except Exception:
-            pass
-
-    emails = sorted({r.email.lower(): r.email for r in rows if r.email}.values())
-    return rows, emails
-
-
-def pipeline_kl_protest(url: str, max_companies: int, status_cb, progress_cb, stop_flag: threading.Event, driver):
-    """
-    Uses an existing driver (user logged in).
-    1) Click show-more until all loaded
-    2) Expand rows and extract YTs (+ some metadata)
-    3) For each YT, fetch email from YTJ
-    """
-    if stop_flag.is_set():
-        return [], []
-
-    status_cb("KL: Ladataan sivu…")
-    try:
-        driver.get(url)
-    except TimeoutException:
-        pass
-    try:
-        wait_loaded(driver)
-    except Exception:
-        pass
-    try_accept_cookies(driver)
-
-    status_cb("KL: Ladataan kaikki rivit (Näytä lisää)…")
-    kl_click_show_more(driver, status_cb, stop_flag)
-
-    # Extract YTs from KL
-    status_cb("KL: Poimitaan yritykset ja Y-tunnukset…")
-    rows = kl_extract_rows_from_visible_page(driver, status_cb, stop_flag, max_rows=max_companies)
-
-    if not rows:
-        status_cb("KL: Ei löytynyt yhtään Y-tunnusta. (Oletko varmasti avannut protestilistan ja detailit?)")
-        return [], []
-
-    # Fetch emails from YTJ using a NEW driver to avoid messing KL session
-    status_cb("YTJ: Käynnistetään email-haku…")
-    ytj_driver = start_new_driver()
-    try:
-        todo = [r for r in rows if r.yt]
-        progress_cb(0, max(1, len(todo)))
-        yt_cache: dict[str, str] = {}
-
-        for i, r in enumerate(todo, start=1):
-            if stop_flag.is_set():
-                break
-            progress_cb(i - 1, len(todo))
-            status_cb(f"YTJ: {i}/{len(todo)} {r.yt}")
-
-            if r.yt not in yt_cache:
-                yt_cache[r.yt] = fetch_email_by_yt(ytj_driver, r.yt, stop_flag)
-            r.email = yt_cache.get(r.yt, "") or ""
-
-            time.sleep(YTJ_PER_COMPANY_SLEEP)
-
-        progress_cb(len(todo), max(1, len(todo)))
-    finally:
-        try:
-            ytj_driver.quit()
         except Exception:
             pass
 
@@ -1108,9 +807,6 @@ class App(BaseTk):
     def __init__(self):
         super().__init__()
         self.stop_flag = threading.Event()
-
-        # Drivers
-        self.kl_driver = None  # kept alive between "Open" and "Continue"
         self.last_output_dir: Optional[str] = None
 
         # theme
@@ -1126,7 +822,7 @@ class App(BaseTk):
         self.GREY_BTN = "#64748b"
         self.GREY_BTN_H = "#475569"
 
-        self.title("Finnish Business Email Finder (MVP)")
+        self.title("Finnish Business Email Finder (MVP A)")
         self.geometry("1020x940")
         self.configure(bg=self.BG)
 
@@ -1180,9 +876,9 @@ class App(BaseTk):
     def _clear_stop(self):
         self.stop_flag.clear()
 
-    def clear_clipboard_text(self):
-        self.clip_text.delete("1.0", tk.END)
-        self._ui_log("Clipboard tyhjennetty.")
+    def clear_paste_text(self):
+        self.paste_text.delete("1.0", tk.END)
+        self._ui_log("Kenttä tyhjennetty.")
 
     def open_last_output(self):
         if self.last_output_dir and os.path.isdir(self.last_output_dir):
@@ -1198,7 +894,7 @@ class App(BaseTk):
         header = tk.Frame(root, bg=self.BG)
         header.pack(fill="x", padx=16, pady=(16, 10))
 
-        tk.Label(header, text="Finnish Business Email Finder (MVP)", bg=self.BG, fg=self.TEXT,
+        tk.Label(header, text="Finnish Business Email Finder (MVP A)", bg=self.BG, fg=self.TEXT,
                  font=("Segoe UI", 20, "bold")).pack(anchor="w")
         tk.Label(header, text=f"Build: {APP_BUILD}", bg=self.BG, fg=self.MUTED, font=("Segoe UI", 9)).pack(anchor="w")
 
@@ -1207,11 +903,8 @@ class App(BaseTk):
         row = tk.Frame(actions, bg=self.CARD)
         row.pack(fill="x", padx=12, pady=12)
 
-        self._btn(row, "KL Protesti (URL) → Avaa selain", self.kl_open_browser).pack(side="left", padx=6)
-        self._btn(row, "KL → Jatka (aloita keruu)", self.kl_continue_scrape).pack(side="left", padx=6)
-
+        self._btn(row, "Paste/Clipboard → YTJ", self.start_paste_mode).pack(side="left", padx=6)
         self._btn(row, "PDF → YTJ", self.start_pdf_mode).pack(side="left", padx=6)
-        self._btn(row, "Clipboard → Finder", self.start_clipboard_mode).pack(side="left", padx=6)
 
         self._btn(row, "Avaa tuloskansio", self.open_last_output, kind="grey").pack(side="right", padx=6)
         self._btn(row, "Pysäytä", self.request_stop, kind="danger").pack(side="right", padx=6)
@@ -1225,27 +918,56 @@ class App(BaseTk):
         self.progress = ttk.Progressbar(status_card, orient="horizontal", mode="determinate", length=920)
         self.progress.pack(fill="x", padx=12, pady=(0, 12))
 
-        # --- KL CARD ---
-        kl_card = self._card(root)
-        kl_card.pack(fill="x", padx=16, pady=(0, 12))
+        # --- PASTE CARD ---
+        paste_card = self._card(root)
+        paste_card.pack(fill="x", padx=16, pady=(0, 12))
 
-        top = tk.Frame(kl_card, bg=self.CARD)
+        top = tk.Frame(paste_card, bg=self.CARD)
         top.pack(fill="x", padx=12, pady=(12, 6))
 
-        tk.Label(top, text="Kauppalehti Protestilista URL:", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 10, "bold")).pack(side="left")
-        self.kl_url_var = tk.StringVar(value=KL_PROTEST_DEFAULT_URL)
-        tk.Entry(top, textvariable=self.kl_url_var, width=70, bg="#ffffff", fg=self.TEXT,
-                 highlightthickness=1, highlightbackground=self.BORDER).pack(side="left", padx=10)
+        tk.Label(top, text="Ohje:", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 10, "bold")).pack(side="left")
+        tk.Label(
+            top,
+            text="Avaa lähdesivu omassa selaimessa → Ctrl+A → Ctrl+C → liitä tähän → Start.",
+            bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 9)
+        ).pack(side="left", padx=10)
 
-        tk.Label(top, text="Max yritystä:", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 10)).pack(side="left", padx=(12, 6))
-        self.kl_max_var = tk.IntVar(value=2000)
-        tk.Spinbox(top, from_=50, to=50000, textvariable=self.kl_max_var, width=8,
+        top2 = tk.Frame(paste_card, bg=self.CARD)
+        top2.pack(fill="x", padx=12, pady=(0, 6))
+
+        self.strict_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            top2, text="Tiukka nimifallback (vain Oy/Ab/Ky/Tmi/...)",
+            variable=self.strict_var,
+            bg=self.CARD, fg=self.TEXT,
+            selectcolor="#ffffff",
+            activebackground=self.CARD, activeforeground=self.TEXT
+        ).pack(side="left")
+
+        self.enable_name_fallback_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            top2, text="Käytä nimihakua jos EI löydy Y-tunnuksia (fallback)",
+            variable=self.enable_name_fallback_var,
+            bg=self.CARD, fg=self.TEXT,
+            selectcolor="#ffffff",
+            activebackground=self.CARD, activeforeground=self.TEXT
+        ).pack(side="left", padx=(16, 0))
+
+        tk.Label(top2, text="Max nimeä:", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 10)).pack(side="left", padx=(16, 6))
+        self.max_names_var = tk.IntVar(value=400)
+        tk.Spinbox(top2, from_=10, to=5000, textvariable=self.max_names_var, width=7,
                    bg="#ffffff", fg=self.TEXT, insertbackground=self.TEXT,
                    highlightthickness=1, highlightbackground=self.BORDER).pack(side="left")
 
-        tk.Label(kl_card,
-                 text="KL käyttö: Paina 'Avaa selain' → kirjaudu itse → varmista että protestilista näkyy → paina 'Jatka'.",
-                 bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 9)).pack(anchor="w", padx=12, pady=(0, 12))
+        self._btn(top2, "Tyhjennä", self.clear_paste_text, kind="grey").pack(side="right", padx=6)
+
+        tk.Label(paste_card, text="Liitä teksti tähän (Ctrl+V):", bg=self.CARD, fg=self.MUTED,
+                 font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=(6, 6))
+
+        self.paste_text = tk.Text(paste_card, height=10, wrap="word",
+                                  bg="#ffffff", fg=self.TEXT, insertbackground=self.TEXT,
+                                  highlightthickness=1, highlightbackground=self.BORDER)
+        self.paste_text.pack(fill="x", padx=12, pady=(0, 12))
 
         # --- PDF CARD ---
         pdf_card = self._card(root)
@@ -1259,38 +981,6 @@ class App(BaseTk):
         if HAS_DND:
             drop.drop_target_register(DND_FILES)
             drop.dnd_bind("<<Drop>>", self._on_drop_pdf)
-
-        # --- CLIPBOARD CARD ---
-        clip_card = self._card(root)
-        clip_card.pack(fill="x", padx=16, pady=(0, 12))
-
-        top2 = tk.Frame(clip_card, bg=self.CARD)
-        top2.pack(fill="x", padx=12, pady=(12, 6))
-
-        self.strict_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(
-            top2, text="Tiukka parsinta (vain Oy/Ab/Ky/Tmi/...)",
-            variable=self.strict_var,
-            bg=self.CARD, fg=self.TEXT,
-            selectcolor="#ffffff",
-            activebackground=self.CARD, activeforeground=self.TEXT
-        ).pack(side="left")
-
-        tk.Label(top2, text="Max nimeä:", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 10)).pack(side="left", padx=(16, 6))
-        self.max_names_var = tk.IntVar(value=400)
-        tk.Spinbox(top2, from_=10, to=5000, textvariable=self.max_names_var, width=7,
-                   bg="#ffffff", fg=self.TEXT, insertbackground=self.TEXT,
-                   highlightthickness=1, highlightbackground=self.BORDER).pack(side="left")
-
-        self._btn(top2, "Tyhjennä", self.clear_clipboard_text, kind="grey").pack(side="right", padx=6)
-
-        tk.Label(clip_card, text="Liitä tähän (Ctrl+V):", bg=self.CARD, fg=self.MUTED,
-                 font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=(6, 6))
-
-        self.clip_text = tk.Text(clip_card, height=9, wrap="word",
-                                 bg="#ffffff", fg=self.TEXT, insertbackground=self.TEXT,
-                                 highlightthickness=1, highlightbackground=self.BORDER)
-        self.clip_text.pack(fill="x", padx=12, pady=(0, 12))
 
         # --- LOG CARD ---
         log_card = self._card(root)
@@ -1311,68 +1001,6 @@ class App(BaseTk):
         self.listbox.configure(yscrollcommand=sb.set)
 
         self._ui_log("Ready.")
-
-    # ========= KL =========
-    def kl_open_browser(self):
-        self._clear_stop()
-        url = (self.kl_url_var.get() or "").strip() or KL_PROTEST_DEFAULT_URL
-        self._set_status("KL: Avataan selain…")
-        try:
-            if self.kl_driver:
-                try:
-                    self.kl_driver.quit()
-                except Exception:
-                    pass
-                self.kl_driver = None
-
-            self.kl_driver = start_new_driver()
-            try:
-                self.kl_driver.get(url)
-            except TimeoutException:
-                pass
-            try:
-                wait_loaded(self.kl_driver)
-            except Exception:
-                pass
-            try_accept_cookies(self.kl_driver)
-
-            self._set_status("KL: Selain auki. Kirjaudu itse ja varmista protestilista näkyy. Paina sitten 'Jatka'.")
-        except Exception as e:
-            self._set_status(f"KL: Virhe selaimen avauksessa: {e}")
-            messagebox.showerror("Virhe", str(e))
-
-    def kl_continue_scrape(self):
-        self._clear_stop()
-        if not self.kl_driver:
-            messagebox.showwarning("Ei selainta", "Avaa ensin KL-selain (Kirjaudu).")
-            return
-        url = (self.kl_url_var.get() or "").strip() or (self.kl_driver.current_url or KL_PROTEST_DEFAULT_URL)
-        max_companies = int(self.kl_max_var.get() or 2000)
-        threading.Thread(target=self._run_kl, args=(url, max_companies), daemon=True).start()
-
-    def _run_kl(self, url: str, max_companies: int):
-        try:
-            self._set_status("KL: Aloitetaan keruu…")
-            rows, emails = pipeline_kl_protest(url, max_companies, self._set_status, self._set_progress, self.stop_flag, self.kl_driver)
-            if self.stop_flag.is_set():
-                self._set_status("Pysäytetty.")
-                return
-            if not rows:
-                self._set_status("Ei löytynyt tuloksia.")
-                return
-
-            # create output ONLY now
-            out_dir = create_final_run_dir()
-            self.last_output_dir = out_dir
-            save_results_xlsx(out_dir, rows, source_label="KL Protestilista", source_url=url)
-            save_results_csv(out_dir, rows)
-            save_emails_docx(out_dir, emails)
-
-            messagebox.showinfo("Valmis", f"Valmis!\n\nKansio:\n{out_dir}\n\nRivejä: {len(rows)}\nSähköposteja: {len(emails)}")
-            self._set_status("Valmis!")
-        except Exception as e:
-            self._ui_log(f"VIRHE: {e}")
-            messagebox.showerror("Virhe", f"Tuli virhe:\n\n{e}")
 
     # ========= PDF =========
     def _on_drop_pdf(self, event):
@@ -1406,7 +1034,7 @@ class App(BaseTk):
 
             out_dir = create_final_run_dir()
             self.last_output_dir = out_dir
-            save_results_xlsx(out_dir, rows, source_label="PDF", source_url=pdf_path)
+            save_results_xlsx(out_dir, rows, source_label="PDF")
             save_results_csv(out_dir, rows)
             save_emails_docx(out_dir, emails)
 
@@ -1416,24 +1044,31 @@ class App(BaseTk):
             self._ui_log(f"VIRHE: {e}")
             messagebox.showerror("Virhe", f"Tuli virhe:\n\n{e}")
 
-    # ========= Clipboard =========
-    def start_clipboard_mode(self):
+    # ========= Paste =========
+    def start_paste_mode(self):
         self._clear_stop()
-        text = self.clip_text.get("1.0", tk.END).strip()
+        text = self.paste_text.get("1.0", tk.END).strip()
         if not text:
             messagebox.showwarning("Tyhjä", "Liitä ensin teksti (Ctrl+V) kenttään.")
             return
-        threading.Thread(target=self._run_clipboard, args=(text,), daemon=True).start()
+        threading.Thread(target=self._run_paste, args=(text,), daemon=True).start()
 
-    def _run_clipboard(self, text: str):
+    def _run_paste(self, text: str):
         try:
-            self._set_status("Clipboard: Aloitetaan ajo…")
+            self._set_status("Paste: Aloitetaan ajo…")
+
             strict = bool(self.strict_var.get())
             max_names = int(self.max_names_var.get() or 400)
+            enable_name_fallback = bool(self.enable_name_fallback_var.get())
 
             rows, emails = pipeline_clipboard(
-                text, strict, max_names,
-                self._set_status, self._set_progress, self.stop_flag
+                text,
+                strict=strict,
+                max_names=max_names,
+                enable_name_fallback=enable_name_fallback,
+                status_cb=self._set_status,
+                progress_cb=self._set_progress,
+                stop_flag=self.stop_flag,
             )
 
             if self.stop_flag.is_set():
@@ -1445,7 +1080,7 @@ class App(BaseTk):
 
             out_dir = create_final_run_dir()
             self.last_output_dir = out_dir
-            save_results_xlsx(out_dir, rows, source_label="Clipboard", source_url="clipboard")
+            save_results_xlsx(out_dir, rows, source_label="Paste/Clipboard")
             save_results_csv(out_dir, rows)
             save_emails_docx(out_dir, emails)
 
