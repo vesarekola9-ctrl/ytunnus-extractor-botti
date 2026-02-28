@@ -1,6 +1,5 @@
 # license_tools/generate_keys.py
-# Generates valid LF-XXXX-XXXX-XXXX-CC keys for this MVP.
-# IMPORTANT: Must match LICENSE_SECRET in app.py.
+# Generate PRO keys for the EXE (offline validation).
 
 import hmac
 import base64
