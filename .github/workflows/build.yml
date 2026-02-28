@@ -16,15 +16,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Debug - list repo files (always)
-        if: always()
-        shell: pwsh
-        run: |
-          Write-Host "=== Repo root ==="
-          Get-ChildItem -Name
-          Write-Host "=== Tree (first 200 items) ==="
-          Get-ChildItem -Recurse | Select-Object -First 200
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -54,7 +45,6 @@ jobs:
 
           if (!(Test-Path "dist/FinnishBusinessEmailFinder.exe")) {
             Write-Host "ERROR: EXE was not produced."
-            Write-Host "Dist contents:"
             Get-ChildItem dist -Recurse -ErrorAction SilentlyContinue
             exit 1
           }
