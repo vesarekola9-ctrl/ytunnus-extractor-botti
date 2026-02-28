@@ -1,7 +1,7 @@
 selenium==4.23.1
 webdriver-manager==4.0.2
-PyPDF2
-python-docx
-openpyxl
-tkinterdnd2
-pyinstaller
+PyPDF2>=3.0.1
+python-docx>=1.1.2
+openpyxl>=3.1.5
+tkinterdnd2>=0.4.2
+pyinstaller>=6.6.0
