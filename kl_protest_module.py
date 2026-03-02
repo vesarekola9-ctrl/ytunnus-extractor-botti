@@ -1,11 +1,15 @@
-# kl_protest_module.py (ULTRA HARDENED + NAV GUARD)
+# kl_protest_module.py (LOCK TAB + NAV KILL SWITCH + FAILURE SNAPSHOT HELPERS + TIMERANGE)
 #
-# Fixes:
-# - Prevents accidental navigation away from protest list (e.g. to /porssi/...)
-# - Strictly filters deep-crawl links to only /yritykset/...
-# - After every "Näytä lisää" click, validates URL still looks like protest list.
-# - If URL escapes, goes back to protest URL and continues.
+# Features:
+# 1) Protest-tab lock (pick correct tab in remote-debug Chrome)
+# 2) Navigation kill switch (blocks accidental <a> navigations during "Näytä lisää" loop)
+# 3) Time range selection (Auto: Day->Week->Month)
+# 4) Robust "Näytä lisää" loop with URL guard (stay on protest list)
+# 5) Y-tunnus extraction via huge JS blob
+# 6) Deep crawl fallback (STRICTLY /yritykset/ links)
+# 7) Optional debug dump helpers (HTML/text/url) called from app on failure
 
+import os
 import re
 import time
 from typing import Callable, List, Optional
@@ -80,7 +84,6 @@ def _try_press_esc(driver, n=2):
 
 
 def close_overlays(driver, status_cb=None):
-    """Try hard to remove popups, modals, cookie consents, overlays."""
     _try_press_esc(driver, n=2)
 
     keywords = [
@@ -115,7 +118,7 @@ def close_overlays(driver, status_cb=None):
     if clicked:
         _log(status_cb, f"KL: overlay/consent click: {clicked}")
 
-    # Hide overlay-like nodes
+    # Hide overlay-ish
     try:
         driver.execute_script(
             """
@@ -139,8 +142,10 @@ def close_overlays(driver, status_cb=None):
         pass
 
 
+# =========================
+#  TAB LOCK / URL GUARD
+# =========================
 def _switch_to_matching_tab(driver, url_substring: str, status_cb=None) -> bool:
-    """If multiple tabs are open in debug Chrome, switch to one that matches protest URL."""
     try:
         handles = driver.window_handles
     except Exception:
@@ -163,7 +168,7 @@ def _switch_to_matching_tab(driver, url_substring: str, status_cb=None) -> bool:
             time.sleep(0.15)
             u = driver.current_url or ""
             if url_substring in u:
-                _log(status_cb, f"KL: Vaihdettu välilehteen: {u}")
+                _log(status_cb, f"KL: Tab lock OK: {u}")
                 return True
         except NoSuchWindowException:
             continue
@@ -176,11 +181,10 @@ def _is_protest_url(u: str) -> bool:
     if not u:
         return False
     u = u.lower()
-    return ("/yritykset/protestilista" in u)
+    return "/yritykset/protestilista" in u
 
 
 def _is_bad_escape_url(u: str) -> bool:
-    """Pages we definitely do NOT want to end up on."""
     if not u:
         return False
     u = u.lower()
@@ -192,107 +196,7 @@ def _is_bad_escape_url(u: str) -> bool:
     return any(b in u for b in bad)
 
 
-def ensure_on_page(driver, url: str, status_cb=None):
-    target = (url or "").strip() or DEFAULT_URL
-    _log(status_cb, f"KL: Navigoidaan: {target}")
-
-    _switch_to_matching_tab(driver, "/yritykset/protestilista", status_cb=status_cb)
-
-    try:
-        driver.get(target)
-        time.sleep(1.3)
-    except Exception:
-        pass
-    close_overlays(driver, status_cb=status_cb)
-
-
-def _scroll_to_bottom(driver):
-    try:
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-    except Exception:
-        pass
-
-
-def _count_yts_fast(driver) -> int:
-    try:
-        txt = driver.execute_script("return document.body ? document.body.innerText : ''") or ""
-    except Exception:
-        txt = ""
-    found = set()
-    for m in YT_RE.findall(txt):
-        n = _normalize_yt(m)
-        if n:
-            found.add(n)
-    return len(found)
-
-
-def _find_show_more_selenium(driver):
-    xps = [
-        # FI
-        "//button[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ','abcdefghijklmnopqrstuvwxyzåäö'),'näytä lisää')]",
-        "//a[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ','abcdefghijklmnopqrstuvwxyzåäö'),'näytä lisää')]",
-        "//*[self::button or self::a][.//*[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ','abcdefghijklmnopqrstuvwxyzåäö'),'näytä lisää')]]",
-        # EN
-        "//button[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'show more')]",
-        "//a[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'show more')]",
-        "//*[self::button or self::a][.//*[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'show more')]]",
-        # generic
-        "//*[@data-testid='show-more' or @data-testid='load-more']",
-        "//*[contains(@class,'show-more') or contains(@class,'load-more')]",
-    ]
-    for xp in xps:
-        try:
-            el = driver.find_element(By.XPATH, xp)
-            if el and el.is_displayed():
-                return el
-        except Exception:
-            continue
-    return None
-
-
-def _click_show_more_js(driver) -> bool:
-    """Fallback: click show more via JS scanning innerText."""
-    try:
-        return bool(
-            driver.execute_script(
-                """
-                function match(t){
-                  t=(t||'').toLowerCase();
-                  return t.includes('näytä lisää') || t.includes('show more');
-                }
-                const candidates = []
-                  .concat(Array.from(document.querySelectorAll('button')))
-                  .concat(Array.from(document.querySelectorAll('a')))
-                  .concat(Array.from(document.querySelectorAll('[role="button"]')));
-                for (const el of candidates) {
-                  const txt = (el.innerText || el.textContent || '').trim();
-                  if (!txt) continue;
-                  if (!match(txt)) continue;
-
-                  // Try to avoid nav links by preferring <button> or role=button
-                  const tag = (el.tagName || '').toLowerCase();
-                  if (tag === 'a') {
-                    // if anchor has href and isn't javascript:void(0), it might navigate
-                    const href = (el.getAttribute('href') || '').trim();
-                    if (href && !href.startsWith('#') && !href.toLowerCase().startsWith('javascript')) {
-                      // still allow if it looks like a load-more anchor (common pattern)
-                      // but we'll keep nav guard in Python anyway
-                    }
-                  }
-
-                  try { el.scrollIntoView({block:'center'}); } catch(e){}
-                  try { el.click(); return true; } catch(e){}
-                }
-                return false;
-                """
-            )
-        )
-    except Exception:
-        return False
-
-
 def _return_to_protest_if_escaped(driver, protest_url: str, status_cb=None) -> bool:
-    """If we accidentally navigated away, go back / reload protest URL."""
     try:
         cur = driver.current_url or ""
     except Exception:
@@ -303,7 +207,7 @@ def _return_to_protest_if_escaped(driver, protest_url: str, status_cb=None) -> b
 
     if _is_bad_escape_url(cur) or (cur and protest_url and protest_url not in cur):
         _log(status_cb, f"KL: VAROITUS: karkasi sivulle: {cur}")
-        # try back first
+        # back first
         try:
             driver.back()
             time.sleep(0.7)
@@ -332,6 +236,244 @@ def _return_to_protest_if_escaped(driver, protest_url: str, status_cb=None) -> b
     return False
 
 
+def ensure_on_page(driver, url: str, status_cb=None):
+    target = (url or "").strip() or DEFAULT_URL
+    _log(status_cb, f"KL: Navigoidaan: {target}")
+
+    # Tab lock
+    _switch_to_matching_tab(driver, "/yritykset/protestilista", status_cb=status_cb)
+
+    try:
+        driver.get(target)
+        time.sleep(1.3)
+    except Exception:
+        pass
+    close_overlays(driver, status_cb=status_cb)
+
+
+# =========================
+#  NAVIGATION KILL SWITCH
+# =========================
+def install_nav_kill_switch(driver, status_cb=None):
+    """
+    Blocks accidental anchor (<a>) navigations during automation.
+    Allows only:
+      - clicks on elements whose text contains "näytä lisää" / "show more"
+      - anchors with href starting with '#' or 'javascript'
+    """
+    try:
+        driver.execute_script(
+            """
+            if (window.__klNavKillInstalled) return true;
+            window.__klNavKillInstalled = true;
+
+            function allowedByText(el){
+              try {
+                const t = ((el.innerText || el.textContent || '') + '').toLowerCase().trim();
+                return t.includes('näytä lisää') || t.includes('show more');
+              } catch(e){ return false; }
+            }
+
+            document.addEventListener('click', function(ev){
+              try {
+                const a = ev.target && ev.target.closest ? ev.target.closest('a') : null;
+                if (!a) return;
+                const href = (a.getAttribute('href') || '').trim().toLowerCase();
+
+                if (allowedByText(a)) return; // allow show-more anchor patterns
+                if (!href) { ev.preventDefault(); ev.stopPropagation(); return; }
+                if (href.startsWith('#') || href.startsWith('javascript')) return;
+
+                // block everything else
+                ev.preventDefault();
+                ev.stopPropagation();
+              } catch(e){}
+            }, true);
+
+            return true;
+            """
+        )
+        _log(status_cb, "KL: Navigation kill switch ON.")
+    except Exception:
+        _log(status_cb, "KL: Navigation kill switch failed (non-fatal).")
+
+
+def uninstall_nav_kill_switch(driver, status_cb=None):
+    # Can't reliably remove anonymous listener; but we can disable via flag check.
+    try:
+        driver.execute_script(
+            """
+            window.__klNavKillInstalled = false;
+            """
+        )
+        _log(status_cb, "KL: Navigation kill switch OFF (flag).")
+    except Exception:
+        pass
+
+
+# =========================
+#  TIMERANGE
+# =========================
+def _page_has_no_results_text(driver) -> bool:
+    try:
+        txt = (driver.execute_script("return document.body ? document.body.innerText : ''") or "").lower()
+    except Exception:
+        txt = ""
+    return ("ei tuloksia" in txt) or ("no results" in txt) or ("ei löytynyt" in txt) or ("nothing found" in txt)
+
+
+def _find_timerange_button(driver, label: str):
+    targets = {
+        "auto": ["auto"],
+        "day": ["päivä", "day"],
+        "week": ["viikko", "week"],
+        "month": ["kuukausi", "month"],
+    }
+    key = (label or "").strip().lower()
+    if key in ("päivä", "day"):
+        want = targets["day"]
+    elif key in ("viikko", "week"):
+        want = targets["week"]
+    elif key in ("kuukausi", "month"):
+        want = targets["month"]
+    else:
+        want = targets["auto"]
+
+    try:
+        elems = driver.find_elements(By.XPATH, "//button|//a|//*[@role='button']")
+    except Exception:
+        elems = []
+
+    for el in elems[:450]:
+        try:
+            if not el.is_displayed():
+                continue
+            txt = (el.text or "").strip() or (el.get_attribute("aria-label") or "").strip()
+            if not txt:
+                continue
+            t = txt.lower()
+            if any(w in t for w in want):
+                return el
+        except Exception:
+            continue
+    return None
+
+
+def _apply_one_range(driver, label: str, status_cb=None) -> bool:
+    close_overlays(driver, status_cb=status_cb)
+    btn = _find_timerange_button(driver, label)
+    if not btn:
+        return False
+    ok = _safe_click(driver, btn)
+    time.sleep(0.7)
+    close_overlays(driver, status_cb=status_cb)
+    return ok
+
+
+def _count_yts_fast(driver) -> int:
+    try:
+        txt = driver.execute_script("return document.body ? document.body.innerText : ''") or ""
+    except Exception:
+        txt = ""
+    found = set()
+    for m in YT_RE.findall(txt):
+        n = _normalize_yt(m)
+        if n:
+            found.add(n)
+    return len(found)
+
+
+def apply_time_range(driver, label: str, status_cb=None) -> str:
+    raw = (label or "").strip() or "Auto"
+    low = raw.lower()
+
+    if low in ("päivä", "day"):
+        return "Päivä/Day" if _apply_one_range(driver, "day", status_cb) else ""
+    if low in ("viikko", "week"):
+        return "Viikko/Week" if _apply_one_range(driver, "week", status_cb) else ""
+    if low in ("kuukausi", "month"):
+        return "Kuukausi/Month" if _apply_one_range(driver, "month", status_cb) else ""
+
+    _log(status_cb, "KL: Auto time range: yritetään Päivä/Day…")
+    if _apply_one_range(driver, "day", status_cb):
+        time.sleep(0.6)
+        if _count_yts_fast(driver) > 0 and not _page_has_no_results_text(driver):
+            return "Päivä/Day"
+        _log(status_cb, "KL: Päivä/Day ei tuloksia -> Viikko/Week…")
+
+    if _apply_one_range(driver, "week", status_cb):
+        time.sleep(0.6)
+        if _count_yts_fast(driver) > 0 and not _page_has_no_results_text(driver):
+            return "Viikko/Week"
+        _log(status_cb, "KL: Viikko/Week ei tuloksia -> Kuukausi/Month…")
+
+    if _apply_one_range(driver, "month", status_cb):
+        time.sleep(0.6)
+        if _count_yts_fast(driver) > 0 and not _page_has_no_results_text(driver):
+            return "Kuukausi/Month"
+
+    return ""
+
+
+# =========================
+#  SHOW MORE LOOP (GUARDED)
+# =========================
+def _scroll_to_bottom(driver):
+    try:
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    except Exception:
+        pass
+
+
+def _find_show_more_selenium(driver):
+    xps = [
+        "//button[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ','abcdefghijklmnopqrstuvwxyzåäö'),'näytä lisää')]",
+        "//a[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ','abcdefghijklmnopqrstuvwxyzåäö'),'näytä lisää')]",
+        "//*[self::button or self::a][.//*[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ','abcdefghijklmnopqrstuvwxyzåäö'),'näytä lisää')]]",
+        "//button[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'show more')]",
+        "//a[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'show more')]",
+        "//*[self::button or self::a][.//*[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'show more')]]",
+        "//*[@data-testid='show-more' or @data-testid='load-more']",
+        "//*[contains(@class,'show-more') or contains(@class,'load-more')]",
+    ]
+    for xp in xps:
+        try:
+            el = driver.find_element(By.XPATH, xp)
+            if el and el.is_displayed():
+                return el
+        except Exception:
+            continue
+    return None
+
+
+def _click_show_more_js(driver) -> bool:
+    try:
+        return bool(
+            driver.execute_script(
+                """
+                function match(t){
+                  t=(t||'').toLowerCase();
+                  return t.includes('näytä lisää') || t.includes('show more');
+                }
+                const candidates = []
+                  .concat(Array.from(document.querySelectorAll('button')))
+                  .concat(Array.from(document.querySelectorAll('a')))
+                  .concat(Array.from(document.querySelectorAll('[role="button"]')));
+                for (const el of candidates) {
+                  const txt = (el.innerText || el.textContent || '').trim();
+                  if (!txt) continue;
+                  if (!match(txt)) continue;
+                  try { el.scrollIntoView({block:'center'}); } catch(e){}
+                  try { el.click(); return true; } catch(e){}
+                }
+                return false;
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
 def click_show_more_until_end(
     driver,
     stop_flag,
@@ -342,6 +484,9 @@ def click_show_more_until_end(
     stuck_rounds_limit: int = 10,
     protest_url: str = DEFAULT_URL,
 ):
+    # Strong guard: install nav kill switch for this loop
+    install_nav_kill_switch(driver, status_cb=status_cb)
+
     clicks = 0
     stuck = 0
     prev_yts = _count_yts_fast(driver)
@@ -351,10 +496,9 @@ def click_show_more_until_end(
             _log(status_cb, "KL: STOP havaittu – lopetetaan loop.")
             break
 
-        # if escaped, recover
         _return_to_protest_if_escaped(driver, protest_url, status_cb=status_cb)
-
         close_overlays(driver, status_cb=status_cb)
+
         _scroll_to_bottom(driver)
         time.sleep(max(0.05, scroll_sleep))
 
@@ -373,10 +517,10 @@ def click_show_more_until_end(
             close_overlays(driver, status_cb=status_cb)
             ok = _click_show_more_js(driver)
 
-        # After click, ensure we didn't navigate away
         time.sleep(max(0.05, post_click_sleep))
+
+        # If we escaped, recover and continue without counting
         if _return_to_protest_if_escaped(driver, protest_url, status_cb=status_cb):
-            # we escaped; do NOT count this as progress click, continue loop
             continue
 
         if not ok:
@@ -401,11 +545,14 @@ def click_show_more_until_end(
             stuck = 0
             prev_yts = cur_yts
 
+    uninstall_nav_kill_switch(driver, status_cb=status_cb)
     _log(status_cb, f"KL: Loop valmis. Klikkauksia: {clicks}. Y-tunnuksia näkyvissä: {prev_yts}")
 
 
+# =========================
+#  EXTRACTION + DEEP CRAWL
+# =========================
 def _collect_big_blob_js(driver) -> str:
-    """Collect a huge text blob from many sources (text + html + scripts + attributes)."""
     try:
         return driver.execute_script(
             """
@@ -419,11 +566,11 @@ def _collect_big_blob_js(driver) -> str:
             } catch(e){}
 
             try {
-              const scripts = Array.from(document.querySelectorAll('script')).slice(0, 220);
+              const scripts = Array.from(document.querySelectorAll('script')).slice(0, 240);
               for (const s of scripts) {
                 const t = (s.textContent || '').trim();
                 if (!t) continue;
-                out.push(t.slice(0, 20000));
+                out.push(t.slice(0, 25000));
               }
             } catch(e){}
 
@@ -475,8 +622,7 @@ def _extract_yts_from_blob(blob: str) -> List[str]:
 
 def _collect_company_links_from_list(driver, limit: int = 200) -> List[str]:
     """
-    STRICT filter: only internal KL company paths.
-    Prevents grabbing /porssi/ etc.
+    STRICT: only KL /yritykset/ links (prevents /porssi/ etc).
     """
     try:
         links = driver.execute_script(
@@ -499,25 +645,20 @@ def _collect_company_links_from_list(driver, limit: int = 200) -> List[str]:
         hh = (h or "").lower()
         if "protestilista" in hh:
             continue
-        # STRICT: only /yritykset/ links (company pages)
         if "/yritykset/" not in hh:
             continue
-        # block known bad
         if "/porssi/" in hh or "/indeks" in hh or "/uutiset" in hh:
             continue
         good.append(h)
 
-    # Normalize to absolute
     abs_links = []
     for h in good:
         if h.startswith("http"):
-            # only accept kauppalehti domain
             if "kauppalehti.fi" in h.lower():
                 abs_links.append(h)
         else:
             abs_links.append("https://www.kauppalehti.fi" + h)
 
-    # de-dup + limit
     seen = set()
     out = []
     for u in abs_links:
@@ -558,7 +699,6 @@ def _deep_crawl_for_yts(driver, status_cb=None, limit_pages: int = 60, protest_u
         except Exception:
             continue
 
-    # Return to protest list
     try:
         driver.get(protest_url or DEFAULT_URL)
         time.sleep(0.8)
@@ -570,12 +710,6 @@ def _deep_crawl_for_yts(driver, status_cb=None, limit_pages: int = 60, protest_u
 
 
 def extract_ytunnukset_via_js(driver, status_cb=None, protest_url: str = DEFAULT_URL) -> List[str]:
-    """
-    Primary: ultra blob extraction from current document.
-    Fallback: deep crawl company pages if 0.
-    Also guards: if currently on wrong page, go back to protest URL first.
-    """
-    # Guard: if we're not on protest list, return there first
     try:
         cur = driver.current_url or ""
     except Exception:
@@ -601,3 +735,53 @@ def extract_ytunnukset_via_js(driver, status_cb=None, protest_url: str = DEFAULT
     yts2 = _deep_crawl_for_yts(driver, status_cb=status_cb, limit_pages=60, protest_url=protest_url)
     _log(status_cb, f"KL: Deep crawl: löytyi {len(yts2)} Y-tunnusta.")
     return yts2
+
+
+# =========================
+#  FAILURE SNAPSHOT HELPERS
+# =========================
+def dump_failure_snapshot(driver, out_dir: str, prefix: str = "kl_fail") -> None:
+    """
+    Called from app.py ONLY on failure.
+    Writes:
+      - <prefix>_url.txt
+      - <prefix>_body.txt (trimmed)
+      - <prefix>_html.html (trimmed)
+    """
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except Exception:
+        return
+
+    try:
+        url = driver.current_url or ""
+    except Exception:
+        url = ""
+
+    try:
+        body = driver.execute_script("return document.body ? document.body.innerText : ''") or ""
+    except Exception:
+        body = ""
+
+    try:
+        html = driver.execute_script("return document.documentElement ? document.documentElement.outerHTML : ''") or ""
+    except Exception:
+        html = ""
+
+    try:
+        with open(os.path.join(out_dir, f"{prefix}_url.txt"), "w", encoding="utf-8") as f:
+            f.write(url)
+    except Exception:
+        pass
+
+    try:
+        with open(os.path.join(out_dir, f"{prefix}_body.txt"), "w", encoding="utf-8") as f:
+            f.write((body or "")[:500_000])
+    except Exception:
+        pass
+
+    try:
+        with open(os.path.join(out_dir, f"{prefix}_html.html"), "w", encoding="utf-8") as f:
+            f.write((html or "")[:2_000_000])
+    except Exception:
+        pass
