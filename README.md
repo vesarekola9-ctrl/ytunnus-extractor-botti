@@ -1,35 +1,43 @@
 # Finnish Business Email Finder
 
-Sellable Windows EXE that:
+**Modes**
+1) **PLAY (Kauppalehti protestilista → YTJ)**  
+   - Start Chrome in remote debugging mode (app button).
+   - Login manually to Kauppalehti.
+   - Open protest list.
+   - Click PLAY in the app.
+   - App loads all via "Näytä lisää", extracts Y-tunnus, fetches emails from YTJ.
 
-- Reads Y-tunnus from:
-  - Kauppalehti Protestilista (PLAY mode; requires user login in Chrome via remote debugging attach)
-  - Paste/Clipboard
-  - PDF
-- Fetches emails from YTJ for each Y-tunnus
-- Exports (ONLY at end):
-  - results.xlsx (Results + Missing + Summary)
-  - results.csv
-  - emails.docx
+2) **Paste/Clipboard → YTJ**
+   - Paste page content / list.
+   - App extracts:
+     - direct emails
+     - Y-tunnus
+     - if no Y-tunnus: optional name fallback (YTJ search by company name).
+   - Fetch emails from YTJ (FAST parallel requests + Selenium fallback).
 
-## Build (GitHub Actions)
+3) **PDF → YTJ**
+   - Extract Y-tunnus from PDF and fetch emails.
 
-Push to `main` → Actions builds Windows EXE artifact:
+**Output (created only when run completes)**
+FinnishBusinessEmailFinder/YYYY-MM-DD/run_HH-MM-SS/
+- results.xlsx (Results + Missing + Summary)
+- results.csv
+- emails.docx
 
-- FinnishBusinessEmailFinder-win64 / FinnishBusinessEmailFinder.exe
+## Chrome debug attach (PLAY mode)
+The app can start Chrome like:
+chrome.exe --remote-debugging-port=9222 --user-data-dir="...\\ChromeDebugProfile"
 
-## Using PLAY: Protestilista → YTJ
+You must:
+1) Login to Kauppalehti in that Chrome
+2) Open https://www.kauppalehti.fi/yritykset/protestilista
+3) Press PLAY
 
-1) Click **Käynnistä Chrome debug** in the app (or start manually)
-2) Login to Kauppalehti in that Chrome window
-3) Open protest list URL
-4) Click **PLAY: Protestilista → YTJ**
+## Build EXE
+### Local
+pip install -r requirements.txt
+pyinstaller --onefile --windowed --name FinnishBusinessEmailFinder app.py
 
-### Manual start (optional)
-
-PowerShell:
-
-```powershell
-& "C:\Program Files\Google\Chrome\Application\chrome.exe" `
-  --remote-debugging-port=9222 `
-  --user-data-dir="C:\ChromeDebug"
+### GitHub Actions
+Push to main -> workflow builds Windows EXE artifact.
