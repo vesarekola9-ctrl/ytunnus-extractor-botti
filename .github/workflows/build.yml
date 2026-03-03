@@ -32,6 +32,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          pip install pyinstaller
+
           pyinstaller `
             --noconfirm `
             --clean `
@@ -44,7 +46,6 @@ jobs:
             --collect-all docx `
             --collect-all PyPDF2 `
             --collect-all requests `
-            --collect-all tkinterdnd2 `
             app.py
 
           if (!(Test-Path "dist/FinnishBusinessEmailFinder.exe")) {
