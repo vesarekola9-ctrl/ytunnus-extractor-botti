@@ -1,20 +1,6 @@
 # app.py
 # Finnish Business Email Finder
-# Build: 2026-03-02_prod_parallel_requests_fallback
-#
-# Modes:
-# 1) PLAY (Kauppalehti Protestilista): attach to Chrome remote-debug session
-#    - click "Näytä lisää" loop (safe, anti-navigation)
-#    - extract Y-tunnus via JS/regex
-#    - fetch emails from YTJ (FAST parallel via requests, fallback selenium)
-# 2) Paste/Clipboard: extract emails + Y-tunnus; if only names -> YTJ name->YT -> emails
-# 3) PDF: extract Y-tunnus -> emails
-#
-# Output ONLY at end:
-# FinnishBusinessEmailFinder/YYYY-MM-DD/run_HH-MM-SS/
-#   - results.xlsx (Results + Missing + Summary)
-#   - results.csv
-#   - emails.docx
+# Build: 2026-03-03_clipboard_C_turbo_parallel_cache
 
 import os
 import re
@@ -26,6 +12,7 @@ import subprocess
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Optional, Tuple, List, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -37,7 +24,7 @@ from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, Alignment
 
 import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import xml.etree.ElementTree as ET
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -56,7 +43,7 @@ except Exception:
     HAS_DND = False
 
 
-APP_BUILD = "2026-03-02_prod_parallel_requests_fallback"
+APP_BUILD = "2026-03-03_clipboard_C_turbo_parallel_cache"
 
 # --- regex ---
 YT_RE = re.compile(r"\b\d{7}-\d\b|\b\d{8}\b")
@@ -68,13 +55,16 @@ STRICT_FORMS_RE = re.compile(
     re.I,
 )
 
-YTJ_COMPANY_URL = "https://tietopalvelu.ytj.fi/yritys/{}"
-YTJ_SEARCH_URLS = ["https://tietopalvelu.ytj.fi/haku", "https://tietopalvelu.ytj.fi/"]
 KL_PROTEST_DEFAULT_URL = "https://www.kauppalehti.fi/yritykset/protestilista"
+YTJ_COMPANY_URL = "https://tietopalvelu.ytj.fi/yritys/{}"
+
+# --- YTJ SOAP company search (name -> Y-tunnus) ---
+# Public documentation shows HTTP GET for wmYritysHaku on api.tietopalvelu.ytj.fi :contentReference[oaicite:1]{index=1}
+YTJ_SOAP_HTTPGET = "https://api.tietopalvelu.ytj.fi/yritystiedot.asmx/wmYritysHaku"
 
 
 # =========================
-#   SPEED PROFILES
+#   SPEED PROFILES (C)
 # =========================
 @dataclass
 class SpeedProfile:
@@ -83,7 +73,7 @@ class SpeedProfile:
     kl_scroll_sleep: float
     kl_post_click_sleep: float
     kl_max_passes: int
-    # YTJ fallback Selenium pacing
+    # YTJ email Selenium pacing
     ytj_retry_reads: int
     ytj_retry_sleep: float
     ytj_nayta_passes: int
@@ -91,12 +81,15 @@ class SpeedProfile:
     # timeouts
     page_load_timeout: int
     ytj_page_load_timeout: int
-    # parallel requests settings
-    parallel_workers: int
-    requests_timeout: float
+    # C upgrades
+    name_workers: int          # SOAP parallel workers
+    email_workers: int         # Selenium parallel workers (each worker has its own driver)
+    soap_timeout: float        # requests timeout for SOAP
+    soap_max_results: int      # read at most N results per name
+    turbo_relaxed_match: bool  # allow softer name matching in Turbo
 
 
-SPEEDS = {
+SPEEDS: Dict[str, SpeedProfile] = {
     "Safe": SpeedProfile(
         name="Safe",
         kl_scroll_sleep=0.35,
@@ -108,8 +101,11 @@ SPEEDS = {
         ytj_per_company_sleep=0.08,
         page_load_timeout=25,
         ytj_page_load_timeout=25,
-        parallel_workers=6,
-        requests_timeout=10.0,
+        name_workers=6,
+        email_workers=1,
+        soap_timeout=12.0,
+        soap_max_results=25,
+        turbo_relaxed_match=False,
     ),
     "Normal": SpeedProfile(
         name="Normal",
@@ -122,8 +118,11 @@ SPEEDS = {
         ytj_per_company_sleep=0.05,
         page_load_timeout=18,
         ytj_page_load_timeout=18,
-        parallel_workers=10,
-        requests_timeout=8.0,
+        name_workers=10,
+        email_workers=2,
+        soap_timeout=10.0,
+        soap_max_results=30,
+        turbo_relaxed_match=False,
     ),
     "Fast": SpeedProfile(
         name="Fast",
@@ -136,14 +135,34 @@ SPEEDS = {
         ytj_per_company_sleep=0.02,
         page_load_timeout=14,
         ytj_page_load_timeout=14,
-        parallel_workers=14,
-        requests_timeout=7.0,
+        name_workers=16,
+        email_workers=3,
+        soap_timeout=8.0,
+        soap_max_results=40,
+        turbo_relaxed_match=False,
+    ),
+    "Turbo": SpeedProfile(
+        name="Turbo",
+        kl_scroll_sleep=0.14,
+        kl_post_click_sleep=0.18,
+        kl_max_passes=420,
+        ytj_retry_reads=4,
+        ytj_retry_sleep=0.10,
+        ytj_nayta_passes=2,
+        ytj_per_company_sleep=0.00,
+        page_load_timeout=12,
+        ytj_page_load_timeout=12,
+        name_workers=26,
+        email_workers=4,
+        soap_timeout=6.0,
+        soap_max_results=60,
+        turbo_relaxed_match=True,
     ),
 }
 
 
 # =========================
-#   UI SCROLL WRAPPER
+#   SCROLLABLE UI WRAPPER
 # =========================
 class ScrollableFrame(ttk.Frame):
     def __init__(self, container, *args, **kwargs):
@@ -176,7 +195,7 @@ BaseTk = TkinterDnD.Tk if HAS_DND else tk.Tk
 
 
 # =========================
-#   OUTPUT PATHS (END ONLY)
+#   PATHS (OUTPUT END ONLY)
 # =========================
 def exe_dir() -> str:
     if getattr(sys, "frozen", False):
@@ -272,61 +291,58 @@ def split_lines(text: str) -> List[str]:
 
 
 def extract_names_from_text(text: str, strict: bool, max_names: int) -> List[str]:
-    """
-    FIX: If strict mode yields 0 names, auto-fallback to non-strict.
-    """
     lines = split_lines(text)
     out: List[str] = []
     seen = set()
+
     bad_contains = [
         "näytä lisää", "kirjaudu", "tilaa", "tilaajille",
         "€", "y-tunnus", "ytunnus", "sähköposti", "puhelin",
-        "www.", "http", "tietopalvelu.ytj.fi"
+        "www.", "http", "kauppalehti", "pörssi", "indeksit"
     ]
 
-    def accept_line(ln: str, strict_mode: bool) -> Optional[str]:
-        if YT_RE.search(ln):
-            return None
-        low = ln.lower()
-        if any(b in low for b in bad_contains):
-            return None
-        if len(ln) < 3:
-            return None
-        if sum(ch.isdigit() for ch in ln) >= 3:
-            return None
-        if not any(ch.isalpha() for ch in ln):
-            return None
-
-        name = re.sub(r"\s{2,}", " ", ln).strip()
-        if len(name) > 90:
-            return None
-        if strict_mode and not STRICT_FORMS_RE.search(name):
-            return None
-        key = name.lower()
-        if key in seen:
-            return None
-        seen.add(key)
-        return name
-
-    # pass 1
     for ln in lines:
         if len(out) >= max_names:
             break
-        nm = accept_line(ln, strict)
-        if nm:
-            out.append(nm)
+        if YT_RE.search(ln):
+            continue
+        low = ln.lower()
+        if any(b in low for b in bad_contains):
+            continue
+        if len(ln) < 3:
+            continue
+        if sum(ch.isdigit() for ch in ln) >= 3:
+            continue
+        if not any(ch.isalpha() for ch in ln):
+            continue
 
-    # auto-fallback
-    if strict and not out:
-        seen.clear()
-        for ln in lines:
-            if len(out) >= max_names:
-                break
-            nm = accept_line(ln, False)
-            if nm:
-                out.append(nm)
+        name = re.sub(r"\s{2,}", " ", ln).strip()
+        if len(name) > 90:
+            continue
+        if strict and not STRICT_FORMS_RE.search(name):
+            continue
+
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(name)
 
     return out
+
+
+def best_name_match_score(query: str, candidate: str) -> float:
+    q = (query or "").lower().strip()
+    c = (candidate or "").lower().strip()
+    if not q or not c:
+        return 0.0
+    # strong start bonus
+    bonus = 0.0
+    if c.startswith(q):
+        bonus += 18.0
+    # basic similarity
+    ratio = SequenceMatcher(None, q, c).ratio() * 100.0
+    return ratio + bonus
 
 
 # =========================
@@ -444,10 +460,6 @@ def start_new_driver(speed: SpeedProfile):
 
 
 def start_driver_attach_debug(port: int, speed: SpeedProfile):
-    """
-    Attach Selenium to an existing Chrome started with:
-      chrome.exe --remote-debugging-port=9222 --user-data-dir="C:\\ChromeDebug"
-    """
     options = webdriver.ChromeOptions()
     options.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
     driver_path = ChromeDriverManager().install()
@@ -469,6 +481,10 @@ def safe_click(driver, elem) -> bool:
         return False
 
 
+def wait_loaded(driver, timeout=18):
+    WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+
+
 def try_accept_cookies(driver):
     texts = ["Hyväksy", "Hyväksy kaikki", "Salli kaikki", "Accept", "Accept all", "I agree", "OK", "Selvä"]
     for _ in range(2):
@@ -486,51 +502,10 @@ def try_accept_cookies(driver):
                 continue
 
 
-def wait_loaded(driver, timeout=18):
-    WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-
-
 # =========================
-#   FAST EMAIL FETCH (REQUESTS) + FALLBACK SELENIUM
+#   YTJ EMAIL (Selenium)
 # =========================
-def _requests_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
-        "Accept-Language": "fi,en;q=0.9",
-    })
-    return s
-
-
-def fetch_email_by_yt_requests(sess: requests.Session, yt: str, timeout: float) -> str:
-    """
-    Fast path: download YTJ company page HTML and parse.
-    """
-    url = YTJ_COMPANY_URL.format(yt)
-    r = sess.get(url, timeout=timeout)
-    if r.status_code != 200:
-        return ""
-    html = r.text or ""
-
-    # mailto:
-    m = re.search(r"mailto:([^\"'>\s]+)", html, re.I)
-    if m:
-        return (m.group(1) or "").strip()
-
-    # visible emails:
-    m2 = EMAIL_RE.search(html)
-    if m2:
-        return (m2.group(0) or "").strip()
-
-    # (a) obfuscation
-    m3 = EMAIL_A_RE.search(html)
-    if m3:
-        return m3.group(0).replace(" ", "").replace("(a)", "@")
-
-    return ""
-
-
-def extract_email_from_ytj_selenium(driver):
+def extract_email_from_ytj(driver) -> str:
     try:
         for a in driver.find_elements(By.TAG_NAME, "a"):
             href = (a.get_attribute("href") or "")
@@ -566,7 +541,7 @@ def click_all_nayta_ytj(driver, speed: SpeedProfile):
                 if (b.text or "").strip().lower() == "näytä" and b.is_displayed() and b.is_enabled():
                     safe_click(driver, b)
                     clicked = True
-                    time.sleep(0.08)
+                    time.sleep(0.06)
             except Exception:
                 continue
         for a in driver.find_elements(By.TAG_NAME, "a"):
@@ -574,14 +549,14 @@ def click_all_nayta_ytj(driver, speed: SpeedProfile):
                 if (a.text or "").strip().lower() == "näytä" and a.is_displayed():
                     safe_click(driver, a)
                     clicked = True
-                    time.sleep(0.08)
+                    time.sleep(0.06)
             except Exception:
                 continue
         if not clicked:
             break
 
 
-def fetch_email_by_yt_selenium(driver, yt: str, stop_flag: threading.Event, speed: SpeedProfile) -> str:
+def fetch_email_by_yt(driver, yt: str, stop_flag: threading.Event, speed: SpeedProfile) -> str:
     if stop_flag.is_set():
         return ""
     try:
@@ -598,7 +573,7 @@ def fetch_email_by_yt_selenium(driver, yt: str, stop_flag: threading.Event, spee
     for _ in range(2):
         if stop_flag.is_set():
             return ""
-        email = extract_email_from_ytj_selenium(driver)
+        email = extract_email_from_ytj(driver)
         if email:
             return email
         time.sleep(speed.ytj_retry_sleep)
@@ -607,255 +582,97 @@ def fetch_email_by_yt_selenium(driver, yt: str, stop_flag: threading.Event, spee
     for _ in range(speed.ytj_retry_reads):
         if stop_flag.is_set():
             return ""
-        email = extract_email_from_ytj_selenium(driver)
+        email = extract_email_from_ytj(driver)
         if email:
             return email
         time.sleep(speed.ytj_retry_sleep)
     return ""
 
 
-def fetch_emails_parallel(
-    yts: List[str],
-    stop_flag: threading.Event,
-    speed: SpeedProfile,
-    status_cb,
-    progress_cb,
-) -> Dict[str, str]:
-    """
-    Parallel requests for email fetch. If requests returns empty, we can optionally
-    do a Selenium fallback pass for the missing ones (still 1 driver, sequential).
-    """
-    results: Dict[str, str] = {}
-    if not yts:
-        return results
-
-    sess = _requests_session()
-
-    # PHASE 1: parallel requests
-    status_cb(f"YTJ FAST: Haetaan emailit rinnakkain ({len(yts)} kpl, workers={speed.parallel_workers}) …")
-    progress_cb(0, max(1, len(yts)))
-
-    futures = []
-    with ThreadPoolExecutor(max_workers=speed.parallel_workers) as ex:
-        for yt in yts:
-            if stop_flag.is_set():
-                break
-            futures.append(ex.submit(fetch_email_by_yt_requests, sess, yt, speed.requests_timeout))
-
-        done_count = 0
-        for yt, fut in zip(yts, futures):
-            if stop_flag.is_set():
-                break
-            try:
-                email = fut.result()
-            except Exception:
-                email = ""
-            results[yt] = email or ""
-            done_count += 1
-            if done_count % 3 == 0 or done_count == len(yts):
-                progress_cb(done_count, len(yts))
-
-    if stop_flag.is_set():
-        return results
-
-    missing = [yt for yt in yts if not (results.get(yt) or "").strip()]
-    if not missing:
-        return results
-
-    # PHASE 2: selenium fallback
-    status_cb(f"YTJ FALLBACK: {len(missing)} ilman emailia → varmistetaan Seleniumlla…")
-    driver = start_new_driver(speed)
-    try:
-        for i, yt in enumerate(missing, start=1):
-            if stop_flag.is_set():
-                break
-            status_cb(f"YTJ fallback: {i}/{len(missing)} {yt}")
-            email = fetch_email_by_yt_selenium(driver, yt, stop_flag, speed)
-            results[yt] = email or ""
-            time.sleep(speed.ytj_per_company_sleep)
-    finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
-
-    return results
-
-
 # =========================
-#   YTJ NAME SEARCH (FIXED: targets NAME field + presses HAE)
+#   YTJ SOAP: NAME -> YT (FAST, PARALLEL)
 # =========================
-def _attr(el, name: str) -> str:
+def ytj_soap_search_name(name: str, speed: SpeedProfile) -> List[Tuple[str, str]]:
+    """
+    Returns list of (ytunnus, yritysnimi) from SOAP HTTP GET.
+    Public docs list wmYritysHaku over HTTP GET and response schema. :contentReference[oaicite:2]{index=2}
+    """
+    params = {
+        "hakusana": name,
+        "yritysmuoto": "",
+        "sanahaku": "true",
+        "ytunnus": "",
+        "voimassaolevat": "true",
+        "kieli": "fi",
+        "asiakastunnus": "",
+        "aikaleima": "",
+        "tarkiste": "",
+        "tiketti": "",
+    }
+
+    r = requests.get(YTJ_SOAP_HTTPGET, params=params, timeout=speed.soap_timeout)
+    r.raise_for_status()
+
+    # Parse XML
+    # Root has namespace: http://www.ytj.fi/
+    xml = r.text
+    root = ET.fromstring(xml)
+
+    ns = {"n": "http://www.ytj.fi/"}
+    out: List[Tuple[str, str]] = []
+
+    for dto in root.findall(".//n:YritysHakuDTO", ns):
+        yt = (dto.findtext("n:YTunnus", default="", namespaces=ns) or "").strip()
+        nm = (dto.findtext("n:Yritysnimi", default="", namespaces=ns) or "").strip()
+        if yt and nm:
+            n_yt = normalize_yt(yt)
+            if n_yt:
+                out.append((n_yt, nm))
+
+    return out[: max(5, speed.soap_max_results)]
+
+
+def resolve_name_to_best_yt(name: str, speed: SpeedProfile) -> Tuple[str, str]:
+    """
+    Returns (yt, matched_name).
+    """
     try:
-        return (el.get_attribute(name) or "").strip()
+        results = ytj_soap_search_name(name, speed)
     except Exception:
-        return ""
+        return "", ""
 
+    if not results:
+        return "", ""
 
-def find_ytj_name_field(driver):
-    """
-    Finds the NAME field: 'Yrityksen tai yhteisön nimi' (not the Y-tunnus field).
-    Robust selectors (aria-label, placeholder, label->input).
-    """
-    xps = [
-        "//input[contains(translate(@aria-label,'ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ','abcdefghijklmnopqrstuvwxyzåäö'),'yrityksen tai yhteisön nimi')]",
-        "//input[contains(translate(@aria-label,'ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ','abcdefghijklmnopqrstuvwxyzåäö'),'yrityksen nimi')]",
-        "//input[contains(translate(@placeholder,'ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ','abcdefghijklmnopqrstuvwxyzåäö'),'yrityksen tai yhteisön nimi')]",
-        "//input[contains(translate(@placeholder,'ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ','abcdefghijklmnopqrstuvwxyzåäö'),'yrityksen nimi')]",
-        "//label[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ','abcdefghijklmnopqrstuvwxyzåäö'),'yrityksen tai yhteisön nimi')]/following::input[1]",
-        "//label[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ','abcdefghijklmnopqrstuvwxyzåäö'),'yrityksen nimi')]/following::input[1]",
-    ]
-    for xp in xps:
-        try:
-            el = driver.find_element(By.XPATH, xp)
-            if el and el.is_displayed() and el.is_enabled():
-                blob = " ".join([
-                    _attr(el, "placeholder").lower(),
-                    _attr(el, "aria-label").lower(),
-                    _attr(el, "name").lower(),
-                    _attr(el, "id").lower(),
-                ])
-                if "y-tunnus" in blob or "lei" in blob or "ytunnus" in blob:
-                    continue
-                return el
-        except Exception:
-            continue
-    return None
+    best = ("", "", -1.0)
+    for yt, nm in results:
+        s = best_name_match_score(name, nm)
+        best = (yt, nm, s) if s > best[2] else best
 
+    yt_best, nm_best, score = best
 
-def ytj_open_search_home(driver, speed: SpeedProfile):
-    for url in YTJ_SEARCH_URLS:
-        try:
-            driver.get(url)
-            wait_loaded(driver, timeout=speed.ytj_page_load_timeout)
-            try_accept_cookies(driver)
-            if find_ytj_name_field(driver):
-                return
-        except Exception:
-            continue
+    # Turbo can accept slightly weaker matches
+    if speed.turbo_relaxed_match:
+        return yt_best, nm_best
 
-
-def extract_yt_from_text_anywhere(txt: str) -> str:
-    if not txt:
-        return ""
-    for m in YT_RE.findall(txt):
-        n = normalize_yt(m)
-        if n:
-            return n
-    return ""
-
-
-def score_result(name_query: str, card_text: str) -> float:
-    txt = (card_text or "").strip()
-    ratio = SequenceMatcher(None, (name_query or "").lower(), txt.lower()).ratio()
-    score = ratio * 100.0
-    if extract_yt_from_text_anywhere(txt):
-        score += 20.0
-    return score
-
-
-def ytj_name_to_yt(driver, name: str, stop_flag: threading.Event, speed: SpeedProfile) -> str:
-    ytj_open_search_home(driver, speed)
-    if stop_flag.is_set():
-        return ""
-
-    inp = find_ytj_name_field(driver)
-    if not inp:
-        return ""
-
-    try:
-        try:
-            inp.clear()
-        except Exception:
-            pass
-        inp.click()
-        time.sleep(0.05)
-        inp.send_keys(name)
-        time.sleep(0.10)
-
-        # Click "HAE" (more reliable than ENTER on this page)
-        hae_btn = None
-        try:
-            hae_btn = driver.find_element(
-                By.XPATH,
-                "//button[normalize-space()='HAE' or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'hae')]"
-            )
-        except Exception:
-            hae_btn = None
-
-        if hae_btn and hae_btn.is_displayed() and hae_btn.is_enabled():
-            safe_click(driver, hae_btn)
-        else:
-            inp.send_keys(u"\ue007")  # ENTER
-    except Exception:
-        return ""
-
-    best_link = None
-    best_score = -1.0
-    t0 = time.time()
-
-    while time.time() - t0 < 10.0:
-        if stop_flag.is_set():
-            return ""
-
-        candidate_links = []
-        for xp in ("//a[contains(@href,'/yritys/')]", "//a[contains(@href,'yritys')]"):
-            try:
-                candidate_links.extend(driver.find_elements(By.XPATH, xp))
-            except Exception:
-                pass
-
-        checked = 0
-        for a in candidate_links:
-            if checked >= 30:
-                break
-            try:
-                if not a.is_displayed():
-                    continue
-                href = (a.get_attribute("href") or "")
-                if not href or "tietopalvelu.ytj.fi" not in href:
-                    continue
-
-                try:
-                    card = a.find_element(By.XPATH, "ancestor::*[self::li or self::div or self::article][1]")
-                    card_text = (card.text or "")
-                except Exception:
-                    card_text = (a.text or "")
-
-                s = score_result(name, card_text)
-                checked += 1
-                if s > best_score:
-                    best_score = s
-                    best_link = a
-            except Exception:
-                continue
-
-        if best_link:
-            break
-        time.sleep(0.18)
-
-    if not best_link:
-        return ""
-
-    try:
-        safe_click(driver, best_link)
-        try:
-            wait_loaded(driver, timeout=speed.ytj_page_load_timeout)
-        except Exception:
-            pass
-        try_accept_cookies(driver)
-        try:
-            body = driver.find_element(By.TAG_NAME, "body").text or ""
-        except Exception:
-            body = ""
-        return extract_yt_from_text_anywhere(body)
-    except Exception:
-        return ""
+    # Normal/Fast/Safe: require a decent score
+    if score >= 70.0:
+        return yt_best, nm_best
+    return "", ""
 
 
 # =========================
-#   PIPELINES
+#   PIPELINES (C)
 # =========================
+def _emails_from_rows(rows: List[Row]) -> List[str]:
+    # dedup preserve nice casing
+    m = {}
+    for r in rows:
+        if r.email:
+            m[r.email.lower()] = r.email
+    return sorted(m.values())
+
+
 def pipeline_pdf(pdf_path: str, status_cb, progress_cb, stop_flag: threading.Event, speed: SpeedProfile):
     status_cb("PDF: Luetaan ja kerätään Y-tunnukset…")
     yts = extract_ytunnukset_from_pdf(pdf_path)
@@ -863,11 +680,11 @@ def pipeline_pdf(pdf_path: str, status_cb, progress_cb, stop_flag: threading.Eve
         status_cb("PDF: ei löytynyt Y-tunnuksia.")
         return [], []
 
-    emails_map = fetch_emails_parallel(yts, stop_flag, speed, status_cb, progress_cb)
+    status_cb(f"PDF: löytyi {len(yts)} Y-tunnusta. Haetaan emailit YTJ:stä…")
 
-    rows: List[Row] = [Row(name="", yt=yt, email=emails_map.get(yt, ""), source="pdf->ytj", notes="") for yt in yts]
-    emails = sorted({r.email.lower(): r.email for r in rows if r.email}.values())
-    return rows, emails
+    # Parallel email fetch with multiple drivers (C)
+    rows = fetch_emails_parallel(yts, stop_flag, status_cb, progress_cb, speed, source="pdf->ytj")
+    return rows, _emails_from_rows(rows)
 
 
 def pipeline_paste(
@@ -895,14 +712,32 @@ def pipeline_paste(
     for yt in yts:
         rows.append(Row(name="", yt=yt, email="", source="paste->ytj", notes="yt found in pasted text"))
 
-    # name fallback if no YTs OR if user wants it
+    # name fallback if enabled and NO YTs found
+    names: List[str] = []
     if enable_name_fallback and not yts:
-        status_cb("Paste: ei Y-tunnuksia – yritetään nimihaulla (fallback)…")
+        status_cb("Paste: ei Y-tunnuksia – kerätään yritysnimet…")
         names = extract_names_from_text(text, strict=strict, max_names=max_names)
-        for nm in names:
-            rows.append(Row(name=nm, yt="", email="", source="paste->ytj", notes="name fallback (no yt in text)"))
+        # dedup
+        names = sorted({n.strip(): n.strip() for n in names if n.strip()}.values())
 
-    # dedup
+        if not names:
+            status_cb("Paste: nimifallback ei löytänyt nimiä.")
+        else:
+            status_cb(f"Paste: löytyi {len(names)} nimeä. Haetaan Y-tunnukset (SOAP) rinnakkain…")
+
+    # C: resolve names -> YTs in parallel (NO Selenium here)
+    name_to_yt: Dict[str, Tuple[str, str]] = {}
+    if names:
+        name_to_yt = resolve_names_parallel(names, stop_flag, status_cb, progress_cb, speed)
+
+        for nm in names:
+            yt, matched = name_to_yt.get(nm, ("", ""))
+            if yt:
+                rows.append(Row(name=matched or nm, yt=yt, email="", source="paste(name)->ytj", notes=f"name->yt via SOAP | q={nm}"))
+            else:
+                rows.append(Row(name=nm, yt="", email="", source="paste(name)->ytj", notes="name->yt not found"))
+
+    # dedup rows
     deduped = []
     seen = set()
     for r in rows:
@@ -917,38 +752,21 @@ def pipeline_paste(
         status_cb("Paste: en löytänyt mitään (email / Y-tunnus / nimi).")
         return [], []
 
-    # Resolve name->yt (selenium) if needed
-    name_rows = [r for r in rows if (not r.email) and (not r.yt) and r.name]
-    if name_rows:
-        status_cb(f"YTJ: haetaan Y-tunnukset nimillä ({len(name_rows)} kpl)…")
-        driver = start_new_driver(speed)
-        try:
-            for i, r in enumerate(name_rows, start=1):
-                if stop_flag.is_set():
-                    break
-                status_cb(f"YTJ nimi→Y: {i}/{len(name_rows)} {r.name}")
-                yt = ytj_name_to_yt(driver, r.name, stop_flag, speed)
-                r.yt = yt or ""
-                if not yt:
-                    r.notes = (r.notes + " | name->yt not found").strip(" |")
-                time.sleep(speed.ytj_per_company_sleep)
-        finally:
-            try:
-                driver.quit()
-            except Exception:
-                pass
-
-    # Now fetch emails for all rows that have yt and no email
+    # fetch emails for YTs (parallel)
     yts_to_fetch = sorted({r.yt for r in rows if r.yt and not r.email})
-    if yts_to_fetch:
-        emails_map = fetch_emails_parallel(yts_to_fetch, stop_flag, speed, status_cb, progress_cb)
-        for r in rows:
-            if r.yt and not r.email:
-                r.email = emails_map.get(r.yt, "") or ""
+    if not yts_to_fetch:
+        status_cb("Paste: valmista (ei YTJ email-hakuja).")
+        return rows, _emails_from_rows(rows)
 
-    emails = sorted({r.email.lower(): r.email for r in rows if r.email}.values())
-    status_cb("Paste: Valmis.")
-    return rows, emails
+    status_cb(f"YTJ: haetaan emailit ({len(yts_to_fetch)} Y-tunnusta) rinnakkain…")
+    fetched_rows = fetch_emails_parallel(yts_to_fetch, stop_flag, status_cb, progress_cb, speed, source="paste->ytj")
+
+    yt_to_email = {r.yt: r.email for r in fetched_rows if r.yt}
+    for r in rows:
+        if r.yt and not r.email:
+            r.email = yt_to_email.get(r.yt, "") or r.email
+
+    return rows, _emails_from_rows(rows)
 
 
 def pipeline_protest_attach(
@@ -960,15 +778,12 @@ def pipeline_protest_attach(
     stop_flag: threading.Event,
     speed: SpeedProfile,
 ):
-    """
-    Attach to logged-in Chrome -> open protest list -> click 'Näytä lisää' -> extract YTs via JS.
-    Then fetch emails from YTJ using FAST parallel requests (+ selenium fallback).
-    """
     status_cb("KL: Yhdistetään Chromeen (debug attach)…")
     driver = start_driver_attach_debug(port, speed)
 
+    yts: List[str] = []
     try:
-        status_cb("KL: Varmistetaan protestilista…")
+        status_cb("KL: Avataan protestilista…")
         klm.ensure_on_page(driver, url, status_cb=status_cb)
 
         status_cb("KL: Ladataan kaikki (Näytä lisää)…")
@@ -983,11 +798,9 @@ def pipeline_protest_attach(
 
         status_cb("KL: Kerätään Y-tunnukset (JS/regex)…")
         yts = klm.extract_ytunnukset_via_js(driver)
-
         if not yts:
-            status_cb("KL: Ei löytynyt Y-tunnuksia. Oletko protestilistalla ja kirjautuneena?")
+            status_cb("KL: Ei löytynyt Y-tunnuksia. Oletko kirjautunut ja protestilista auki?")
             return [], []
-
     finally:
         try:
             driver.quit()
@@ -1000,10 +813,138 @@ def pipeline_protest_attach(
     else:
         status_cb(f"KL: Löytyi {len(yts)} Y-tunnusta. Haetaan YTJ emailit…")
 
-    emails_map = fetch_emails_parallel(yts, stop_flag, speed, status_cb, progress_cb)
-    rows: List[Row] = [Row(name="", yt=yt, email=emails_map.get(yt, ""), source="protest->ytj", notes="from KL via JS regex") for yt in yts]
-    emails = sorted({r.email.lower(): r.email for r in rows if r.email}.values())
-    return rows, emails
+    rows = fetch_emails_parallel(yts, stop_flag, status_cb, progress_cb, speed, source="protest->ytj")
+    return rows, _emails_from_rows(rows)
+
+
+# =========================
+#   C: PARALLEL RESOLVE + PARALLEL EMAIL FETCH
+# =========================
+def resolve_names_parallel(
+    names: List[str],
+    stop_flag: threading.Event,
+    status_cb,
+    progress_cb,
+    speed: SpeedProfile
+) -> Dict[str, Tuple[str, str]]:
+    """
+    Parallel: name -> (yt, matched_name) using SOAP.
+    Cache inside this run.
+    """
+    out: Dict[str, Tuple[str, str]] = {}
+    cache: Dict[str, Tuple[str, str]] = {}
+
+    total = max(1, len(names))
+    progress_cb(0, total)
+
+    def worker(nm: str):
+        key = nm.strip().lower()
+        if key in cache:
+            return nm, cache[key]
+        yt, matched = resolve_name_to_best_yt(nm, speed)
+        cache[key] = (yt, matched)
+        return nm, (yt, matched)
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=max(1, speed.name_workers)) as ex:
+        futures = [ex.submit(worker, nm) for nm in names]
+        for fut in as_completed(futures):
+            if stop_flag.is_set():
+                break
+            try:
+                nm, res = fut.result()
+                out[nm] = res
+            except Exception:
+                pass
+            done += 1
+            if done % 5 == 0 or done == len(names):
+                status_cb(f"YTJ SOAP: nimihaut {done}/{len(names)}")
+            progress_cb(done, total)
+
+    return out
+
+
+def fetch_emails_parallel(
+    yts: List[str],
+    stop_flag: threading.Event,
+    status_cb,
+    progress_cb,
+    speed: SpeedProfile,
+    source: str
+) -> List[Row]:
+    """
+    Parallel: yt -> email using Selenium, each worker has its own driver.
+    Has run-level cache to avoid repeats.
+    """
+    yts = sorted({yt for yt in yts if yt})
+    total = max(1, len(yts))
+    progress_cb(0, total)
+
+    cache_email: Dict[str, str] = {}
+    rows: List[Row] = []
+    lock = threading.Lock()
+
+    # split work among workers
+    workers = max(1, speed.email_workers)
+    chunks = [[] for _ in range(workers)]
+    for i, yt in enumerate(yts):
+        chunks[i % workers].append(yt)
+
+    def email_worker(worker_id: int, yt_list: List[str]) -> List[Row]:
+        local_rows: List[Row] = []
+        if not yt_list:
+            return local_rows
+
+        drv = start_new_driver(speed)
+        try:
+            for yt in yt_list:
+                if stop_flag.is_set():
+                    break
+
+                with lock:
+                    if yt in cache_email:
+                        em = cache_email[yt]
+                        local_rows.append(Row(name="", yt=yt, email=em, source=source, notes="cache"))
+                        continue
+
+                em = fetch_email_by_yt(drv, yt, stop_flag, speed)
+
+                with lock:
+                    cache_email[yt] = em or ""
+                local_rows.append(Row(name="", yt=yt, email=em, source=source, notes=""))
+
+                if speed.ytj_per_company_sleep > 0:
+                    time.sleep(speed.ytj_per_company_sleep)
+        finally:
+            try:
+                drv.quit()
+            except Exception:
+                pass
+
+        return local_rows
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = []
+        for w, chunk in enumerate(chunks):
+            futs.append(ex.submit(email_worker, w, chunk))
+
+        for fut in as_completed(futs):
+            part = []
+            try:
+                part = fut.result()
+            except Exception:
+                part = []
+            rows.extend(part)
+            # update progress approximately
+            done = min(len(cache_email), len(yts))
+            status_cb(f"YTJ email: {done}/{len(yts)}")
+            progress_cb(done, total)
+
+    # ensure order by yt
+    rows.sort(key=lambda r: r.yt)
+    progress_cb(len(yts), total)
+    return rows
 
 
 # =========================
@@ -1029,17 +970,12 @@ def start_chrome_debug(port: int, user_data_dir: str) -> Tuple[bool, str]:
     chrome = find_chrome_exe()
     if not chrome:
         return False, "Chrome.exe ei löytynyt."
-
     try:
         os.makedirs(user_data_dir, exist_ok=True)
     except Exception:
         return False, f"Ei voitu luoda user-data-dir: {user_data_dir}"
 
-    args = [
-        chrome,
-        f"--remote-debugging-port={port}",
-        f'--user-data-dir={user_data_dir}',
-    ]
+    args = [chrome, f"--remote-debugging-port={port}", f'--user-data-dir={user_data_dir}']
     try:
         subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=False)
         return True, f"Chrome käynnistetty debug-tilassa porttiin {port}."
@@ -1149,7 +1085,6 @@ class App(BaseTk):
                  font=("Segoe UI", 20, "bold")).pack(anchor="w")
         tk.Label(header, text=f"Build: {APP_BUILD}", bg=self.BG, fg=self.MUTED, font=("Segoe UI", 9)).pack(anchor="w")
 
-        # Top bar
         actions = self._card(root)
         actions.pack(fill="x", padx=16, pady=(0, 12))
         row = tk.Frame(actions, bg=self.CARD)
@@ -1162,7 +1097,6 @@ class App(BaseTk):
         self._btn(row, "Avaa tuloskansio", self.open_last_output, kind="grey").pack(side="right", padx=6)
         self._btn(row, "Pysäytä", self.request_stop, kind="danger").pack(side="right", padx=6)
 
-        # Status
         status_card = self._card(root)
         status_card.pack(fill="x", padx=16, pady=(0, 12))
         self.status = tk.Label(status_card, text="Valmiina.", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 11))
@@ -1214,7 +1148,7 @@ class App(BaseTk):
         top = tk.Frame(paste_card, bg=self.CARD)
         top.pack(fill="x", padx=12, pady=(12, 6))
         tk.Label(top, text="Ohje:", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 10, "bold")).pack(side="left")
-        tk.Label(top, text="Avaa sivu → Ctrl+A → Ctrl+C → liitä tähän → Start.",
+        tk.Label(top, text="Liitä: Y-tunnuksia / sähköposteja / yritysnimiä (yksi per rivi) → Start.",
                  bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 9)).pack(side="left", padx=10)
 
         top2 = tk.Frame(paste_card, bg=self.CARD)
@@ -1231,7 +1165,7 @@ class App(BaseTk):
 
         self.enable_name_fallback_var = tk.BooleanVar(value=True)
         tk.Checkbutton(
-            top2, text="Käytä nimihakua jos EI löydy Y-tunnuksia (fallback)",
+            top2, text="Käytä nimihakua jos EI löydy Y-tunnuksia (suositus)",
             variable=self.enable_name_fallback_var,
             bg=self.CARD, fg=self.TEXT,
             selectcolor="#ffffff",
@@ -1239,8 +1173,8 @@ class App(BaseTk):
         ).pack(side="left", padx=(16, 0))
 
         tk.Label(top2, text="Max nimeä:", bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 10)).pack(side="left", padx=(16, 6))
-        self.max_names_var = tk.IntVar(value=600)
-        tk.Spinbox(top2, from_=10, to=5000, textvariable=self.max_names_var, width=7,
+        self.max_names_var = tk.IntVar(value=800)
+        tk.Spinbox(top2, from_=10, to=20000, textvariable=self.max_names_var, width=7,
                    bg="#ffffff", fg=self.TEXT, insertbackground=self.TEXT,
                    highlightthickness=1, highlightbackground=self.BORDER).pack(side="left")
 
@@ -1348,7 +1282,7 @@ class App(BaseTk):
         try:
             self._set_status(f"Paste: Aloitetaan ajo ({speed.name})…")
             strict = bool(self.strict_var.get())
-            max_names = int(self.max_names_var.get() or 600)
+            max_names = int(self.max_names_var.get() or 800)
             enable_name_fallback = bool(self.enable_name_fallback_var.get())
 
             rows, emails = pipeline_paste(
